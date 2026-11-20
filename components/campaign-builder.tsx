@@ -13,7 +13,7 @@
  */
 
 import { useI18n } from "@/lib/i18n/provider";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import AccountSelect, { type AccountOption } from "@/components/account-select";
 import PostPicker from "@/components/post-picker";
@@ -24,6 +24,7 @@ import {
   IMPORT_ACCOUNT_KEY,
   type ImportRow,
 } from "@/lib/import-queue";
+import { BUTTON_LABEL_MAX } from "@/lib/validation/text";
 
 type TriggerScope = "specific" | "any" | "next";
 type MatchMode = "specific" | "any";
@@ -56,6 +57,10 @@ interface LoadedCampaign {
   isActive: boolean;
   instagramAccountId: string;
   trackedLinks?: { destinationUrl: string; label?: string | null }[];
+  ignoreQuestionComments?: boolean;
+  followPromptRetryMessage?: string | null;
+  followPromptRetryButtonLabel?: string | null;
+  deliveryTag?: string | null;
 }
 
 interface CampaignBuilderProps {
@@ -131,6 +136,42 @@ function Toggle({
   );
 }
 
+// Instagram cuts button titles after 20 UTF-16 units, so an emoji takes two.
+// maxLength and String.length count the same units, and so does the API. A
+// label saved before the limit dropped from 64 can be longer: the counter
+// turns red, since the API now refuses it.
+function ButtonLabelInput({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  placeholder: string;
+}) {
+  const counterId = useId();
+  return (
+    <div className="relative">
+      <input
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        maxLength={BUTTON_LABEL_MAX}
+        aria-describedby={counterId}
+        className="w-full rounded-lg border border-border bg-surface py-2 pl-3 pr-14 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none"
+      />
+      <span
+        id={counterId}
+        className={`pointer-events-none absolute inset-y-0 right-3 flex items-center text-xs tabular-nums ${
+          value.length > BUTTON_LABEL_MAX ? "text-error" : "text-muted"
+        }`}
+      >
+        {value.length}/{BUTTON_LABEL_MAX}
+      </span>
+    </div>
+  );
+}
+
 export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderProps) {
   const { t } = useI18n();
   const router = useRouter();
@@ -162,6 +203,9 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
   const [keywordText, setKeywordText] = useState("");
   const [wholeWordMatch, setWholeWordMatch] = useState(true);
   const [dmTriggerEnabled, setDmTriggerEnabled] = useState(false);
+  // On for new campaigns: a question under a reel is rarely a request for the
+  // link. Editing loads the stored value, which is off for older campaigns.
+  const [ignoreQuestionComments, setIgnoreQuestionComments] = useState(true);
 
   const [publicReplyEnabled, setPublicReplyEnabled] = useState(false);
   const [publicReplyMessages, setPublicReplyMessages] = useState<string[]>([""]);
@@ -181,9 +225,15 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
   const [followPromptMessage, setFollowPromptMessage] = useState("");
   const [followPromptButtonLabel, setFollowPromptButtonLabel] =
     useState("i'm following");
+  // Left empty, the second follow request repeats the first one.
+  const [followPromptRetryMessage, setFollowPromptRetryMessage] = useState("");
+  const [followPromptRetryButtonLabel, setFollowPromptRetryButtonLabel] =
+    useState("");
   const [followUpEnabled, setFollowUpEnabled] = useState(false);
   const [followUpMessage, setFollowUpMessage] = useState("");
   const [followUpDelayMinutes, setFollowUpDelayMinutes] = useState(0);
+  const [deliveryTag, setDeliveryTag] = useState("");
+  const deliveryTagId = useId();
 
   const [previewTab, setPreviewTab] = useState<PreviewTab>("dm");
 
@@ -264,6 +314,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
         setKeywordText(c.keywords.join(", "));
         setWholeWordMatch(c.wholeWordMatch ?? true);
         setDmTriggerEnabled(c.dmTriggerEnabled ?? false);
+        setIgnoreQuestionComments(c.ignoreQuestionComments ?? false);
         setPublicReplyEnabled(c.publicReplyEnabled);
         setPublicReplyMessages(
           c.publicReplyMessages?.length
@@ -290,9 +341,12 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
         setFollowPromptButtonLabel(
           c.followPromptButtonLabel ?? "i'm following"
         );
+        setFollowPromptRetryMessage(c.followPromptRetryMessage ?? "");
+        setFollowPromptRetryButtonLabel(c.followPromptRetryButtonLabel ?? "");
         setFollowUpEnabled(c.followUpEnabled ?? false);
         setFollowUpMessage(c.followUpMessage ?? "");
         setFollowUpDelayMinutes(c.followUpDelayMinutes ?? 0);
+        setDeliveryTag(c.deliveryTag ?? "");
       })
       .catch(() => setNotFound(true))
       .finally(() => setLoading(false));
@@ -430,9 +484,19 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
       followPromptButtonLabel: requireFollow
         ? followPromptButtonLabel.trim() || "i'm following"
         : "",
+      // Empty is saved as null, "not set": the second request then repeats
+      // the first one's text and button.
+      followPromptRetryMessage: requireFollow
+        ? followPromptRetryMessage.trim() || null
+        : null,
+      followPromptRetryButtonLabel: requireFollow
+        ? followPromptRetryButtonLabel.trim() || null
+        : null,
       followUpEnabled,
       followUpMessage: followUpEnabled ? followUpMessage.trim() : "",
       followUpDelayMinutes: followUpEnabled ? followUpDelayMinutes : 0,
+      ignoreQuestionComments,
+      deliveryTag: deliveryTag.trim() || null,
       isActive: activeValue,
     };
 
@@ -756,6 +820,20 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                 : t("A DM containing any of these words gets the same reply, no comment needed.")}
             </p>
           )}
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2.5">
+            <span className="text-sm text-foreground">
+              {t("Ignore comments with a question mark")}
+            </span>
+            <Toggle
+              on={ignoreQuestionComments}
+              onToggle={() => setIgnoreQuestionComments(!ignoreQuestionComments)}
+            />
+          </div>
+          {ignoreQuestionComments && (
+            <p className="text-xs text-muted">
+              {t("For example, “Was ist ein Prompt?” gets no DM.")}
+            </p>
+          )}
           <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2.5">
             <span className="text-sm text-foreground">
               {t("reply to their comments under the post")}
@@ -833,12 +911,10 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                   className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none resize-none"
                   maxLength={1000}
                 />
-                <input
+                <ButtonLabelInput
                   value={openingDmButtonLabel}
-                  onChange={(e) => setOpeningDmButtonLabel(e.target.value)}
+                  onChange={setOpeningDmButtonLabel}
                   placeholder={t("Send me the link")}
-                  className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none"
-                  maxLength={64}
                 />
               </div>
             )}
@@ -863,16 +939,41 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                   className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none resize-none"
                   maxLength={1000}
                 />
-                <input
+                <ButtonLabelInput
                   value={followPromptButtonLabel}
-                  onChange={(e) => setFollowPromptButtonLabel(e.target.value)}
+                  onChange={setFollowPromptButtonLabel}
                   placeholder={t("i'm following")}
-                  className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none"
-                  maxLength={20}
                 />
                 <p className="text-xs text-muted">
                   {t("We send the link only after they tap the button and Instagram confirms the follow. If it can't be verified, we send it anyway.")}
                 </p>
+                {/* The second request goes out once the automatic re-checks
+                    still see no follow. The placeholders show what an empty
+                    field sends: the first request again. */}
+                <div className="space-y-2 border-t border-border pt-3">
+                  <p className="text-sm text-foreground">
+                    {t("If they still don't follow after tapping")}
+                  </p>
+                  <textarea
+                    value={followPromptRetryMessage}
+                    onChange={(e) => setFollowPromptRetryMessage(e.target.value)}
+                    placeholder={
+                      followPromptMessage.trim() ||
+                      t("quick favor before i send your link. i don't make any money from this, it's free. if you want to support me, just don't unfollow after, and star the repo on github if it helps you. tap the button once you're following and i'll send it over")
+                    }
+                    rows={3}
+                    className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none resize-none"
+                    maxLength={1000}
+                  />
+                  <ButtonLabelInput
+                    value={followPromptRetryButtonLabel}
+                    onChange={setFollowPromptRetryButtonLabel}
+                    placeholder={followPromptButtonLabel.trim() || t("i'm following")}
+                  />
+                  <p className="text-xs text-muted">
+                    {t("Their next tap gets the link without another check, so nobody gets stuck.")}
+                  </p>
+                </div>
               </div>
             )}
           </div>
@@ -898,12 +999,10 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                   placeholder="https://yourlink.com/offer"
                   className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none"
                 />
-                <input
+                <ButtonLabelInput
                   value={linkButtonLabel}
-                  onChange={(e) => setLinkButtonLabel(e.target.value)}
+                  onChange={setLinkButtonLabel}
                   placeholder={t("Button label (e.g. Open link)")}
-                  maxLength={20}
-                  className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none"
                 />
                 {secondLinkOpen ? (
                   <div className="space-y-2 border-t border-border pt-2">
@@ -913,12 +1012,10 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                       placeholder="https://yourlink.com/second"
                       className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none"
                     />
-                    <input
+                    <ButtonLabelInput
                       value={secondaryButtonLabel}
-                      onChange={(e) => setSecondaryButtonLabel(e.target.value)}
+                      onChange={setSecondaryButtonLabel}
                       placeholder={t("Second button label")}
-                      maxLength={20}
-                      className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none"
                     />
                   </div>
                 ) : (
@@ -990,6 +1087,29 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                 </p>
               </div>
             )}
+          </div>
+        </Section>
+
+        <Section title={t("After the link")}>
+          <div className="space-y-2 rounded-lg border border-border p-3">
+            <label
+              htmlFor={deliveryTagId}
+              className="block text-sm text-foreground"
+            >
+              {t("Tag people who got the link")}
+            </label>
+            {/* Tag names are the user's own words: never translated. */}
+            <input
+              id={deliveryTagId}
+              value={deliveryTag}
+              onChange={(e) => setDeliveryTag(e.target.value)}
+              placeholder={t("e.g. [LM] Guide sent")}
+              maxLength={100}
+              className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none"
+            />
+            <p className="text-xs text-muted">
+              {t("Contacts get this tag when this campaign's link reaches them. Leave it empty for no tag.")}
+            </p>
           </div>
         </Section>
       </div>

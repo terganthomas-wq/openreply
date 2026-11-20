@@ -33,6 +33,7 @@ interface Campaign {
   requireFollow: boolean;
   followPromptMessage: string | null;
   followPromptButtonLabel: string | null;
+  deliveryTag?: string | null;
   isActive: boolean;
   wholeWordMatch: boolean;
   instagramAccountId: string;
@@ -445,6 +446,15 @@ export default function CampaignsPage() {
                   {auto.trackedLinks.length >= 2 && (
                     <span className="shrink-0 rounded-full bg-accent/10 px-2 py-0.5 text-xs font-medium text-accent">
                       {t("2 links")}
+                    </span>
+                  )}
+                  {/* Tags can be long; the chip is cut to the card's width. */}
+                  {auto.deliveryTag && (
+                    <span
+                      title={auto.deliveryTag}
+                      className="max-w-full truncate rounded-md border border-border bg-surface px-2 py-0.5 text-xs text-muted"
+                    >
+                      {t("Tag: {tag}", { tag: auto.deliveryTag })}
                     </span>
                   )}
                 </div>

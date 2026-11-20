@@ -141,6 +141,13 @@ describe("read-only MCP and REST", () => {
     expect(selection.select.reportShareSlug).toBeUndefined();
     expect(selection.select.instagramAccount).toBeUndefined();
   });
+  it("returns the question filter, second follow request, delivery tag and offers", async () => {
+    const weg2 = { ignoreQuestionComments: true, followPromptRetryMessage: "Still not following?", followPromptRetryButtonLabel: "Done now", deliveryTag: "[LM] Guide sent", offersEnabled: true, offerIds: ["offer_2", "offer_1"] };
+    state.campaigns.findFirst.mockResolvedValue({ id: "campaign", ...weg2, trackedLinks: [] });
+    expect(await getCampaign(context, "campaign")).toMatchObject(weg2);
+    const { select } = state.campaigns.findFirst.mock.calls[0][0];
+    expect(Object.fromEntries(Object.keys(weg2).map(field => [field, select[field]]))).toEqual(Object.fromEntries(Object.keys(weg2).map(field => [field, true])));
+  });
   it("does not leak foreign campaigns or invent missing links", async () => {
     state.campaigns.findFirst.mockResolvedValue(null);
     await expect(getCampaign(context, "foreign")).rejects.toMatchObject({ status: 404 });

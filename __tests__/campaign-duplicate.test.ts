@@ -48,6 +48,12 @@ const sourceCampaign = {
   wholeWordMatch: true,
   reportShareSlug: "report_123",
   reportShareEnabled: false,
+  ignoreQuestionComments: true,
+  followPromptRetryMessage: "Still can't see your follow, tap again once you do",
+  followPromptRetryButtonLabel: "Done now 👍",
+  deliveryTag: "[LM] Guide sent",
+  offersEnabled: true,
+  offerIds: ["offer_2", "offer_1"],
   createdAt: new Date("2026-05-01T00:00:00.000Z"),
   updatedAt: new Date("2026-05-20T00:00:00.000Z"),
   trackedLinks: [
@@ -115,6 +121,23 @@ describe("duplicateCampaign", () => {
       linkButtonLabel: "Get offer",
       goal: "Product link request",
       reportShareEnabled: false,
+    });
+  });
+
+  it("keeps the question filter, second follow request, delivery tag and offers", async () => {
+    await duplicateCampaign({
+      automationId: "automation_123",
+      workspaceId: "workspace_123",
+    });
+
+    expect(createArgs().data).toMatchObject({
+      ignoreQuestionComments: true,
+      followPromptRetryMessage: "Still can't see your follow, tap again once you do",
+      followPromptRetryButtonLabel: "Done now 👍",
+      deliveryTag: "[LM] Guide sent",
+      offersEnabled: true,
+      // The custom order, in the original's order.
+      offerIds: ["offer_2", "offer_1"],
     });
   });
 

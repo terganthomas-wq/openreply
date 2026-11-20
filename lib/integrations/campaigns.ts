@@ -27,7 +27,9 @@ export async function getCampaign(context: ServiceContext, id: string) {
       linkButtonLabel: true, requireFollow: true, followPromptMessage: true,
       followPromptButtonLabel: true, followUpEnabled: true, followUpMessage: true,
       followUpDelayMinutes: true, publicReplyEnabled: true, publicReplyMessage: true,
-      publicReplyMessages: true,
+      publicReplyMessages: true, ignoreQuestionComments: true,
+      followPromptRetryMessage: true, followPromptRetryButtonLabel: true,
+      deliveryTag: true, offersEnabled: true, offerIds: true,
       trackedLinks: {
         where: { workspaceId: context.workspaceId }, orderBy: TRACKED_LINK_ORDER,
         select: { destinationUrl: true, label: true, position: true },

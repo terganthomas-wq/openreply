@@ -38,6 +38,10 @@ interface Campaign {
   publicReplyEnabled: boolean;
   publicReplyMessage: string | null;
   publicReplyMessages: string[];
+  ignoreQuestionComments?: boolean;
+  followPromptRetryMessage?: string | null;
+  followPromptRetryButtonLabel?: string | null;
+  deliveryTag?: string | null;
   isActive: boolean;
   instagramAccountId: string;
   instagramAccount: { username: string };
@@ -152,6 +156,11 @@ export default function CampaignDetailPage() {
         : [];
   const hasLink = Boolean(campaign.trackedLinks?.[0]?.destinationUrl);
   const hasSecondLink = Boolean(campaign.trackedLinks?.[1]?.destinationUrl);
+  // Empty fields show what the worker sends in their place.
+  const followPrompt =
+    campaign.followPromptMessage ||
+    "quick favor before i send your link. i don't make any money from this, it's free. if you want to support me, just don't unfollow after, and star the repo on github if it helps you. tap the button once you're following and i'll send it over";
+  const followButton = campaign.followPromptButtonLabel || "i'm following";
 
   const trigger = campaign.matchAnyPost
     ? t("Any post or reel")
@@ -220,6 +229,11 @@ export default function CampaignDetailPage() {
               {campaign.matchAnyWord ? t("anything") : t("these words")}.
             </p>
           )}
+          {campaign.ignoreQuestionComments && (
+            <p className="text-xs text-muted">
+              {t("Comments with a question mark get no DM.")}
+            </p>
+          )}
           {publicReplies.length > 0 && (
             <div className="space-y-1.5">
               <p className="text-xs text-muted">{t("Public reply under the post")}</p>
@@ -239,13 +253,24 @@ export default function CampaignDetailPage() {
 
         {campaign.requireFollow && (
           <Summary title={t("They must follow first")}>
-            <FieldBox>
-              {campaign.followPromptMessage ||
-                "quick favor before i send your link. i don't make any money from this, it's free. if you want to support me, just don't unfollow after, and star the repo on github if it helps you. tap the button once you're following and i'll send it over"}
-            </FieldBox>
-            <FieldBox>
-              {campaign.followPromptButtonLabel || "i'm following"}
-            </FieldBox>
+            <FieldBox>{followPrompt}</FieldBox>
+            <FieldBox>{followButton}</FieldBox>
+            {/* Without its own text the second request repeats the first,
+                which the boxes above already show. */}
+            {(campaign.followPromptRetryMessage ||
+              campaign.followPromptRetryButtonLabel) && (
+              <div className="space-y-1.5">
+                <p className="text-xs text-muted">
+                  {t("If they still don't follow after tapping")}
+                </p>
+                <FieldBox>
+                  {campaign.followPromptRetryMessage || followPrompt}
+                </FieldBox>
+                <FieldBox>
+                  {campaign.followPromptRetryButtonLabel || followButton}
+                </FieldBox>
+              </div>
+            )}
           </Summary>
         )}
 
@@ -289,6 +314,19 @@ export default function CampaignDetailPage() {
                 ? t("Sent {minutes} min after the link.", { minutes: campaign.followUpDelayMinutes })
                 : t("Sent right after the link.")}
             </p>
+          </Summary>
+        )}
+
+        {campaign.deliveryTag && (
+          <Summary title={t("After the link")}>
+            <p className="text-xs text-muted">
+              {t("Tag people who got the link")}
+            </p>
+            {/* A tag can be one long word; let it wrap instead of widening
+                the page on a phone. */}
+            <FieldBox>
+              <span className="wrap-anywhere">{campaign.deliveryTag}</span>
+            </FieldBox>
           </Summary>
         )}
       </div>

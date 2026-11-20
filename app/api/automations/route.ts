@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import { z } from "zod";
 import { getCurrentWorkspaceId } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
 import {
@@ -14,6 +13,12 @@ import {
   buildInitialCampaignLinks,
   syncCampaignLinks,
 } from "@/lib/campaigns/links";
+import {
+  createAutomationSchema,
+  OFFER_RULE_MESSAGE,
+  offerRuleViolated,
+  updateAutomationSchema,
+} from "@/lib/campaigns/schema";
 import { buildReportUrl, generateReportShareSlug } from "@/lib/reports/share";
 import {
   canManageWorkspace,
@@ -24,112 +29,23 @@ import {
 // immediately), so never cache it at the route or CDN layer.
 export const dynamic = "force-dynamic";
 
-const createAutomationSchema = z
-  .object({
-    name: z.string().min(1).max(100),
-    goal: z.string().min(1).max(120).optional().nullable(),
-    instagramAccountId: z.string().min(1).optional().nullable(),
-    postId: z.string().min(1).optional().nullable(),
-    postUrl: z.string().url().optional().nullable(),
-    pendingNextReel: z.boolean().optional().default(false),
-    matchAnyPost: z.boolean().optional().default(false),
-    keywords: z.array(z.string().min(1).max(50)).max(10).optional().default([]),
-    matchAnyWord: z.boolean().optional().default(false),
-    dmTriggerEnabled: z.boolean().optional().default(false),
-    dmMessage: z.string().min(1).max(1000),
-    openingDmEnabled: z.boolean().optional().default(false),
-    openingDmMessage: z.string().max(1000).optional().nullable(),
-    openingDmButtonLabel: z.string().max(64).optional().nullable(),
-    linkButtonLabel: z.string().max(20).optional().nullable(),
-    requireFollow: z.boolean().optional().default(false),
-    followPromptMessage: z.string().max(1000).optional().nullable(),
-    followPromptButtonLabel: z.string().max(20).optional().nullable(),
-    followUpEnabled: z.boolean().optional().default(false),
-    followUpMessage: z.string().max(1000).optional().nullable(),
-    // Minutes to wait before the follow-up. Capped at 24h so it stays inside
-    // Instagram's messaging window.
-    followUpDelayMinutes: z.number().int().min(0).max(1440).optional().default(0),
-    publicReplyEnabled: z.boolean().optional().default(false),
-    publicReplyMessage: z.string().max(1000).optional().nullable(),
-    publicReplyMessages: z
-      .array(z.string().max(1000))
-      .max(10)
-      .optional()
-      .default([]),
-    // Empty string means "no tracked link"; a URL sets one.
-    trackedDestinationUrl: z
-      .union([z.string().url(), z.literal("")])
-      .optional()
-      .nullable(),
-    // Optional second tracked link, rendered as a second DM button.
-    secondaryDestinationUrl: z
-      .union([z.string().url(), z.literal("")])
-      .optional()
-      .nullable(),
-    secondaryButtonLabel: z.string().max(20).optional().nullable(),
-    isActive: z.boolean().optional().default(true),
-    wholeWordMatch: z.boolean().optional().default(true),
-  })
-  // A campaign must target a specific post, any post, or the next reel.
-  .refine(
-    (d) => d.matchAnyPost || d.pendingNextReel || Boolean(d.postId),
-    { message: "Choose which post(s) trigger the campaign", path: ["postId"] }
-  )
-  // And it must match either specific words or any word.
-  .refine((d) => d.matchAnyWord || d.keywords.length >= 1, {
-    message: "Add at least one keyword, or match any word",
-    path: ["keywords"],
-  })
-  // An opening DM needs both a message and a button label.
-  .refine(
-    (d) =>
-      !d.openingDmEnabled ||
-      (Boolean(d.openingDmMessage?.trim()) &&
-        Boolean(d.openingDmButtonLabel?.trim())),
-    { message: "Opening DM needs a message and a button label", path: ["openingDmMessage"] }
-  );
+// A campaign's custom offer order holds plain ids (no foreign key), so every
+// id must name an offer of this workspace that is still on the Offers page.
+// Archived offers are kept for their history but must not be offered again.
+async function offersExist(workspaceId: string, offerIds: string[]) {
+  if (offerIds.length === 0) return true;
+  const count = await prisma.offer.count({
+    where: { workspaceId, id: { in: offerIds }, archivedAt: null },
+  });
+  return count === offerIds.length;
+}
 
-const updateAutomationSchema = z.object({
-  name: z.string().min(1).max(100).optional(),
-  goal: z.string().min(1).max(120).optional().nullable(),
-  instagramAccountId: z.string().min(1).optional(),
-  postId: z.string().min(1).optional().nullable(),
-  postUrl: z.string().url().optional().nullable(),
-  pendingNextReel: z.boolean().optional(),
-  matchAnyPost: z.boolean().optional(),
-  keywords: z.array(z.string().min(1).max(50)).max(10).optional(),
-  matchAnyWord: z.boolean().optional(),
-  dmTriggerEnabled: z.boolean().optional(),
-  dmMessage: z.string().min(1).max(1000).optional(),
-  openingDmEnabled: z.boolean().optional(),
-  openingDmMessage: z.string().max(1000).optional().nullable(),
-  openingDmButtonLabel: z.string().max(64).optional().nullable(),
-  linkButtonLabel: z.string().max(20).optional().nullable(),
-  requireFollow: z.boolean().optional(),
-  followPromptMessage: z.string().max(1000).optional().nullable(),
-  followPromptButtonLabel: z.string().max(20).optional().nullable(),
-  followUpEnabled: z.boolean().optional(),
-  followUpMessage: z.string().max(1000).optional().nullable(),
-  followUpDelayMinutes: z.number().int().min(0).max(1440).optional(),
-  publicReplyEnabled: z.boolean().optional(),
-  publicReplyMessage: z.string().max(1000).optional().nullable(),
-  publicReplyMessages: z.array(z.string().max(1000)).max(10).optional(),
-  isActive: z.boolean().optional(),
-  wholeWordMatch: z.boolean().optional(),
-  reportShareEnabled: z.boolean().optional(),
-  // Empty string clears the tracked link; a URL updates/creates it; undefined
-  // leaves it unchanged.
-  trackedDestinationUrl: z
-    .union([z.string().url(), z.literal("")])
-    .optional()
-    .nullable(),
-  // Same semantics for the optional second tracked link / DM button.
-  secondaryDestinationUrl: z
-    .union([z.string().url(), z.literal("")])
-    .optional()
-    .nullable(),
-  secondaryButtonLabel: z.string().max(20).optional().nullable(),
-});
+function unknownOfferResponse() {
+  return NextResponse.json(
+    { success: false, error: "Unknown offer" },
+    { status: 400 }
+  );
+}
 
 export async function GET(request: NextRequest) {
   const workspaceId = await getCurrentWorkspaceId();
@@ -321,8 +237,11 @@ export async function POST(request: NextRequest) {
     parsed.data.instagramAccountId && parsed.data.instagramAccountId !== "all"
       ? parsed.data.instagramAccountId
       : null;
+  // A repeated id adds nothing (an offer is never made twice to the same
+  // person), so only its first place counts.
+  const offerIds = [...new Set(parsed.data.offerIds)];
 
-  const [workspace, instagramAccount] = await Promise.all([
+  const [workspace, instagramAccount, offersKnown] = await Promise.all([
     prisma.workspace.findUnique({
       where: { id: workspaceId },
       select: { id: true },
@@ -335,6 +254,7 @@ export async function POST(request: NextRequest) {
           where: { workspaceId },
           orderBy: { connectedAt: "desc" },
         }),
+    offersExist(workspaceId, offerIds),
   ]);
 
   if (!workspace) {
@@ -350,6 +270,8 @@ export async function POST(request: NextRequest) {
       { status: 400 }
     );
   }
+
+  if (!offersKnown) return unknownOfferResponse();
 
   const linkCreates = buildInitialCampaignLinks({
     workspaceId,
@@ -400,6 +322,12 @@ export async function POST(request: NextRequest) {
       followPromptButtonLabel: parsed.data.requireFollow
         ? parsed.data.followPromptButtonLabel || null
         : null,
+      followPromptRetryMessage: parsed.data.requireFollow
+        ? parsed.data.followPromptRetryMessage || null
+        : null,
+      followPromptRetryButtonLabel: parsed.data.requireFollow
+        ? parsed.data.followPromptRetryButtonLabel || null
+        : null,
       followUpEnabled: parsed.data.followUpEnabled,
       followUpMessage: parsed.data.followUpEnabled
         ? parsed.data.followUpMessage || null
@@ -416,6 +344,11 @@ export async function POST(request: NextRequest) {
         : null,
       isActive: parsed.data.isActive,
       wholeWordMatch: parsed.data.wholeWordMatch,
+      ignoreQuestionComments: parsed.data.ignoreQuestionComments,
+      // Trimmed by the schema; nothing left means no tag.
+      deliveryTag: parsed.data.deliveryTag || null,
+      offersEnabled: parsed.data.offersEnabled,
+      offerIds,
       workspaceId,
       instagramAccountId: instagramAccount.id,
       reportShareSlug: generateReportShareSlug(),
@@ -519,6 +452,8 @@ export async function PATCH(request: NextRequest) {
   if (automationData.requireFollow === false) {
     automationData.followPromptMessage = null;
     automationData.followPromptButtonLabel = null;
+    automationData.followPromptRetryMessage = null;
+    automationData.followPromptRetryButtonLabel = null;
   }
   if (automationData.followUpEnabled === false) {
     automationData.followUpMessage = null;
@@ -540,6 +475,41 @@ export async function PATCH(request: NextRequest) {
   if (automationData.publicReplyEnabled === false) {
     automationData.publicReplyMessages = [];
     automationData.publicReplyMessage = null;
+  }
+  // Trimmed by the schema; nothing left means no tag.
+  if (automationData.deliveryTag === "") automationData.deliveryTag = null;
+
+  // The update schema has no cross-field rules, since a body may carry a
+  // single field. Offers need the opening DM, so the rule is checked on the
+  // campaign as this update leaves it, and only when the body touches one of
+  // its fields: switching the opening DM off on a campaign with offers is
+  // refused, while a bare { isActive } toggle never runs into it.
+  if (
+    (automationData.offersEnabled !== undefined ||
+      automationData.openingDmEnabled !== undefined ||
+      automationData.openingDmMessage !== undefined ||
+      automationData.openingDmButtonLabel !== undefined) &&
+    offerRuleViolated({ ...existing, ...automationData })
+  ) {
+    return NextResponse.json(
+      {
+        success: false,
+        error: "Invalid input",
+        // Shaped like zod's flatten(), so the editor names the field.
+        details: {
+          formErrors: [],
+          fieldErrors: { offersEnabled: [OFFER_RULE_MESSAGE] },
+        },
+      },
+      { status: 400 }
+    );
+  }
+
+  if (automationData.offerIds !== undefined) {
+    automationData.offerIds = [...new Set(automationData.offerIds)];
+    if (!(await offersExist(workspaceId, automationData.offerIds))) {
+      return unknownOfferResponse();
+    }
   }
 
   // One transaction, so a save never lands half applied. Updating the campaign
