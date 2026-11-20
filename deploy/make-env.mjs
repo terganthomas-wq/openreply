@@ -190,6 +190,9 @@ write(path.join(dir, "worker.env"), [
   ["COMMENT_POLL_INTERVAL_MS", "1800000"],
   ["DB_POOL_MAX", "3"],
   ["CHECKPOINT_DISABLE", "1"],
+  // Follow gate: Instagram reports a new follow with a delay, so the worker
+  // re-checks after 20 s and 40 s. This message bridges the wait.
+  ["FOLLOW_RECHECK_ACK_MESSAGE", "Danke! Ich prüfe kurz, ob dein Folgen schon angekommen ist. Einen Moment ⏳"],
 ]);
 
 console.log(`\nGeschrieben: vercel.env und worker.env in ${dir}`);
