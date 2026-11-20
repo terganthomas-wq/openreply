@@ -28,7 +28,7 @@
 import { MAX_COMMENT_SEND_ATTEMPTS } from "@/lib/queue/comment-delivery";
 import { hasLegacyUnconfirmedDelivery } from "@/lib/instagram/delivery-errors";
 import { prisma } from "@/lib/db/client";
-import { getDMQueue } from "@/lib/queue/client";
+import { COMMENT_JOB_NAME, getDMQueue } from "@/lib/queue/client";
 import {
   getRecentMediaComments,
   getUserMedia,
@@ -271,7 +271,7 @@ async function sweepCampaign({
       // drop this add, so the comment would never be retried. Dedup is handled
       // above and by the worker's atomic, durable per-leg claims. Send attempts
       // are counted in DmLog across jobs, so a sweep cannot reset the budget.
-      await queue.add("process-comment", {
+      await queue.add(COMMENT_JOB_NAME, {
         instagramAccountId: account.instagramId,
         accountConnectionId: account.id,
         commentId: c.id,

@@ -83,6 +83,9 @@ export type DmQueueJob =
   | ProcessFollowUpJob
   | ProcessMessageJob;
 
+// The worker runs a comment job only under this name (or none at all), so a
+// job name it does not know yet is ignored instead of being read as a comment.
+export const COMMENT_JOB_NAME = "process-comment";
 export const POSTBACK_JOB_NAME = "process-postback";
 export const FOLLOWUP_JOB_NAME = "process-followup";
 export const MESSAGE_JOB_NAME = "process-message";

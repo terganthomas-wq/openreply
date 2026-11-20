@@ -116,6 +116,7 @@ vi.mock("@/lib/queue/client", () => ({
     add: mockQueueAdd,
   }),
   getRedisConnection: vi.fn(),
+  COMMENT_JOB_NAME: "process-comment",
   POSTBACK_JOB_NAME: "process-postback",
   FOLLOWUP_JOB_NAME: "process-followup",
   MESSAGE_JOB_NAME: "process-message",
@@ -137,6 +138,7 @@ vi.mock("bullmq", () => {
   };
 });
 
+import { createHash } from "node:crypto";
 import { MetaApiError, RateLimitError } from "@/lib/meta/client";
 import { createDMWorker } from "../lib/queue/dm-worker";
 import { getRedisConnection } from "@/lib/queue/client";
@@ -222,6 +224,9 @@ function createMockPostbackJob(
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // clearAllMocks keeps implementations: a test that makes the queue fail must
+  // not leave the next test with a failing queue.
+  mockQueueAdd.mockReset();
   mockPrisma.postbackDelivery.create.mockReset().mockResolvedValue({});
   mockPrisma.postbackDelivery.delete.mockReset().mockResolvedValue({});
 
@@ -1168,23 +1173,321 @@ describe("DM Worker — DM keyword trigger", () => {
     );
   });
 
-  it("should release the usage reservation and rethrow when the send fails", async () => {
+  // An unknown outcome may still have reached the inbox, so the reply is not
+  // retried and its reservation is kept, exactly as for a button tap.
+  it("keeps the reservation and stops retrying when the send outcome is unknown", async () => {
     mockSendDirectMessage.mockRejectedValue(new Error("Meta is down"));
 
     const processor = getProcessor();
-    await expect(processor(createMockMessageJob())).rejects.toThrow(
-      "Meta is down"
+    await expect(processor(createMockMessageJob())).rejects.toMatchObject({
+      name: "UnrecoverableError",
+      message: expect.stringContaining("Meta is down"),
+    });
+
+    expect(mockReleaseWorkspaceDMReservation).not.toHaveBeenCalled();
+    expect(mockPrisma.postbackDelivery.delete).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({
+          status: "FAILED",
+          dmDeliveryUnconfirmed: true,
+        }),
+        update: expect.objectContaining({
+          status: "FAILED",
+          dmDeliveryUnconfirmed: true,
+        }),
+      })
     );
+  });
+
+  it("releases the reservation and the claim when Instagram refuses the reply", async () => {
+    mockSendDirectMessage.mockRejectedValue(
+      new MetaApiError(100, undefined, undefined, "Invalid parameter")
+    );
+
+    await expect(getProcessor()(createMockMessageJob())).rejects.toMatchObject({
+      name: "MetaApiError",
+      message: "Invalid parameter",
+    });
 
     expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledWith(
       "workspace_123",
       usagePeriodStart
     );
+    // A confirmed rejection frees the claim, so the retry may send.
+    expect(mockPrisma.postbackDelivery.delete).toHaveBeenCalledTimes(1);
     expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
-        create: expect.objectContaining({ status: "FAILED" }),
+        create: expect.objectContaining({
+          status: "FAILED",
+          dmDeliveryUnconfirmed: false,
+        }),
       })
     );
+  });
+
+  it("claims the reply per account, campaign and inbound message before sending", async () => {
+    await getProcessor()(createMockMessageJob());
+
+    const operationId = createHash("sha256")
+      .update(JSON.stringify(["ig_account_row_1", "dm", "auto_789", "mid_abc"]))
+      .digest("hex");
+    expect(mockPrisma.postbackDelivery.create).toHaveBeenCalledWith({
+      data: { id: operationId },
+    });
+    expect(
+      mockPrisma.postbackDelivery.create.mock.invocationCallOrder[0]
+    ).toBeLessThan(mockSendDirectMessage.mock.invocationCallOrder[0]);
+  });
+
+  it("sends nothing and releases the reservation when the message is already claimed", async () => {
+    mockPrisma.postbackDelivery.create.mockRejectedValue({ code: "P2002" });
+
+    await expect(
+      getProcessor()(createMockMessageJob())
+    ).resolves.toBeUndefined();
+
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
+    expect(mockSendDirectMessageWithLinkButton).not.toHaveBeenCalled();
+    expect(mockSendDirectMessageWithButton).not.toHaveBeenCalled();
+    expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledWith(
+      "workspace_123",
+      usagePeriodStart
+    );
+    expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
+  });
+
+  it("answers a redelivered message only once even when its log row is missing", async () => {
+    const claims = new Set<string>();
+    mockPrisma.postbackDelivery.create.mockImplementation(
+      async ({ data }: { data: { id: string } }) => {
+        if (claims.has(data.id)) throw { code: "P2002" };
+        claims.add(data.id);
+        return data;
+      }
+    );
+
+    const process = getProcessor();
+    await process(createMockMessageJob());
+    // dmLog.findUnique still finds nothing, as after a lost log write, and the
+    // webhook comes back under a new job id once BullMQ forgot the old one.
+    await process({ ...createMockMessageJob(), id: "redelivered-message" });
+
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("schedules the follow-up once the link is out and recorded", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      {
+        ...dmTriggerAutomation,
+        followUpEnabled: true,
+        followUpMessage: "Thanks, {username}!",
+        followUpDelayMinutes: 2,
+      },
+    ]);
+
+    await getProcessor()(createMockMessageJob());
+
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-followup",
+      {
+        instagramAccountId: "ig_456",
+        accountConnectionId: "ig_account_row_1",
+        userId: "commenter_999",
+        automationId: "auto_789",
+        commenterName: "commenter_user",
+      },
+      { delay: 2 * 60_000, jobId: "followup_auto_789_commenter_999" }
+    );
+    expect(mockPrisma.dmLog.upsert.mock.invocationCallOrder[0]).toBeLessThan(
+      mockQueueAdd.mock.invocationCallOrder[0]
+    );
+  });
+
+  it("keeps a delivered reply SENT when the follow-up cannot be scheduled", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      {
+        ...dmTriggerAutomation,
+        followUpEnabled: true,
+        followUpMessage: "Thanks!",
+      },
+    ]);
+    mockQueueAdd.mockRejectedValue(new Error("Redis connection lost"));
+
+    await expect(
+      getProcessor()(createMockMessageJob())
+    ).resolves.toBeUndefined();
+
+    expect(mockQueueAdd).toHaveBeenCalledTimes(1);
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ status: "SENT" }),
+        update: expect.objectContaining({ status: "SENT" }),
+      })
+    );
+    expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({ status: "FAILED" }),
+      })
+    );
+    expect(mockReleaseWorkspaceDMReservation).not.toHaveBeenCalled();
+  });
+
+  it("schedules no follow-up behind a follow prompt", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      {
+        ...dmTriggerAutomation,
+        requireFollow: true,
+        followUpEnabled: true,
+        followUpMessage: "Thanks!",
+      },
+    ]);
+    mockGetUserFollowStatus.mockResolvedValue(false);
+
+    await getProcessor()(createMockMessageJob());
+
+    expect(mockSendDirectMessageWithButton).toHaveBeenCalledTimes(1);
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+});
+
+describe("DM Worker — work after a delivered button tap", () => {
+  const withFollowUp = {
+    ...mockAutomation,
+    followUpEnabled: true,
+    followUpMessage: "Thanks for grabbing it, {username}!",
+    followUpDelayMinutes: 5,
+  };
+
+  it("schedules the follow-up once the link is out and recorded", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue(withFollowUp);
+
+    await getProcessor()(createMockPostbackJob());
+
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-followup",
+      {
+        instagramAccountId: "ig_456",
+        accountConnectionId: "ig_account_row_1",
+        userId: "commenter_999",
+        automationId: "auto_789",
+        commenterName: "commenter_user",
+      },
+      { delay: 5 * 60_000, jobId: "followup_auto_789_commenter_999" }
+    );
+    expect(mockPrisma.dmLog.upsert.mock.invocationCallOrder[0]).toBeLessThan(
+      mockQueueAdd.mock.invocationCallOrder[0]
+    );
+  });
+
+  it("keeps a delivered tap SENT when the follow-up cannot be scheduled", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue(withFollowUp);
+    mockQueueAdd.mockRejectedValue(new Error("Redis connection lost"));
+
+    await expect(
+      getProcessor()(createMockPostbackJob())
+    ).resolves.toBeUndefined();
+
+    expect(mockQueueAdd).toHaveBeenCalledTimes(1);
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ status: "SENT" }),
+        update: expect.objectContaining({ status: "SENT" }),
+      })
+    );
+    expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({ status: "FAILED" }),
+      })
+    );
+    expect(mockReleaseWorkspaceDMReservation).not.toHaveBeenCalled();
+    // The lost follow-up shows up in Diagnostics instead.
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        workspaceId: "workspace_123",
+        source: "WORKER",
+        level: "WARNING",
+        message: "Follow-up not scheduled after a delivered link",
+      }),
+    });
+  });
+
+  it("still schedules the follow-up after a read fallback delivered the link", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue(withFollowUp);
+
+    await getProcessor()(
+      createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        payload: "reveal:auto_789",
+        fallback: true,
+      })
+    );
+
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-followup",
+      expect.objectContaining({ automationId: "auto_789" }),
+      expect.objectContaining({ jobId: "followup_auto_789_commenter_999" })
+    );
+  });
+
+  it("schedules nothing when the tap was already delivered", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue(withFollowUp);
+    mockPrisma.postbackDelivery.create.mockRejectedValue({ code: "P2002" });
+
+    await getProcessor()(createMockPostbackJob());
+
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+});
+
+describe("DM Worker — job dispatch", () => {
+  function prismaCallCount(): number {
+    return Object.values(mockPrisma)
+      .flatMap((model) => Object.values(model))
+      .reduce((total, fn) => total + fn.mock.calls.length, 0);
+  }
+
+  // A worker rolled back below a release that added a job type must leave
+  // those jobs alone rather than treat them as comments.
+  it("ignores a job name it does not know", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await expect(
+        getProcessor()({ ...createMockJob(), name: "process-unknown" })
+      ).resolves.toBeUndefined();
+
+      expect(prismaCallCount()).toBe(0);
+      expect(mockQueueAdd).not.toHaveBeenCalled();
+      expect(mockSendPrivateReply).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(
+        "[DM Worker] Ignoring unknown job",
+        "process-unknown",
+        "job_001"
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it.each([
+    { label: "a job without a name", name: undefined },
+    { label: "a process-comment job", name: "process-comment" },
+  ])("runs $label as a comment", async ({ name }) => {
+    await getProcessor()({ ...createMockJob(), name });
+
+    expect(mockPrisma.automation.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          OR: [{ postId: "media_101" }, { matchAnyPost: true }],
+        }),
+      })
+    );
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
   });
 });
 

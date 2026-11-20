@@ -1,5 +1,5 @@
 import { prisma } from '@/lib/db/client';
-import { getDMQueue, MESSAGE_JOB_NAME, POSTBACK_JOB_NAME } from '@/lib/queue/client';
+import { COMMENT_JOB_NAME, getDMQueue, MESSAGE_JOB_NAME, POSTBACK_JOB_NAME } from '@/lib/queue/client';
 import { parseCommentEvents, parseMessageEvents, parsePostbackEvents, parseReadEvents } from '@/lib/meta/webhook';
 import { Prisma, type InstagramProvider } from '@/app/generated/prisma/client';
 
@@ -10,6 +10,14 @@ export async function processInstagramWebhook({ payload: incoming, provider, wor
   payload: InstagramPayload; provider: InstagramProvider; workspaceId?: string;
 }) {
   if (incoming.object !== 'instagram' || !Array.isArray(incoming.entry)) return;
+  // Every DM the account sends comes back as an echo, which the parsers drop.
+  // A payload that holds nothing else would still cost an account lookup and a
+  // WebhookEvent insert and update, and wake the database for nothing. Nothing
+  // reads such a row: Diagnostics shows failed events only, and the sweep
+  // reads comment payloads.
+  const hasWork = [parseCommentEvents, parsePostbackEvents, parseMessageEvents, parseReadEvents]
+    .some((parse) => parse(incoming).length > 0);
+  if (!hasWork) return;
   const accounts = await prisma.instagramAccount.findMany({
     where: { instagramId: { in: incoming.entry.map(e => e.id) }, provider, ...(workspaceId ? { workspaceId } : {}) },
     select: { id: true, instagramId: true, workspaceId: true },
@@ -41,7 +49,7 @@ export async function processInstagramWebhook({ payload: incoming, provider, wor
       if (!account) continue;
 
       await queue.add(
-        "process-comment",
+        COMMENT_JOB_NAME,
         {
           instagramAccountId: event.instagramAccountId,
           accountConnectionId: accountMap.get(event.instagramAccountId)?.id,
@@ -149,6 +157,7 @@ export async function processInstagramWebhook({ payload: incoming, provider, wor
           },
         },
         select: {
+          commentId: true,
           automation: {
             select: {
               id: true,
@@ -157,9 +166,20 @@ export async function processInstagramWebhook({ payload: incoming, provider, wor
         },
       });
 
+      // A tap that delivered the link leaves a SENT "reveal:<user>" row, and
+      // the fallback job returns as soon as it reads that row. Every later
+      // message this person reads sends another receipt, so skip those
+      // campaigns here rather than queue jobs that only wake the database to
+      // do nothing. The rows come with the query above; no extra query.
+      const revealedAutomationIds = new Set(
+        openingLogs
+          .filter((log) => log.commentId === `reveal:${event.userId}`)
+          .map((log) => log.automation.id)
+      );
       const scheduledAutomationIds = new Set<string>();
       for (const log of openingLogs) {
         const automation = log.automation;
+        if (revealedAutomationIds.has(automation.id)) continue;
         if (scheduledAutomationIds.has(automation.id)) continue;
         scheduledAutomationIds.add(automation.id);
 

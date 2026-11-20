@@ -19,6 +19,7 @@ const { mockPrisma, queueAdd, readComments } = vi.hoisted(() => ({
 }));
 vi.mock("@/lib/queue/client", () => ({
   getDMQueue: () => ({ add: queueAdd }),
+  COMMENT_JOB_NAME: "process-comment",
 }));
 vi.mock("@/lib/instagram/provider", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/instagram/provider")>()),
@@ -131,8 +132,11 @@ describe("comment polling does not recreate unsafe sends", () => {
       await reconcileComments();
       await reconcileComments();
       expect(queueAdd).toHaveBeenCalledTimes(2);
-      for (const [, data] of queueAdd.mock.calls)
+      for (const [name, data] of queueAdd.mock.calls) {
+        // The worker runs only this name as a comment; any other is ignored.
+        expect(name).toBe("process-comment");
         expect(data.commentId).toBe("new");
+      }
     },
   );
 });

@@ -5,11 +5,18 @@ import {
   isDeliveryUnconfirmed,
 } from "@/lib/instagram/delivery-errors";
 import { claimCommentDelivery, MAX_COMMENT_SEND_ATTEMPTS } from "./comment-delivery";
+import { afterLinkDelivered } from "./after-delivery";
+import {
+  formatError,
+  isTemplateRejection,
+  sendPostbackOnce,
+} from "./send-helpers";
 import { createHash } from "node:crypto";
 import { UnrecoverableError, Worker, type Job } from "bullmq";
 import {
   getDMQueue,
   getRedisConnection,
+  COMMENT_JOB_NAME,
   MESSAGE_JOB_NAME,
   POSTBACK_JOB_NAME,
   FOLLOWUP_JOB_NAME,
@@ -21,9 +28,6 @@ import {
 } from "./client";
 import { prisma } from "@/lib/db/client";
 import {
-  MetaApiError,
-  RateLimitError,
-  TokenExpiredError,
   getUserFollowStatus,
   resolveRecipientName,
   sendCommentReply,
@@ -54,8 +58,6 @@ import {
 import { TRACKED_LINK_ORDER } from "@/lib/tracking/link-order";
 import { hashRecipientId } from "@/lib/tracking/server";
 
-import { ZernioApiError } from "@/lib/zernio/client";
-
 const BACKOFF_DELAYS = [5 * 60 * 1000, 15 * 60 * 1000, 45 * 60 * 1000];
 
 // How long to wait before re-checking a follow that came back false: one
@@ -81,60 +83,6 @@ const FOLLOW_RECHECK_TOTAL_MS = FOLLOW_RECHECK_DELAYS_MS.reduce(
   (total, ms) => total + ms,
   0
 );
-
-/**
- * Sends Meta answered with an error but may well have delivered anyway.
- *
- * Meta returns the generic code 1 OAuthException on /messages *after* the DM
- * has reached the recipient — observed in production: a user tapped the reply's
- * button 30 seconds after a send this worker had already marked FAILED. Logging
- * that as a plain failure is harmful twice over: the job is retried (up to
- * BACKOFF_DELAYS.length times, each retry another copy in the same inbox), and
- * the comment never satisfies the reconciler's "handled" test, so every sweep
- * re-enqueues it for the whole lookback window. Together that sent one person
- * dozens of identical DMs.
- *
- * Flagging it as unconfirmed instead is exactly what dmDeliveryUnconfirmed is
- * for: the sweep's dedup already treats that as handled, and processComment
- * skips a DM whose delivery is unconfirmed. The trade-off is deliberate — a
- * code 1 that really did fail means that person gets no DM and can comment
- * again, which is far better than spamming someone who already received it.
- */
-
-function formatError(error: unknown): string {
-  if (error instanceof MetaApiError) {
-    return `${error.name} ${error.code}: ${error.message}`;
-  }
-  if (error instanceof Error) {
-    return error.message;
-  }
-  return "Unknown error";
-}
-
-// Meta rejections that a plain-text retry cannot fix: the send was refused for
-// the conversation, not for the button template. Retrying as text just burns
-// the attempt and — worse — overwrites the real error with a misleading one
-// ("invalid for a private reply", because the first attempt already used up the
-// comment's single allowed private reply).
-const NON_TEMPLATE_REJECTIONS = [
-  /outside of allowed window/i,
-  /invalid for a private reply/i,
-  /requested user cannot be found/i,
-];
-
-function isTemplateRejection(error: unknown): boolean {
-  if (
-    error instanceof TokenExpiredError ||
-    error instanceof RateLimitError ||
-    error instanceof ZernioApiError
-  ) {
-    return false;
-  }
-  // Falling back is another send: allow it only for a proven template error.
-  return error instanceof MetaApiError && error.code === 100 &&
-    /template|button/i.test(error.message) &&
-    !NON_TEMPLATE_REJECTIONS.some((pattern) => pattern.test(error.message));
-}
 
 type WorkerTrackedLink = {
   slug: string;
@@ -622,7 +570,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         });
 
         await getDMQueue().add(
-          "process-comment",
+          COMMENT_JOB_NAME,
           {
             ...job.data,
             requeueAttempt: requeueAttempt + 1,
@@ -821,39 +769,6 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     }
 
     await postPublicReply();
-  }
-}
-
-async function sendPostbackOnce({
-  operationId,
-  send,
-}: {
-  operationId: string;
-  send: () => Promise<unknown>;
-}): Promise<boolean> {
-  try {
-    await prisma.postbackDelivery.create({ data: { id: operationId } });
-  } catch (error) {
-    if (
-      typeof error === "object" &&
-      error !== null &&
-      "code" in error &&
-      error.code === "P2002"
-    )
-      return false;
-    throw error;
-  }
-  try {
-    await send();
-    return true;
-  } catch (error) {
-    // A durable claim survives queue eviction, concurrent redelivery, and a
-    // process crash during delivery. Only confirmed rejections permit retry.
-    if (isConfirmedSendRejection(error)) {
-      await prisma.postbackDelivery.delete({ where: { id: operationId } });
-      throw error;
-    }
-    throw classifySendError(error);
   }
 }
 
@@ -1149,28 +1064,6 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
       );
       return;
     }
-    // Optional appreciation follow-up: once the link has been delivered, send a
-    // short thank-you. It is scheduled as its own delayed job so it can go out
-    // some minutes later (followUpDelayMinutes) rather than immediately. The
-    // deterministic job id dedupes repeat button taps to one follow-up per user.
-    if (automation.followUpEnabled && automation.followUpMessage?.trim()) {
-      const delayMs =
-        Math.max(0, automation.followUpDelayMinutes ?? 0) * 60_000;
-      await getDMQueue().add(
-        FOLLOWUP_JOB_NAME,
-        {
-          instagramAccountId: automation.instagramAccount.instagramId,
-          accountConnectionId: automation.instagramAccountId,
-          userId,
-          automationId: automation.id,
-          commenterName,
-        },
-        {
-          delay: delayMs,
-          jobId: `followup_${automation.id}_${userId}`,
-        },
-      );
-    }
     await prisma.dmLog.upsert({
       where: {
         automationId_commentId: {
@@ -1240,6 +1133,15 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     });
     throw error;
   }
+
+  // The link is out and recorded. Nothing that follows may turn this delivery
+  // into a failure or a retry, so it runs outside the send's try block.
+  await afterLinkDelivered({
+    automation,
+    userId,
+    commenterName,
+    via: fallback ? "read-fallback" : "tap",
+  });
 }
 
 /**
@@ -1461,51 +1363,59 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
       continue;
     }
 
-    try {
-      if (sendFollowPrompt) {
-        const promptText = renderMessageWithoutLink({
-          message:
-            automation.followPromptMessage ||
-            "Almost there! Follow me and tap the button below to grab your link 💛",
-          commenterName,
-        });
-        await sendDirectMessageWithButton({
-          context: accessToken,
-          instagramAccountId: automation.instagramAccount.instagramId,
-          userId: senderId,
-          text: promptText,
-          buttonTitle: automation.followPromptButtonLabel || "I'm following ✅",
-          payload: `followcheck:${automation.id}`,
-        });
-      } else {
-        await sendRevealDirectMessage({
-          accessToken: accessToken,
-          automation: automation,
-          userId: senderId,
-          commenterName: commenterName,
-          context: "message trigger",
-        });
+    // A durable claim per account, campaign and inbound message, taken before
+    // Instagram is called. The DmLog check above only sees rows that were
+    // written: a retry after a send whose log write failed, or the same
+    // message redelivered once BullMQ no longer remembers its job id, used to
+    // send the reply a second time.
+    const operationId = createHash("sha256")
+      .update(JSON.stringify([
+        automation.instagramAccountId,
+        "dm",
+        automation.id,
+        messageId,
+      ]))
+      .digest("hex");
 
-        // The link has been delivered, so the appreciation follow-up applies
-        // here exactly as it does after a button tap. Not scheduled behind the
-        // follow prompt — no link went out yet in that branch.
-        if (automation.followUpEnabled && automation.followUpMessage?.trim()) {
-          await getDMQueue().add(
-            FOLLOWUP_JOB_NAME,
-            {
-              instagramAccountId: automation.instagramAccount.instagramId,
-              accountConnectionId: automation.instagramAccountId,
-              userId: senderId,
-              automationId: automation.id,
-              commenterName,
-            },
-            {
-              delay: Math.max(0, automation.followUpDelayMinutes ?? 0) * 60_000,
-              jobId: `followup_${automation.id}_${senderId}`,
-            }
-          );
-        }
+    let linkSent = false;
+    try {
+      const sent = await sendPostbackOnce({
+        operationId,
+        send: () =>
+          sendFollowPrompt
+            ? sendDirectMessageWithButton({
+                context: accessToken,
+                instagramAccountId: automation.instagramAccount.instagramId,
+                userId: senderId,
+                text: renderMessageWithoutLink({
+                  message:
+                    automation.followPromptMessage ||
+                    "Almost there! Follow me and tap the button below to grab your link 💛",
+                  commenterName,
+                }),
+                buttonTitle:
+                  automation.followPromptButtonLabel || "I'm following ✅",
+                payload: `followcheck:${automation.id}`,
+              })
+            : sendRevealDirectMessage({
+                accessToken: accessToken,
+                automation: automation,
+                userId: senderId,
+                commenterName: commenterName,
+                context: "message trigger",
+              }),
+      });
+      if (!sent) {
+        // An earlier run sent this reply, or may have: never send it again.
+        await releaseWorkspaceDMReservation(
+          automation.workspaceId,
+          usage.periodStart
+        );
+        continue;
       }
+      // The follow prompt carries no link, so nothing follows it yet: the tap
+      // on its button delivers the link and schedules the follow-up.
+      linkSent = !sendFollowPrompt;
 
       await prisma.dmLog.upsert({
         where: {
@@ -1526,11 +1436,17 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
           errorMessage: null,
         },
       });
-    } catch (error) {
-      await releaseWorkspaceDMReservation(
-        automation.workspaceId,
-        usage.periodStart
-      );
+    } catch (originalError) {
+      const error = classifySendError(originalError);
+      // Like a button tap: the reservation is kept when Instagram may have
+      // delivered the reply, and an unknown outcome ends the job without a
+      // retry (see processJob), since a retry could only send it again.
+      if (isConfirmedSendRejection(error)) {
+        await releaseWorkspaceDMReservation(
+          automation.workspaceId,
+          usage.periodStart
+        );
+      }
       await prisma.dmLog.upsert({
         where: {
           automationId_commentId: {
@@ -1555,6 +1471,17 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
       });
       throw error;
     }
+
+    // Outside the send's try block, so a failure here can never mark the
+    // delivered reply FAILED or retry the job into a second send.
+    if (linkSent) {
+      await afterLinkDelivered({
+        automation,
+        userId: senderId,
+        commenterName,
+        via: "dm",
+      });
+    }
   }
 }
 
@@ -1568,9 +1495,35 @@ async function dispatchJob(job: Job<DmQueueJob>): Promise<void> {
   if (job.name === MESSAGE_JOB_NAME) {
     return processMessage(job as Job<ProcessMessageJob>);
   }
+  // Every other name used to fall through to processComment. A job type this
+  // worker does not know yet (one added by a newer release, still delayed in
+  // Redis when the worker is rolled back) would then be read as a comment.
+  // Ignore it instead. A job without a name still counts as a comment.
+  if (job.name && job.name !== COMMENT_JOB_NAME) {
+    console.warn("[DM Worker] Ignoring unknown job", job.name, job.id);
+    return;
+  }
   return processComment(job as Job<ProcessCommentJob>);
 }
 
+/**
+ * Sends Meta answered with an error but may well have delivered anyway.
+ *
+ * Meta returns the generic code 1 OAuthException on /messages *after* the DM
+ * has reached the recipient — observed in production: a user tapped the reply's
+ * button 30 seconds after a send this worker had already marked FAILED. Logging
+ * that as a plain failure is harmful twice over: the job is retried (up to
+ * BACKOFF_DELAYS.length times, each retry another copy in the same inbox), and
+ * the comment never satisfies the reconciler's "handled" test, so every sweep
+ * re-enqueues it for the whole lookback window. Together that sent one person
+ * dozens of identical DMs.
+ *
+ * Flagging it as unconfirmed instead is exactly what dmDeliveryUnconfirmed is
+ * for: the sweep's dedup already treats that as handled, and processComment
+ * skips a DM whose delivery is unconfirmed. The trade-off is deliberate — a
+ * code 1 that really did fail means that person gets no DM and can comment
+ * again, which is far better than spamming someone who already received it.
+ */
 async function processJob(job: Job<DmQueueJob>): Promise<void> {
   try {
     await dispatchJob(job);
