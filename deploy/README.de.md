@@ -71,6 +71,10 @@ node deploy/make-env.mjs <ordner>
   Instagram-Konten unbrauchbar. Zusätzlich im Passwort-Manager sichern.
 - `vercel.env` kommt in Vercel unter Settings → Environment Variables,
   `worker.env` per `deploy/oracle/upload-env.sh` auf den Server.
+- `vercel.env` enthält `DEFAULT_LOCALE=de`: Dashboard und Anmeldung sind auf
+  Deutsch, bis jemand im Sprachmenü eine andere Sprache wählt. Fehlt die
+  Variable in Vercel (Projekt von vor dieser Änderung), bleibt die Oberfläche
+  englisch: ergänzen und neu deployen.
 
 ## Worker-Server einrichten
 

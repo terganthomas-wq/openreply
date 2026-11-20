@@ -42,6 +42,9 @@ export default function LanguageSwitcher() {
           <option value="ru" lang="ru">
             Русский
           </option>
+          <option value="de" lang="de">
+            Deutsch
+          </option>
         </select>
       </label>
       {failed && (

@@ -172,6 +172,8 @@ write(path.join(dir, "vercel.env"), [
   ["LEGAL_DATA_DELETION_URL", pick("LEGAL_DATA_DELETION_URL")],
   ["DB_POOL_MAX", "2"],
   ["HEALTH_STUCK_QUEUE_WAITING", "3"],
+  // Dashboard and sign-in in German until someone picks another language.
+  ["DEFAULT_LOCALE", "de"],
   ["NEXT_TELEMETRY_DISABLED", "1"],
   ["CHECKPOINT_DISABLE", "1"],
 ]);

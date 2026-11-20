@@ -33,15 +33,63 @@ describe("language preference", () => {
     expect(t("Settings")).toBe("Настройки");
   });
 
+  it("renders German from the saved cookie", async () => {
+    store.get.mockReturnValue({ value: "de" });
+    const { locale, t } = await getI18n();
+    expect(locale).toBe("de");
+    expect(t("Settings")).toBe("Einstellungen");
+  });
+
   it("falls back to English for an invalid cookie", async () => {
+    vi.stubEnv("DEFAULT_LOCALE", undefined);
     store.get.mockReturnValue({ value: "unsupported" });
     expect((await getI18n()).locale).toBe("en");
+  });
+
+  it("uses the installation's DEFAULT_LOCALE until a language is saved", async () => {
+    vi.stubEnv("DEFAULT_LOCALE", "de");
+    store.get.mockReturnValue(undefined);
+    const { locale, t } = await getI18n();
+    expect(store.get).toHaveBeenCalledWith(LOCALE_COOKIE);
+    expect(locale).toBe("de");
+    expect(t("Settings")).toBe("Einstellungen");
+
+    store.get.mockReturnValue({ value: "unsupported" });
+    expect((await getI18n()).locale).toBe("de");
+  });
+
+  it("keeps a saved language over DEFAULT_LOCALE, English included", async () => {
+    vi.stubEnv("DEFAULT_LOCALE", "de");
+    store.get.mockReturnValue({ value: "en" });
+    expect((await getI18n()).locale).toBe("en");
+    store.get.mockReturnValue({ value: "zh-TW" });
+    expect((await getI18n()).locale).toBe("zh-TW");
+  });
+
+  it("ignores an unsupported DEFAULT_LOCALE", async () => {
+    store.get.mockReturnValue(undefined);
+    for (const value of ["", "de-DE", "DE", "fr"]) {
+      vi.stubEnv("DEFAULT_LOCALE", value);
+      expect((await getI18n()).locale, value).toBe("en");
+    }
   });
 
   it("persists only the language cookie, across routes and browser restarts", async () => {
     vi.stubEnv("NODE_ENV", "production");
     await setLocale("zh-TW");
     expect(store.set).toHaveBeenCalledExactlyOnceWith(LOCALE_COOKIE, "zh-TW", {
+      path: "/",
+      maxAge: 31_536_000,
+      sameSite: "lax",
+      httpOnly: true,
+      secure: true,
+    });
+  });
+
+  it("saves German like any other language", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    await setLocale("de");
+    expect(store.set).toHaveBeenCalledExactlyOnceWith(LOCALE_COOKIE, "de", {
       path: "/",
       maxAge: 31_536_000,
       sameSite: "lax",
