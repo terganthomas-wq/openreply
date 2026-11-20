@@ -106,11 +106,28 @@ if (created) write(internFile, Object.entries(intern));
 if (!/^[0-9a-f]{64}$/.test(intern.ENCRYPTION_KEY)) throw new Error(".intern.env: ENCRYPTION_KEY ist beschädigt");
 
 const u = parse(userFile);
+// Consoles often copy a whole command ("redis-cli -u redis://…", "psql '…'").
+// Keep only the connection URL itself.
+for (const [key, re] of [
+  ["DATABASE_URL", /postgres(?:ql)?:\/\/[^\s'"]+/],
+  ["REDIS_URL", /rediss?:\/\/[^\s'"]+/],
+]) {
+  const match = u[key]?.match(re);
+  if (match) u[key] = match[0];
+}
 const status = {};
 for (const [key, [re, hint]] of Object.entries(RULES)) {
   if (!u[key]) status[key] = REQUIRED.includes(key) ? "fehlt" : "leer";
   else if (!re.test(u[key])) status[key] = `Format prüfen (${hint})`;
   else status[key] = "ok";
+}
+// Copy buttons sometimes copy the masked text ("****") instead of the secret.
+for (const key of ["DATABASE_URL", "REDIS_URL"]) {
+  if (status[key] !== "ok") continue;
+  const password = decodeURIComponent(new URL(u[key]).password);
+  if (/^[*•●·]+$/.test(password)) {
+    status[key] = "Passwort ist nur ****: in der Konsole erst aufdecken (Auge), dann kopieren";
+  }
 }
 if (status.DATABASE_URL === "ok") {
   const host = new URL(u.DATABASE_URL).hostname;
