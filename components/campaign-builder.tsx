@@ -13,7 +13,7 @@
  */
 
 import { useI18n } from "@/lib/i18n/provider";
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useEffectEvent, useId, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import AccountSelect, { type AccountOption } from "@/components/account-select";
 import PostPicker from "@/components/post-picker";
@@ -25,9 +25,36 @@ import {
   type ImportRow,
 } from "@/lib/import-queue";
 import { BUTTON_LABEL_MAX, BUTTON_TEXT_MAX } from "@/lib/validation/text";
+import {
+  EMPTY_MESSAGE_DEFAULTS,
+  parseMessageDefaults,
+  withImportRow,
+  type CampaignDefaults,
+} from "@/lib/campaigns/message-defaults";
 
 type TriggerScope = "specific" | "any" | "next";
 type MatchMode = "specific" | "any";
+
+const MESSAGE_DEFAULTS_URL = "/api/workspace/message-defaults";
+
+// The editor's own starting point, for a workspace without default texts:
+// nothing switched on but the question-mark filter, and the English button
+// labels the senders fall back to.
+const BLANK_CAMPAIGN_TEXTS: CampaignDefaults = {
+  ...EMPTY_MESSAGE_DEFAULTS.campaign,
+  followPromptButtonLabel: "i'm following",
+  linkButtonLabel: "Open link",
+};
+
+// The message of the first field the API refused, as "field: message", or
+// null. The defaults route names nested fields by their whole path.
+function firstFieldError(details: unknown): string | null {
+  const fieldErrors = (details as { fieldErrors?: Record<string, string[]> })
+    ?.fieldErrors;
+  const field = fieldErrors && Object.keys(fieldErrors)[0];
+  if (!field) return null;
+  return `${field.split(".").pop()}: ${fieldErrors[field][0]}`;
+}
 
 interface LoadedCampaign {
   id: string;
@@ -176,10 +203,25 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
   const { t } = useI18n();
   const router = useRouter();
 
-  const [loading, setLoading] = useState(mode === "edit");
+  // Editing waits for the campaign, a new campaign for the default texts, so
+  // nothing typed meanwhile is overwritten when they arrive.
+  const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // New mode: the workspace's default texts (null when it has none) and
+  // whether this person may change them.
+  const [campaignDefaults, setCampaignDefaults] =
+    useState<CampaignDefaults | null>(null);
+  const [canManageDefaults, setCanManageDefaults] = useState(false);
+  const [defaultsBusy, setDefaultsBusy] = useState<"save" | "reset" | null>(
+    null
+  );
+  const [defaultsStatus, setDefaultsStatus] = useState<{
+    tone: "success" | "error";
+    text: string;
+  } | null>(null);
 
   const [name, setName] = useState("");
   const [accounts, setAccounts] = useState<AccountOption[]>([]);
@@ -205,30 +247,51 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
   const [dmTriggerEnabled, setDmTriggerEnabled] = useState(false);
   // On for new campaigns: a question under a reel is rarely a request for the
   // link. Editing loads the stored value, which is off for older campaigns.
-  const [ignoreQuestionComments, setIgnoreQuestionComments] = useState(true);
+  const [ignoreQuestionComments, setIgnoreQuestionComments] = useState(
+    BLANK_CAMPAIGN_TEXTS.ignoreQuestionComments
+  );
 
-  const [publicReplyEnabled, setPublicReplyEnabled] = useState(false);
+  // The texts and switches below start blank and take the workspace's
+  // default texts in new mode (applyCampaignFields).
+  const [publicReplyEnabled, setPublicReplyEnabled] = useState(
+    BLANK_CAMPAIGN_TEXTS.publicReplyEnabled
+  );
   const [publicReplyMessages, setPublicReplyMessages] = useState<string[]>([""]);
 
-  const [openingDmEnabled, setOpeningDmEnabled] = useState(false);
-  const [openingDmMessage, setOpeningDmMessage] = useState("");
-  const [openingDmButtonLabel, setOpeningDmButtonLabel] = useState("");
+  const [openingDmEnabled, setOpeningDmEnabled] = useState(
+    BLANK_CAMPAIGN_TEXTS.openingDmEnabled
+  );
+  const [openingDmMessage, setOpeningDmMessage] = useState(
+    BLANK_CAMPAIGN_TEXTS.openingDmMessage
+  );
+  const [openingDmButtonLabel, setOpeningDmButtonLabel] = useState(
+    BLANK_CAMPAIGN_TEXTS.openingDmButtonLabel
+  );
 
-  const [dmMessage, setDmMessage] = useState("");
+  const [dmMessage, setDmMessage] = useState(BLANK_CAMPAIGN_TEXTS.dmMessage);
   const [linkOpen, setLinkOpen] = useState(false);
   const [trackedDestinationUrl, setTrackedDestinationUrl] = useState("");
-  const [linkButtonLabel, setLinkButtonLabel] = useState("Open link");
+  const [linkButtonLabel, setLinkButtonLabel] = useState(
+    BLANK_CAMPAIGN_TEXTS.linkButtonLabel
+  );
   const [secondLinkOpen, setSecondLinkOpen] = useState(false);
   const [secondaryDestinationUrl, setSecondaryDestinationUrl] = useState("");
   const [secondaryButtonLabel, setSecondaryButtonLabel] = useState("Open link");
-  const [requireFollow, setRequireFollow] = useState(false);
-  const [followPromptMessage, setFollowPromptMessage] = useState("");
-  const [followPromptButtonLabel, setFollowPromptButtonLabel] =
-    useState("i'm following");
+  const [requireFollow, setRequireFollow] = useState(
+    BLANK_CAMPAIGN_TEXTS.requireFollow
+  );
+  const [followPromptMessage, setFollowPromptMessage] = useState(
+    BLANK_CAMPAIGN_TEXTS.followPromptMessage
+  );
+  const [followPromptButtonLabel, setFollowPromptButtonLabel] = useState(
+    BLANK_CAMPAIGN_TEXTS.followPromptButtonLabel
+  );
   // Left empty, the second follow request repeats the first one.
-  const [followPromptRetryMessage, setFollowPromptRetryMessage] = useState("");
+  const [followPromptRetryMessage, setFollowPromptRetryMessage] = useState(
+    BLANK_CAMPAIGN_TEXTS.followPromptRetryMessage
+  );
   const [followPromptRetryButtonLabel, setFollowPromptRetryButtonLabel] =
-    useState("");
+    useState(BLANK_CAMPAIGN_TEXTS.followPromptRetryButtonLabel);
   const [followUpEnabled, setFollowUpEnabled] = useState(false);
   const [followUpMessage, setFollowUpMessage] = useState("");
   const [followUpDelayMinutes, setFollowUpDelayMinutes] = useState(0);
@@ -377,9 +440,42 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
     };
   }, [selectedAccountId, mode, campaignId]);
 
-  // Prefill the editable fields from one queued import row. The reel is left
-  // unset so the user picks it per row.
-  function prefillFromRow(row: ImportRow) {
+  // Put default texts and switches into the form; a field left out stays as
+  // it is. The offer switch waits for the offer controls (WP10).
+  function applyCampaignFields(fields: Partial<CampaignDefaults>) {
+    if (fields.openingDmEnabled !== undefined)
+      setOpeningDmEnabled(fields.openingDmEnabled);
+    if (fields.openingDmMessage !== undefined)
+      setOpeningDmMessage(fields.openingDmMessage);
+    if (fields.openingDmButtonLabel !== undefined)
+      setOpeningDmButtonLabel(fields.openingDmButtonLabel);
+    if (fields.requireFollow !== undefined) setRequireFollow(fields.requireFollow);
+    if (fields.followPromptMessage !== undefined)
+      setFollowPromptMessage(fields.followPromptMessage);
+    if (fields.followPromptButtonLabel !== undefined)
+      setFollowPromptButtonLabel(fields.followPromptButtonLabel);
+    if (fields.followPromptRetryMessage !== undefined)
+      setFollowPromptRetryMessage(fields.followPromptRetryMessage);
+    if (fields.followPromptRetryButtonLabel !== undefined)
+      setFollowPromptRetryButtonLabel(fields.followPromptRetryButtonLabel);
+    if (fields.dmMessage !== undefined) setDmMessage(fields.dmMessage);
+    if (fields.linkButtonLabel !== undefined)
+      setLinkButtonLabel(fields.linkButtonLabel);
+    if (fields.publicReplyEnabled !== undefined)
+      setPublicReplyEnabled(fields.publicReplyEnabled);
+    // The form always shows at least one reply field.
+    if (fields.publicReplyMessages !== undefined)
+      setPublicReplyMessages(
+        fields.publicReplyMessages.length > 0 ? fields.publicReplyMessages : [""]
+      );
+    if (fields.ignoreQuestionComments !== undefined)
+      setIgnoreQuestionComments(fields.ignoreQuestionComments);
+  }
+
+  // Prefill the editable fields from one queued import row: the cells it
+  // fills go over the workspace's default texts, so every row starts from
+  // them. The reel is left unset so the user picks it per row.
+  function prefillFromRow(row: ImportRow, defaults: CampaignDefaults | null) {
     setName(row.name ?? "");
     setTriggerScope("specific");
     setPostId(null);
@@ -388,38 +484,68 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
     setPostCaption("");
     setMatchMode("specific");
     setKeywordText((row.keywords ?? []).join(", "));
-    setDmMessage(row.dmMessage ?? "");
-    setPublicReplyEnabled(Boolean(row.publicReply));
-    setPublicReplyMessages(row.publicReply ? [row.publicReply] : [""]);
-    const hasOpening = Boolean(row.openingDmMessage);
-    setOpeningDmEnabled(hasOpening);
-    setOpeningDmMessage(row.openingDmMessage ?? "");
-    setOpeningDmButtonLabel(
-      row.openingDmButtonLabel || (hasOpening ? "Send link" : "")
-    );
+    applyCampaignFields(withImportRow(defaults, row));
     const link = row.trackedUrl ?? "";
     setTrackedDestinationUrl(link);
-    setLinkOpen(Boolean(link));
+    // With default texts the link is what is left to fill in.
+    setLinkOpen(Boolean(link) || defaults !== null);
     setError(null);
   }
 
-  // Pick up a staged CSV import (new mode only) and prefill the first row.
+  // Once the defaults are in: the first queued row over them, or the
+  // defaults alone. An Effect Event, so the effect below runs once per mount
+  // and still calls this render's functions.
+  const onDefaultsLoaded = useEffectEvent(
+    (defaults: CampaignDefaults | null, queue: ImportRow[] | null) => {
+      if (queue) {
+        prefillFromRow(queue[0], defaults);
+      } else if (defaults) {
+        applyCampaignFields(defaults);
+        setLinkOpen(true);
+      }
+    }
+  );
+
+  // New campaigns open with the workspace's default texts (R14): the opening
+  // DM, both follow requests, the link DM and its button, the public replies
+  // and the question-mark filter, so keywords, post and link are what is
+  // left. A staged CSV import (new mode only) puts its rows over them, the
+  // first one right away. Editing keeps the stored values and never asks.
   /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     if (mode !== "new") return;
+    let queue: ImportRow[] | null = null;
     try {
       const raw = window.localStorage.getItem(IMPORT_QUEUE_KEY);
       const acct = window.localStorage.getItem(IMPORT_ACCOUNT_KEY);
-      if (!raw) return;
-      const queue = JSON.parse(raw) as ImportRow[];
-      if (!Array.isArray(queue) || queue.length === 0) return;
-      setImportQueue(queue);
-      setImportTotal(queue.length);
-      if (acct) setSelectedAccountId(acct);
-      prefillFromRow(queue[0]);
+      const staged = raw ? (JSON.parse(raw) as ImportRow[]) : null;
+      if (Array.isArray(staged) && staged.length > 0) {
+        queue = staged;
+        setImportQueue(staged);
+        setImportTotal(staged.length);
+        if (acct) setSelectedAccountId(acct);
+      }
     } catch {
       // ignore a malformed queue
     }
+
+    let cancelled = false;
+    fetch(MESSAGE_DEFAULTS_URL, { cache: "no-store" })
+      .then((r) => r.json())
+      .then((payload) => (payload.success ? payload.data : null))
+      // Without them the editor opens blank, as it always did.
+      .catch(() => null)
+      .then((data) => {
+        if (cancelled) return;
+        const defaults = parseMessageDefaults(data?.defaults)?.campaign ?? null;
+        setCampaignDefaults(defaults);
+        setCanManageDefaults(data?.canManage === true);
+        onDefaultsLoaded(defaults, queue);
+        setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [mode]);
   /* eslint-enable react-hooks/set-state-in-effect */
 
@@ -535,7 +661,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
             // ignore
           }
           setImportQueue(remaining);
-          prefillFromRow(remaining[0]);
+          prefillFromRow(remaining[0], campaignDefaults);
           setSaving(false);
           if (typeof window !== "undefined") window.scrollTo({ top: 0 });
           return;
@@ -587,7 +713,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
         // ignore
       }
       setImportQueue(remaining);
-      prefillFromRow(remaining[0]);
+      prefillFromRow(remaining[0], campaignDefaults);
       if (typeof window !== "undefined") window.scrollTo({ top: 0 });
       return;
     }
@@ -600,6 +726,114 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
     }
     router.push("/campaigns");
     router.refresh();
+  }
+
+  // The texts and switches new campaigns take from the defaults, as this
+  // form has them. A text is kept while its switch is off, so a campaign
+  // that turns the switch on gets the default text back.
+  function currentCampaignTexts(): Omit<CampaignDefaults, "offersEnabled"> {
+    return {
+      openingDmEnabled,
+      openingDmMessage,
+      openingDmButtonLabel,
+      requireFollow,
+      followPromptMessage,
+      followPromptButtonLabel,
+      followPromptRetryMessage,
+      followPromptRetryButtonLabel,
+      dmMessage,
+      linkButtonLabel,
+      publicReplyEnabled,
+      publicReplyMessages: publicReplyMessages
+        .map((m) => m.trim())
+        .filter(Boolean),
+      ignoreQuestionComments,
+    };
+  }
+
+  // Owners and admins: new campaigns of the workspace open with these texts.
+  // The offer switch is not sent, so it keeps its saved value.
+  async function saveTextsAsDefaults() {
+    setDefaultsStatus(null);
+    if (
+      openingDmEnabled &&
+      (!openingDmMessage.trim() || !openingDmButtonLabel.trim())
+    ) {
+      return setDefaultsStatus({
+        tone: "error",
+        text: t("Your opening DM needs a message and a button label."),
+      });
+    }
+    setDefaultsBusy("save");
+    try {
+      const res = await fetch(MESSAGE_DEFAULTS_URL, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ campaign: currentCampaignTexts() }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setCampaignDefaults(
+          parseMessageDefaults(data.data?.defaults)?.campaign ?? null
+        );
+        setDefaultsStatus({
+          tone: "success",
+          text: t("Saved. New campaigns now open with these texts."),
+        });
+      } else {
+        setDefaultsStatus({
+          tone: "error",
+          text:
+            firstFieldError(data.details) ??
+            data.error ??
+            t("Could not save the default texts."),
+        });
+      }
+    } catch {
+      setDefaultsStatus({
+        tone: "error",
+        text: t("Could not save the default texts."),
+      });
+    } finally {
+      setDefaultsBusy(null);
+    }
+  }
+
+  // Owners and admins: back to the built-in texts of the interface language
+  // (none for some languages: then new campaigns open blank). The form shows
+  // what new campaigns open with from now on.
+  async function resetDefaults() {
+    if (
+      !window.confirm(
+        t("Reset the default texts for new campaigns to the built-in ones? The texts in this form are replaced as well.")
+      )
+    )
+      return;
+    setDefaultsStatus(null);
+    setDefaultsBusy("reset");
+    try {
+      const res = await fetch(MESSAGE_DEFAULTS_URL, { method: "DELETE" });
+      const data = await res.json();
+      if (!data.success) {
+        setDefaultsStatus({
+          tone: "error",
+          text: data.error ?? t("Could not reset the default texts."),
+        });
+        return;
+      }
+      const defaults =
+        parseMessageDefaults(data.data?.defaults)?.campaign ?? null;
+      setCampaignDefaults(defaults);
+      applyCampaignFields(defaults ?? BLANK_CAMPAIGN_TEXTS);
+      setDefaultsStatus({ tone: "success", text: t("Default texts reset.") });
+    } catch {
+      setDefaultsStatus({
+        tone: "error",
+        text: t("Could not reset the default texts."),
+      });
+    } finally {
+      setDefaultsBusy(null);
+    }
   }
 
   if (loading) {
@@ -1114,6 +1348,48 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
             </p>
           </div>
         </Section>
+
+        {/* Owners and admins manage the workspace's default texts where
+            they see them: in a new campaign. */}
+        {mode === "new" && canManageDefaults && (
+          <Section title={t("Default texts")}>
+            <div className="space-y-3 rounded-lg border border-border p-3">
+              <p className="text-xs text-muted">
+                {t("Saves the opening DM, both follow requests, the link DM text and button, the public replies and which of them are on, and the question-mark filter. Everything else, like keywords, post and link, is set per campaign.")}
+              </p>
+              <button
+                type="button"
+                onClick={saveTextsAsDefaults}
+                disabled={defaultsBusy !== null || saving}
+                className="w-full rounded-lg border border-border px-4 py-2 text-sm font-medium text-muted hover:text-foreground disabled:opacity-50"
+              >
+                {defaultsBusy === "save"
+                  ? t("Saving…")
+                  : t("Save these texts as defaults for new campaigns")}
+              </button>
+              {campaignDefaults && (
+                <button
+                  type="button"
+                  onClick={resetDefaults}
+                  disabled={defaultsBusy !== null || saving}
+                  className="w-full rounded-lg border border-border px-4 py-2 text-sm font-medium text-muted hover:text-foreground disabled:opacity-50"
+                >
+                  {t("Reset to built-in defaults")}
+                </button>
+              )}
+              {defaultsStatus && (
+                <p
+                  role="status"
+                  className={`text-xs ${
+                    defaultsStatus.tone === "error" ? "text-error" : "text-success"
+                  }`}
+                >
+                  {defaultsStatus.text}
+                </p>
+              )}
+            </div>
+          </Section>
+        )}
       </div>
 
       {/* Right: preview */}
