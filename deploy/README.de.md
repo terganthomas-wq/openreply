@@ -12,6 +12,29 @@ stehen in Frankfurt, soweit der Dienst das anbietet.
 | Worker | Oracle Cloud Always Free (Ubuntu 24.04, Node 24, pm2) | Fragt die Datenbank nur alle 30 Minuten ab, damit Neon schlafen kann. |
 | Login-Mails | Resend | Ohne eigene Domain nur an die Adresse des Resend-Kontos. |
 
+## Meta-App (Unified Login)
+
+Neue Meta-Apps bieten seit Oktober 2026 nur noch „API setup with Unified login“.
+Eingerichtet ist:
+
+- Anwendungsfall „Messaging und Content auf Instagram verwalten“, App gehört
+  einem Business-Portfolio.
+- Login-Konfiguration (Facebook Login for Business): Systemnutzer-Token, läuft
+  nie ab, Asset nur Instagram-Konten, Rechte `instagram_basic`,
+  `instagram_manage_comments`, `instagram_manage_messages`,
+  `instagram_manage_insights`, `business_management`. Ohne `business_management`
+  sieht der Token kein Instagram-Konto.
+- Weiterleitung `https://<domain>/api/instagram/callback`, Webhook
+  `https://<domain>/api/webhook` mit den Feldern comments, messages,
+  messaging_postbacks und messaging_seen.
+- Jedes verbundene Instagram-Konto braucht ohne App-Review die Rolle
+  „Instagram-Tester“ (Einladung in Instagram unter Apps und Websites annehmen).
+- Variablen: `META_APP_ID`, `META_LOGIN_CONFIG_ID`, `FACEBOOK_APP_SECRET`.
+
+Unter Standardzugriff kommen laut Erfahrungsberichten Kommentar-Webhooks an,
+`messages`/`messaging_postbacks` aber oft nicht. Kampagnen deshalb mit dem Link
+direkt in der ersten DM bauen (ohne Button davor, ohne Follow-Gate).
+
 ## Zugangsdaten
 
 Nie in dieses Repository. Alle Werte stehen in einem Ordner außerhalb des Repos:
