@@ -10,7 +10,9 @@ import { useI18n } from "@/lib/i18n/provider";
  *
  * Fixed-size iPhone 17 Pro mockup that simulates how a campaign appears on
  * Instagram across three screens (Post, Comments, DM). Every screen renders in
- * the identical frame so switching tabs never resizes the phone.
+ * the identical frame so switching tabs never resizes the phone. The phone,
+ * its status bar, avatar and DM header and composer are exported for the
+ * offer editor's preview (components/offer-preview.tsx).
  */
 
 export type PreviewTab = "post" | "comments" | "dm" | "dmTrigger";
@@ -40,12 +42,25 @@ interface CampaignPreviewProps {
   requireFollow: boolean;
   followPromptMessage: string;
   followPromptButtonLabel: string;
+  // The second follow request; empty repeats the first one.
+  followPromptRetryMessage?: string;
+  followPromptRetryButtonLabel?: string;
   followUpEnabled: boolean;
   followUpMessage: string;
   followUpDelayMinutes?: number;
 }
 
-const SAMPLE_USER = "username";
+/** The commenter's name in the previews, where {username} goes. */
+export const SAMPLE_USER = "username";
+
+/** A thin, dark scrollbar for a DM thread that scrolls inside the phone. */
+export const THREAD_SCROLLBAR =
+  "[scrollbar-width:thin] [scrollbar-color:#3f3f46_transparent]";
+
+// What the worker sends when the follow request is left empty.
+const DEFAULT_FOLLOW_PROMPT =
+  "quick favor before i send your link. i don't make any money from this, it's free. if you want to support me, just don't unfollow after, and star the repo on github if it helps you. tap the button once you're following and i'll send it over";
+const DEFAULT_FOLLOW_BUTTON = "i'm following";
 
 /* ----------------------------- icons ----------------------------- */
 
@@ -116,7 +131,7 @@ function renderMessage(text: string, hasLink: boolean, linkUrl: string | undefin
   );
 }
 
-function Avatar({
+export function Avatar({
   url,
   size = 28,
 }: {
@@ -139,7 +154,7 @@ function Avatar({
   );
 }
 
-function StatusBar() {
+export function StatusBar() {
   return (
     <div className="flex items-center justify-between px-6 pt-2.5 text-[11px] font-semibold text-white">
       <span>12:13</span>
@@ -152,7 +167,7 @@ function StatusBar() {
   );
 }
 
-function Phone({ children }: { children: React.ReactNode }) {
+export function Phone({ children }: { children: React.ReactNode }) {
   const btn = "absolute w-[3px] rounded-sm bg-gradient-to-r from-zinc-500 to-zinc-700";
   return (
     // max-w-full so the fixed 300px frame cannot overflow a narrow screen
@@ -175,6 +190,40 @@ function Phone({ children }: { children: React.ReactNode }) {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+/** The top of a DM thread: back arrow, the account, call buttons. */
+export function DmHeader({
+  username,
+  avatarUrl,
+}: {
+  username: string;
+  avatarUrl: string | null;
+}) {
+  return (
+    <div className="flex items-center gap-2 px-3 py-2">
+      <span className="w-4">{Ico.back("h-5 w-5")}</span>
+      <Avatar url={avatarUrl} size={30} />
+      <span className="min-w-0 truncate text-sm font-semibold">{username}</span>
+      <span className="ml-auto flex shrink-0 items-center gap-3">
+        {Ico.phone("h-5 w-5")}
+        {Ico.video("h-5 w-5")}
+      </span>
+    </div>
+  );
+}
+
+/** The bottom of a DM thread: camera button and message field. */
+export function DmComposer() {
+  const { t } = useI18n();
+  return (
+    <div className="flex items-center gap-2 px-3 py-3">
+      <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-accent text-white">
+        {Ico.camera("h-4 w-4")}
+      </span>
+      <div className="flex-1 rounded-full bg-zinc-800 px-3 py-2 text-xs text-zinc-500">{t("Message…")}</div>
     </div>
   );
 }
@@ -323,6 +372,8 @@ function DmScreen({
   requireFollow,
   followPromptMessage,
   followPromptButtonLabel,
+  followPromptRetryMessage = "",
+  followPromptRetryButtonLabel = "",
   followUpEnabled,
   followUpMessage,
   followUpDelayMinutes = 0,
@@ -343,6 +394,8 @@ function DmScreen({
   requireFollow: boolean;
   followPromptMessage: string;
   followPromptButtonLabel: string;
+  followPromptRetryMessage?: string;
+  followPromptRetryButtonLabel?: string;
   followUpEnabled: boolean;
   followUpMessage: string;
   followUpDelayMinutes?: number;
@@ -350,20 +403,16 @@ function DmScreen({
   inboundMessage?: string;
 }) {
   const { t } = useI18n();
+  const followPrompt = followPromptMessage || DEFAULT_FOLLOW_PROMPT;
+  const followButton = followPromptButtonLabel || DEFAULT_FOLLOW_BUTTON;
   return (
     <div className="flex h-full flex-col text-white">
       <StatusBar />
-      <div className="flex items-center gap-2 px-3 py-2">
-        <span className="w-4">{Ico.back("h-5 w-5")}</span>
-        <Avatar url={avatarUrl} size={30} />
-        <span className="text-sm font-semibold">{username}</span>
-        <span className="ml-auto flex items-center gap-3">
-          {Ico.phone("h-5 w-5")}
-          {Ico.video("h-5 w-5")}
-        </span>
-      </div>
+      <DmHeader username={username} avatarUrl={avatarUrl} />
 
-      <div className="flex-1 space-y-3 px-3 py-4">
+      {/* Scrolls inside the fixed phone: with both follow requests the
+          thread is taller than the screen. */}
+      <div className={`min-h-0 flex-1 space-y-3 overflow-y-auto px-3 py-4 ${THREAD_SCROLLBAR}`}>
         {inboundMessage !== undefined && (
           <div className="flex justify-end">
             <div className="max-w-[80%] rounded-2xl rounded-br-md bg-accent px-3 py-2 text-sm">
@@ -395,17 +444,38 @@ function DmScreen({
               <Avatar url={avatarUrl} size={24} />
               <div className="max-w-[80%] overflow-hidden rounded-2xl rounded-bl-md bg-zinc-800">
                 <p className="whitespace-pre-wrap px-3 py-2 text-sm">
-                  {followPromptMessage ||
-                    "quick favor before i send your link. i don't make any money from this, it's free. if you want to support me, just don't unfollow after, and star the repo on github if it helps you. tap the button once you're following and i'll send it over"}
+                  {followPrompt}
                 </p>
                 <div className="mx-1.5 mb-1.5 rounded-xl bg-zinc-700 px-4 py-1.5 text-center text-sm font-medium text-white">
-                  {followPromptButtonLabel || "i'm following"}
+                  {followButton}
                 </div>
               </div>
             </div>
             <div className="flex justify-end">
               <div className="rounded-2xl rounded-br-md bg-accent px-3 py-2 text-sm">
-                {followPromptButtonLabel || "i'm following"}
+                {followButton}
+              </div>
+            </div>
+            {/* Someone who taps without following gets the second request
+                once the automatic re-checks still see no follow; left empty
+                it repeats the first. Their next tap gets the link. */}
+            <p className="py-1 text-center text-[11px] text-zinc-500">
+              {t("If they still don't follow after tapping")}
+            </p>
+            <div className="flex items-end gap-2">
+              <Avatar url={avatarUrl} size={24} />
+              <div className="max-w-[80%] overflow-hidden rounded-2xl rounded-bl-md bg-zinc-800">
+                <p className="whitespace-pre-wrap px-3 py-2 text-sm">
+                  {followPromptRetryMessage || followPrompt}
+                </p>
+                <div className="mx-1.5 mb-1.5 rounded-xl bg-zinc-700 px-4 py-1.5 text-center text-sm font-medium text-white">
+                  {followPromptRetryButtonLabel || followButton}
+                </div>
+              </div>
+            </div>
+            <div className="flex justify-end">
+              <div className="rounded-2xl rounded-br-md bg-accent px-3 py-2 text-sm">
+                {followPromptRetryButtonLabel || followButton}
               </div>
             </div>
           </>
@@ -467,12 +537,7 @@ function DmScreen({
         )}
       </div>
 
-      <div className="flex items-center gap-2 px-3 py-3">
-        <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-accent text-white">
-          {Ico.camera("h-4 w-4")}
-        </span>
-        <div className="flex-1 rounded-full bg-zinc-800 px-3 py-2 text-xs text-zinc-500">{t("Message…")}</div>
-      </div>
+      <DmComposer />
     </div>
   );
 }
@@ -531,6 +596,8 @@ export default function CampaignPreview(props: CampaignPreviewProps) {
             requireFollow={props.requireFollow}
             followPromptMessage={props.followPromptMessage}
             followPromptButtonLabel={props.followPromptButtonLabel}
+            followPromptRetryMessage={props.followPromptRetryMessage}
+            followPromptRetryButtonLabel={props.followPromptRetryButtonLabel}
             followUpEnabled={props.followUpEnabled}
             followUpMessage={props.followUpMessage}
             followUpDelayMinutes={props.followUpDelayMinutes}
@@ -553,6 +620,8 @@ export default function CampaignPreview(props: CampaignPreviewProps) {
             requireFollow={props.requireFollow}
             followPromptMessage={props.followPromptMessage}
             followPromptButtonLabel={props.followPromptButtonLabel}
+            followPromptRetryMessage={props.followPromptRetryMessage}
+            followPromptRetryButtonLabel={props.followPromptRetryButtonLabel}
             followUpEnabled={props.followUpEnabled}
             followUpMessage={props.followUpMessage}
             followUpDelayMinutes={props.followUpDelayMinutes}

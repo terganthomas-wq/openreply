@@ -18,19 +18,31 @@ import { useRouter } from "next/navigation";
 import AccountSelect, { type AccountOption } from "@/components/account-select";
 import PostPicker from "@/components/post-picker";
 import CampaignPreview, { type PreviewTab } from "@/components/campaign-preview";
+import CampaignOffersSection, {
+  fetchOfferOptions,
+  type OfferOption,
+  type OfferOrderMode,
+} from "@/components/campaign-offers-section";
+import {
+  CountedInput,
+  Radio,
+  Section,
+  Toggle,
+} from "@/components/form-controls";
 import { readCache, writeCache } from "@/lib/client-cache";
 import {
   IMPORT_QUEUE_KEY,
   IMPORT_ACCOUNT_KEY,
   type ImportRow,
 } from "@/lib/import-queue";
-import { BUTTON_LABEL_MAX, BUTTON_TEXT_MAX } from "@/lib/validation/text";
+import { BUTTON_TEXT_MAX } from "@/lib/validation/text";
 import {
   EMPTY_MESSAGE_DEFAULTS,
   parseMessageDefaults,
   withImportRow,
   type CampaignDefaults,
 } from "@/lib/campaigns/message-defaults";
+import { cleanCustomOrder } from "@/lib/offers/editor";
 
 type TriggerScope = "specific" | "any" | "next";
 type MatchMode = "specific" | "any";
@@ -88,6 +100,8 @@ interface LoadedCampaign {
   followPromptRetryMessage?: string | null;
   followPromptRetryButtonLabel?: string | null;
   deliveryTag?: string | null;
+  offersEnabled?: boolean;
+  offerIds?: string[];
 }
 
 interface CampaignBuilderProps {
@@ -95,108 +109,9 @@ interface CampaignBuilderProps {
   campaignId?: string;
 }
 
-function Section({
-  title,
-  children,
-}: {
-  title: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-3">
-      <h2 className="text-sm font-semibold text-foreground">{title}</h2>
-      {children}
-    </div>
-  );
-}
-
-function Radio({
-  checked,
-  onSelect,
-  children,
-}: {
-  checked: boolean;
-  onSelect: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onSelect}
-      className={`flex w-full items-center gap-3 rounded-lg border px-3 py-2.5 text-left text-sm transition-colors ${
-        checked ? "border-accent bg-accent/5" : "border-border hover:border-border-hover"
-      }`}
-    >
-      <span
-        className={`grid h-4 w-4 shrink-0 place-items-center rounded-full border ${
-          checked ? "border-accent" : "border-zinc-500"
-        }`}
-      >
-        {checked && <span className="h-2 w-2 rounded-full bg-accent" />}
-      </span>
-      <span className="flex-1 text-foreground">{children}</span>
-    </button>
-  );
-}
-
-function Toggle({
-  on,
-  onToggle,
-}: {
-  on: boolean;
-  onToggle: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onToggle}
-      className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${
-        on ? "bg-accent" : "bg-zinc-300"
-      }`}
-    >
-      <span
-        className={`absolute top-1 h-4 w-4 rounded-full bg-white transition-transform ${
-          on ? "left-6" : "left-1"
-        }`}
-      />
-    </button>
-  );
-}
-
-// Instagram cuts button titles after 20 UTF-16 units, so an emoji takes two.
-// maxLength and String.length count the same units, and so does the API. A
-// label saved before the limit dropped from 64 can be longer: the counter
-// turns red, since the API now refuses it.
-function ButtonLabelInput({
-  value,
-  onChange,
-  placeholder,
-}: {
-  value: string;
-  onChange: (value: string) => void;
-  placeholder: string;
-}) {
-  const counterId = useId();
-  return (
-    <div className="relative">
-      <input
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-        maxLength={BUTTON_LABEL_MAX}
-        aria-describedby={counterId}
-        className="w-full rounded-lg border border-border bg-surface py-2 pl-3 pr-14 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none"
-      />
-      <span
-        id={counterId}
-        className={`pointer-events-none absolute inset-y-0 right-3 flex items-center text-xs tabular-nums ${
-          value.length > BUTTON_LABEL_MAX ? "text-error" : "text-muted"
-        }`}
-      >
-        {value.length}/{BUTTON_LABEL_MAX}
-      </span>
-    </div>
-  );
+// Offers start only where there is an active one to offer.
+function hasActiveOffer(offers: OfferOption[] | null): boolean {
+  return Boolean(offers?.some((offer) => offer.isActive));
 }
 
 export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderProps) {
@@ -298,6 +213,22 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
   const [deliveryTag, setDeliveryTag] = useState("");
   const deliveryTagId = useId();
 
+  // Weg 2 (R4, R13): offers after the link, in the workspace's default order
+  // from the Offers page or in this campaign's own. The offers are loaded
+  // with the campaign or the defaults; null when that failed.
+  const [offerOptions, setOfferOptions] = useState<OfferOption[] | null>(null);
+  const [offersEnabled, setOffersEnabled] = useState(false);
+  const [offerOrderMode, setOfferOrderMode] =
+    useState<OfferOrderMode>("default");
+  const [customOfferIds, setCustomOfferIds] = useState<string[]>([]);
+  // Switching offers on switched the opening DM on too: the card says why.
+  const [openingDmSwitchedOn, setOpeningDmSwitchedOn] = useState(false);
+  // Whether the workspace's default texts were asked for (new mode always).
+  const [defaultsFetched, setDefaultsFetched] = useState(false);
+  // How often "Manage offers" opened the Offers page in another tab; coming
+  // back reloads the offers, so new or paused ones show here.
+  const [offersPageVisits, setOffersPageVisits] = useState(0);
+
   const [previewTab, setPreviewTab] = useState<PreviewTab>("dm");
 
   // CSV import queue. When present, each save advances to the next row instead
@@ -357,12 +288,16 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
       .catch(() => setAccounts([]));
   }, []);
 
-  // Prefill when editing.
+  // Prefill when editing, together with the offers its order can name.
   useEffect(() => {
     if (mode !== "edit" || !campaignId) return;
-    fetch("/api/automations", { cache: "no-store" })
-      .then((r) => r.json())
-      .then((payload) => {
+    let cancelled = false;
+    Promise.all([
+      fetch("/api/automations", { cache: "no-store" }).then((r) => r.json()),
+      fetchOfferOptions(),
+    ])
+      .then(([payload, offers]) => {
+        if (cancelled) return;
         if (!payload.success) return setNotFound(true);
         const c = (payload.data as LoadedCampaign[]).find((x) => x.id === campaignId);
         if (!c) return setNotFound(true);
@@ -410,9 +345,27 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
         setFollowUpMessage(c.followUpMessage ?? "");
         setFollowUpDelayMinutes(c.followUpDelayMinutes ?? 0);
         setDeliveryTag(c.deliveryTag ?? "");
+        setOfferOptions(offers);
+        setOffersEnabled(c.offersEnabled ?? false);
+        // An own order stays one, even when cleaning empties it: saving it
+        // then asks for an offer instead of silently using the default
+        // order. Ids of deleted offers drop out; without the list they are
+        // kept as stored.
+        const storedIds = c.offerIds ?? [];
+        setOfferOrderMode(storedIds.length > 0 ? "custom" : "default");
+        setCustomOfferIds(
+          offers ? cleanCustomOrder(storedIds, offers) : storedIds
+        );
       })
-      .catch(() => setNotFound(true))
-      .finally(() => setLoading(false));
+      .catch(() => {
+        if (!cancelled) setNotFound(true);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [mode, campaignId]);
 
   // Track which posts on the selected account are already assigned to an
@@ -441,8 +394,17 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
   }, [selectedAccountId, mode, campaignId]);
 
   // Put default texts and switches into the form; a field left out stays as
-  // it is. The offer switch waits for the offer controls (WP10).
-  function applyCampaignFields(fields: Partial<CampaignDefaults>) {
+  // it is. The offer switch is only turned on while the workspace has an
+  // active offer: until then a new campaign has nothing to offer, and can
+  // switch offers on later.
+  function applyCampaignFields(
+    fields: Partial<CampaignDefaults>,
+    offers: OfferOption[] | null
+  ) {
+    if (fields.offersEnabled !== undefined) {
+      setOffersEnabled(fields.offersEnabled && hasActiveOffer(offers));
+      setOpeningDmSwitchedOn(false);
+    }
     if (fields.openingDmEnabled !== undefined)
       setOpeningDmEnabled(fields.openingDmEnabled);
     if (fields.openingDmMessage !== undefined)
@@ -474,8 +436,13 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
 
   // Prefill the editable fields from one queued import row: the cells it
   // fills go over the workspace's default texts, so every row starts from
-  // them. The reel is left unset so the user picks it per row.
-  function prefillFromRow(row: ImportRow, defaults: CampaignDefaults | null) {
+  // them, offers in the default order included. The reel is left unset so
+  // the user picks it per row.
+  function prefillFromRow(
+    row: ImportRow,
+    defaults: CampaignDefaults | null,
+    offers: OfferOption[] | null
+  ) {
     setName(row.name ?? "");
     setTriggerScope("specific");
     setPostId(null);
@@ -484,7 +451,9 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
     setPostCaption("");
     setMatchMode("specific");
     setKeywordText((row.keywords ?? []).join(", "));
-    applyCampaignFields(withImportRow(defaults, row));
+    setOfferOrderMode("default");
+    setCustomOfferIds([]);
+    applyCampaignFields(withImportRow(defaults, row), offers);
     const link = row.trackedUrl ?? "";
     setTrackedDestinationUrl(link);
     // With default texts the link is what is left to fill in.
@@ -496,21 +465,26 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
   // defaults alone. An Effect Event, so the effect below runs once per mount
   // and still calls this render's functions.
   const onDefaultsLoaded = useEffectEvent(
-    (defaults: CampaignDefaults | null, queue: ImportRow[] | null) => {
+    (
+      defaults: CampaignDefaults | null,
+      queue: ImportRow[] | null,
+      offers: OfferOption[] | null
+    ) => {
       if (queue) {
-        prefillFromRow(queue[0], defaults);
+        prefillFromRow(queue[0], defaults, offers);
       } else if (defaults) {
-        applyCampaignFields(defaults);
+        applyCampaignFields(defaults, offers);
         setLinkOpen(true);
       }
     }
   );
 
   // New campaigns open with the workspace's default texts (R14): the opening
-  // DM, both follow requests, the link DM and its button, the public replies
-  // and the question-mark filter, so keywords, post and link are what is
-  // left. A staged CSV import (new mode only) puts its rows over them, the
-  // first one right away. Editing keeps the stored values and never asks.
+  // DM, both follow requests, the link DM and its button, the public replies,
+  // the question-mark filter and the offers, so keywords, post and link are
+  // what is left. A staged CSV import (new mode only) puts its rows over
+  // them, the first one right away. Editing keeps the stored values and
+  // never asks.
   /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     if (mode !== "new") return;
@@ -530,24 +504,49 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
     }
 
     let cancelled = false;
-    fetch(MESSAGE_DEFAULTS_URL, { cache: "no-store" })
-      .then((r) => r.json())
-      .then((payload) => (payload.success ? payload.data : null))
-      // Without them the editor opens blank, as it always did.
-      .catch(() => null)
-      .then((data) => {
-        if (cancelled) return;
-        const defaults = parseMessageDefaults(data?.defaults)?.campaign ?? null;
-        setCampaignDefaults(defaults);
-        setCanManageDefaults(data?.canManage === true);
-        onDefaultsLoaded(defaults, queue);
-        setLoading(false);
-      });
+    Promise.all([
+      fetch(MESSAGE_DEFAULTS_URL, { cache: "no-store" })
+        .then((r) => r.json())
+        .then((payload) => (payload.success ? payload.data : null))
+        // Without them the editor opens blank, as it always did.
+        .catch(() => null),
+      fetchOfferOptions(),
+    ]).then(([data, offers]) => {
+      if (cancelled) return;
+      const defaults = parseMessageDefaults(data?.defaults)?.campaign ?? null;
+      setCampaignDefaults(defaults);
+      setDefaultsFetched(true);
+      setCanManageDefaults(data?.canManage === true);
+      setOfferOptions(offers);
+      onDefaultsLoaded(defaults, queue, offers);
+      setLoading(false);
+    });
     return () => {
       cancelled = true;
     };
   }, [mode]);
   /* eslint-enable react-hooks/set-state-in-effect */
+
+  // Back from the Offers page opened by "Manage offers": its offers, new or
+  // paused ones included, replace the list once, and deleted ones leave this
+  // campaign's own order. Each opening waits for the next return.
+  useEffect(() => {
+    if (offersPageVisits === 0) return;
+    let active = true;
+    function reloadOffers() {
+      window.removeEventListener("focus", reloadOffers);
+      void fetchOfferOptions().then((offers) => {
+        if (!active || !offers) return;
+        setOfferOptions(offers);
+        setCustomOfferIds((ids) => cleanCustomOrder(ids, offers));
+      });
+    }
+    window.addEventListener("focus", reloadOffers);
+    return () => {
+      active = false;
+      window.removeEventListener("focus", reloadOffers);
+    };
+  }, [offersPageVisits]);
 
   const username =
     accounts.find((a) => a.id === selectedAccountId)?.username ?? "yourbrand";
@@ -568,6 +567,53 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
     setDmMessage((cur) => (cur.includes("{link}") ? cur : `${cur.trim()} {link}`.trim()));
   }
 
+  // The workspace's default texts, asked for once. A new campaign has them
+  // from the start; editing asks only when offers need the opening DM.
+  async function loadCampaignDefaults(): Promise<CampaignDefaults | null> {
+    if (defaultsFetched) return campaignDefaults;
+    try {
+      const res = await fetch(MESSAGE_DEFAULTS_URL, { cache: "no-store" });
+      const payload = await res.json();
+      if (!payload.success) return null;
+      const defaults =
+        parseMessageDefaults(payload.data?.defaults)?.campaign ?? null;
+      setCampaignDefaults(defaults);
+      setDefaultsFetched(true);
+      return defaults;
+    } catch {
+      return null;
+    }
+  }
+
+  // R11: Instagram allows offers only after the person taps a button (or
+  // DMs), so offers need the opening DM. Switching them on turns it on as
+  // well and fills its empty text and button from the default texts.
+  async function toggleOffers() {
+    if (offersEnabled) {
+      setOffersEnabled(false);
+      setOpeningDmSwitchedOn(false);
+      return;
+    }
+    setOffersEnabled(true);
+    if (
+      openingDmEnabled &&
+      openingDmMessage.trim() &&
+      openingDmButtonLabel.trim()
+    ) {
+      return;
+    }
+    if (!openingDmEnabled) {
+      setOpeningDmEnabled(true);
+      setOpeningDmSwitchedOn(true);
+    }
+    const defaults = await loadCampaignDefaults();
+    const message = defaults?.openingDmMessage.trim() ?? "";
+    const label = defaults?.openingDmButtonLabel.trim() ?? "";
+    // Only into empty fields: whatever was typed meanwhile stays.
+    if (message) setOpeningDmMessage((cur) => (cur.trim() ? cur : message));
+    if (label) setOpeningDmButtonLabel((cur) => (cur.trim() ? cur : label));
+  }
+
   async function handleSubmit(activeValue: boolean) {
     setError(null);
 
@@ -579,6 +625,10 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
     if (!dmMessage.trim()) return setError(t("Add the DM with the link."));
     if (openingDmEnabled && (!openingDmMessage.trim() || !openingDmButtonLabel.trim()))
       return setError(t("Your opening DM needs a message and a button label."));
+    if (offersEnabled && !openingDmEnabled)
+      return setError(t("Offers need the opening DM: Instagram only allows them after the person taps a button."));
+    if (offersEnabled && offerOrderMode === "custom" && customOfferIds.length === 0)
+      return setError(t("Add at least one offer to the custom order, or use the default order."));
 
     setSaving(true);
 
@@ -623,6 +673,11 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
       followUpDelayMinutes: followUpEnabled ? followUpDelayMinutes : 0,
       ignoreQuestionComments,
       deliveryTag: deliveryTag.trim() || null,
+      offersEnabled,
+      // Empty means the workspace's default order. Offers switched off keep
+      // no order of their own.
+      offerIds:
+        offersEnabled && offerOrderMode === "custom" ? customOfferIds : [],
       isActive: activeValue,
     };
 
@@ -661,7 +716,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
             // ignore
           }
           setImportQueue(remaining);
-          prefillFromRow(remaining[0], campaignDefaults);
+          prefillFromRow(remaining[0], campaignDefaults, offerOptions);
           setSaving(false);
           if (typeof window !== "undefined") window.scrollTo({ top: 0 });
           return;
@@ -713,7 +768,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
         // ignore
       }
       setImportQueue(remaining);
-      prefillFromRow(remaining[0], campaignDefaults);
+      prefillFromRow(remaining[0], campaignDefaults, offerOptions);
       if (typeof window !== "undefined") window.scrollTo({ top: 0 });
       return;
     }
@@ -824,7 +879,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
       const defaults =
         parseMessageDefaults(data.data?.defaults)?.campaign ?? null;
       setCampaignDefaults(defaults);
-      applyCampaignFields(defaults ?? BLANK_CAMPAIGN_TEXTS);
+      applyCampaignFields(defaults ?? BLANK_CAMPAIGN_TEXTS, offerOptions);
       setDefaultsStatus({ tone: "success", text: t("Default texts reset.") });
     } catch {
       setDefaultsStatus({
@@ -1022,6 +1077,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                 <Toggle
                   on={!wholeWordMatch}
                   onToggle={() => setWholeWordMatch(!wholeWordMatch)}
+                  label={t("Match part of a word")}
                 />
               </div>
               {!wholeWordMatch && (
@@ -1045,6 +1101,9 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
             <Toggle
               on={dmTriggerEnabled}
               onToggle={() => setDmTriggerEnabled(!dmTriggerEnabled)}
+              label={`${t("also reply when someone DMs")} ${
+                matchMode === "any" ? t("anything") : t("these words")
+              }`}
             />
           </div>
           {dmTriggerEnabled && (
@@ -1061,6 +1120,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
             <Toggle
               on={ignoreQuestionComments}
               onToggle={() => setIgnoreQuestionComments(!ignoreQuestionComments)}
+              label={t("Ignore comments with a question mark")}
             />
           </div>
           {ignoreQuestionComments && (
@@ -1075,6 +1135,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
             <Toggle
               on={publicReplyEnabled}
               onToggle={() => setPublicReplyEnabled(!publicReplyEnabled)}
+              label={t("reply to their comments under the post")}
             />
           </div>
           {publicReplyEnabled && (
@@ -1132,7 +1193,11 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
               <span className="text-sm text-foreground">{t("an opening DM")}</span>
               <Toggle
                 on={openingDmEnabled}
-                onToggle={() => setOpeningDmEnabled(!openingDmEnabled)}
+                onToggle={() => {
+                  setOpeningDmEnabled(!openingDmEnabled);
+                  setOpeningDmSwitchedOn(false);
+                }}
+                label={t("an opening DM")}
               />
             </div>
             {openingDmEnabled && (
@@ -1145,7 +1210,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                   className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none resize-none"
                   maxLength={1000}
                 />
-                <ButtonLabelInput
+                <CountedInput
                   value={openingDmButtonLabel}
                   onChange={setOpeningDmButtonLabel}
                   placeholder={t("Send me the link")}
@@ -1161,6 +1226,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
               <Toggle
                 on={requireFollow}
                 onToggle={() => setRequireFollow(!requireFollow)}
+                label={t("a follow requirement first")}
               />
             </div>
             {requireFollow && (
@@ -1173,7 +1239,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                   className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none resize-none"
                   maxLength={1000}
                 />
-                <ButtonLabelInput
+                <CountedInput
                   value={followPromptButtonLabel}
                   onChange={setFollowPromptButtonLabel}
                   placeholder={t("i'm following")}
@@ -1201,7 +1267,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                     className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none resize-none"
                     maxLength={BUTTON_TEXT_MAX}
                   />
-                  <ButtonLabelInput
+                  <CountedInput
                     value={followPromptRetryButtonLabel}
                     onChange={setFollowPromptRetryButtonLabel}
                     placeholder={followPromptButtonLabel.trim() || t("i'm following")}
@@ -1235,7 +1301,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                   placeholder="https://yourlink.com/offer"
                   className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none"
                 />
-                <ButtonLabelInput
+                <CountedInput
                   value={linkButtonLabel}
                   onChange={setLinkButtonLabel}
                   placeholder={t("Button label (e.g. Open link)")}
@@ -1248,7 +1314,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                       placeholder="https://yourlink.com/second"
                       className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none"
                     />
-                    <ButtonLabelInput
+                    <CountedInput
                       value={secondaryButtonLabel}
                       onChange={setSecondaryButtonLabel}
                       placeholder={t("Second button label")}
@@ -1285,6 +1351,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
               <Toggle
                 on={followUpEnabled}
                 onToggle={() => setFollowUpEnabled(!followUpEnabled)}
+                label={t("a follow-up thank-you message")}
               />
             </div>
             {followUpEnabled && (
@@ -1347,6 +1414,19 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
               {t("Contacts get this tag when this campaign's link reaches them. Leave it empty for no tag.")}
             </p>
           </div>
+          <CampaignOffersSection
+            offers={offerOptions}
+            enabled={offersEnabled}
+            onToggle={() => void toggleOffers()}
+            orderMode={offerOrderMode}
+            onOrderModeChange={setOfferOrderMode}
+            customIds={customOfferIds}
+            onCustomIdsChange={setCustomOfferIds}
+            openingDmEnabled={openingDmEnabled}
+            openingDmSwitchedOn={openingDmSwitchedOn}
+            followUpEnabled={followUpEnabled}
+            onManageOffers={() => setOffersPageVisits((visits) => visits + 1)}
+          />
         </Section>
 
         {/* Owners and admins manage the workspace's default texts where
@@ -1421,6 +1501,8 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
             requireFollow={requireFollow}
             followPromptMessage={followPromptMessage}
             followPromptButtonLabel={followPromptButtonLabel || "i'm following"}
+            followPromptRetryMessage={followPromptRetryMessage}
+            followPromptRetryButtonLabel={followPromptRetryButtonLabel}
             followUpEnabled={followUpEnabled}
             followUpMessage={followUpMessage}
             followUpDelayMinutes={followUpDelayMinutes}

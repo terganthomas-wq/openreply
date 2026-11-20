@@ -1,0 +1,107 @@
+# Lead-magnet offers ("Weg 2")
+
+A campaign sends its link (the resource of a reel) as before. With offers
+switched on it then offers a lead magnet: a few short DMs ending with a
+button, a card with your link for everyone who taps it, and a reminder for
+everyone who does not. Offers belong to the workspace, not to a campaign: you
+manage them in one place, **Offers** in the sidebar, and every campaign with
+offers on uses them.
+
+## How it runs
+
+1. Someone triggers a campaign and gets its link after tapping a button (the
+   opening DM or the follow request) or after sending a DM.
+2. The campaign picks the first offer this person has not been offered yet,
+   in its order (below). Nobody gets the same offer twice, whichever campaign
+   or post it comes from. With none left, nothing more is sent.
+3. The offer messages go out one after another, each after its own pause (0
+   to 60 seconds). The last one carries the button, for example
+   "Ja, gerne! 🙌".
+4. A tap on the button sends the confirmation messages, then the card: image,
+   title, subtitle and a button that opens your link.
+5. Without a tap, the reminder goes out after the hours you set (1 to 23),
+   with the card's button.
+
+Every new trigger of a campaign by the same person (a new comment whose
+opening DM they tap, a new tap, a new DM) sends the link again and starts the
+next offer they have not had. A repeat of the same trigger (a webhook
+Instagram sends twice, a retried job) starts nothing.
+
+Tags record how far each person got, per offer: offered, interested (tapped
+the button), sent (got the card or the reminder) and clicked (opened the
+link). New offers take their tag names from the workspace's tag templates
+and the offer's name, for example "Guide angeboten" and "[LM] Guide
+gesendet"; you can change them under **Tags** in the editor. The funnel on
+the Offers page counts the same stages, each as a share of everyone offered:
+a reminder counts as sent without any interest, so the stages are not
+nested. "Stopped early" counts offers that ended before the person got the
+link, for example because the messaging window closed.
+
+## Which offer a campaign uses
+
+- **Default order (Offers page)**: the order of the Offers page, changed with
+  the arrows there. Swapping a lead magnet never means editing campaigns:
+  create the new offer, move it up, pause or delete the old one.
+- **Custom order for this campaign**: the campaign's own list, picked in the
+  campaign editor under **After the link**. Offers not in the list are never
+  offered by this campaign.
+
+Paused offers are skipped in both. Turning offers on in the campaign editor
+also turns the opening DM on (see below) and fills it from the default texts
+when it is empty.
+
+## Instagram's 24-hour window
+
+Instagram allows messages beyond the comment's private reply only within 24
+hours of the person's last button tap or DM. That is why a campaign with
+offers needs the opening DM: its tap opens the window. A link that went out
+without a tap or a DM (as the comment's private reply) starts no offer.
+Every offer message checks the window first, and the reminder is sent no
+later than 23.5 hours after the person's last tap or DM, so it may come a
+little earlier than the hours you set. A follow-up message switched on in the
+same campaign also goes out after the link and can land between the offer
+messages.
+
+## The card image
+
+Instagram downloads the card's image itself. It needs a direct `https` link
+to the image file (JPG or PNG; square, 1080 × 1080, works best). A Google
+Drive share link is a web page, not an image: the editor shows a warning when
+the image does not load, and Instagram cannot show it either. If Instagram
+refuses a card, its title and subtitle go out as a message with the button
+instead (Diagnostics notes "Offer card fell back to a button message"). The
+link behind the card's button may be any web page, Google Drive and Docs
+share links included. Clicks go through a tracked link (`/o/<slug>`) that
+forwards to it and records the click.
+
+Uploading the image in the editor is not available yet; use a link to an
+image you host elsewhere.
+
+## Pause or delete
+
+- **Pause** (the switch on the Offers page): no new person gets the offer, the
+  campaigns move on to the next one in their order. Sequences already running
+  finish: taps on the button still get the card, and reminders still go out.
+  Resume it the same way.
+- **Delete**: an offer nobody got yet is deleted. One that was ever offered is
+  archived instead: it leaves the Offers page and every campaign's order, its
+  messages that have not gone out yet are not sent, and the card links already
+  sent keep working. Its tags stay on the contacts. A campaign whose own order
+  held only this offer gets its offers switched off; it keeps sending its
+  link, and the Offers page names it.
+
+## Default texts
+
+A new offer starts with the workspace's default texts for offers (in German,
+the built-in set). Owners and admins can save the texts of a new offer as the
+defaults with **Save these texts as defaults for new offers**: the offer
+messages with their pauses, both buttons' labels, the confirmations and the
+reminder. Name, card, link and tags are set per offer.
+
+## Limits
+
+Instagram cuts some texts, counting an emoji as two characters: button labels
+after 20, the card's title and subtitle after 80, the text of a message with
+a button (the last offer message and the reminder) after 640. The editor and
+the API hold you to these. An offer has at most five offer messages and five
+confirmations. Offer messages count toward the workspace's monthly DMs.

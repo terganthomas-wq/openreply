@@ -19,10 +19,20 @@ const pageTitles: Record<string, StaticMessageKey> = {
   "/campaigns/new": "New Campaign",
   "/automations": "Campaigns",
   "/automations/new": "New Campaign",
+  "/offers": "Offers",
+  "/offers/new": "New offer",
   "/logs": "DM Logs",
   "/settings": "Settings",
   "/diagnostics": "Diagnostics",
 };
+
+// Pages with an id in the path: /offers/<id>/edit, /campaigns/<id>[/edit].
+function fallbackTitle(pathname: string): StaticMessageKey {
+  if (pathname.endsWith("/edit")) {
+    return pathname.startsWith("/offers/") ? "Edit offer" : "Edit campaign";
+  }
+  return pathname.startsWith("/campaigns/") ? "Campaign details" : "Dashboard";
+}
 
 interface TopBarProps {
   onMenuClick: () => void;
@@ -37,10 +47,7 @@ export default function TopBar({
 }: TopBarProps) {
   const { t } = useI18n();
   const pathname = usePathname();
-  const title: StaticMessageKey = pageTitles[pathname] ?? (
-    pathname.endsWith("/edit") ? "Edit campaign"
-      : pathname.startsWith("/campaigns/") ? "Campaign details" : "Dashboard"
-  );
+  const title: StaticMessageKey = pageTitles[pathname] ?? fallbackTitle(pathname);
 
   return (
     <header

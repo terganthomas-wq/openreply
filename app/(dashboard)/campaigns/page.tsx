@@ -34,6 +34,7 @@ interface Campaign {
   followPromptMessage: string | null;
   followPromptButtonLabel: string | null;
   deliveryTag?: string | null;
+  offersEnabled?: boolean;
   isActive: boolean;
   wholeWordMatch: boolean;
   instagramAccountId: string;
@@ -230,8 +231,15 @@ export default function CampaignsPage() {
     }
   }
 
+  // Contacts and their tags do not belong to a campaign (R16): deleting it
+  // keeps them, and pausing it keeps everything.
   async function deleteAutomation(id: string) {
-    if (!confirm(t("Delete this campaign? This cannot be undone."))) return;
+    if (
+      !confirm(
+        t("Delete this campaign? Contacts and tags are kept. To stop it for now, pause it instead.")
+      )
+    )
+      return;
     try {
       await fetch(`/api/automations?id=${id}`, { method: "DELETE" });
       setAutomations((prev) => prev.filter((a) => a.id !== id));
@@ -441,6 +449,12 @@ export default function CampaignsPage() {
                   {auto.requireFollow && (
                     <span className="shrink-0 rounded-full bg-accent/10 px-2 py-0.5 text-xs font-medium text-accent">
                       {t("Follow gate")}
+                    </span>
+                  )}
+                  {/* Weg 2: a lead-magnet offer follows the link. */}
+                  {auto.offersEnabled && (
+                    <span className="shrink-0 rounded-full bg-accent/10 px-2 py-0.5 text-xs font-medium text-accent">
+                      {t("Offers")}
                     </span>
                   )}
                   {auto.trackedLinks.length >= 2 && (

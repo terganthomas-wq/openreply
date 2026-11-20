@@ -13,6 +13,11 @@ import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import CampaignPreview, { type PreviewTab } from "@/components/campaign-preview";
+import {
+  fetchOfferOptions,
+  type OfferOption,
+} from "@/components/campaign-offers-section";
+import { cleanCustomOrder } from "@/lib/offers/editor";
 
 interface Campaign {
   id: string;
@@ -42,6 +47,8 @@ interface Campaign {
   followPromptRetryMessage?: string | null;
   followPromptRetryButtonLabel?: string | null;
   deliveryTag?: string | null;
+  offersEnabled?: boolean;
+  offerIds?: string[];
   isActive: boolean;
   instagramAccountId: string;
   instagramAccount: { username: string };
@@ -74,6 +81,27 @@ export default function CampaignDetailPage() {
   const [tab, setTab] = useState<Tab>("insights");
   const [previewTab, setPreviewTab] = useState<PreviewTab>("dm");
   const [busy, setBusy] = useState(false);
+  // The offers a custom order names: undefined while loading, null when
+  // they could not be loaded.
+  const [offerOptions, setOfferOptions] = useState<
+    OfferOption[] | null | undefined
+  >(undefined);
+
+  // Only a campaign with its own order needs the offers' names; the default
+  // order lives on the Offers page.
+  const customOrderKey = campaign?.offersEnabled
+    ? (campaign.offerIds ?? []).join(",")
+    : "";
+  useEffect(() => {
+    if (!customOrderKey) return;
+    let active = true;
+    void fetchOfferOptions().then((offers) => {
+      if (active) setOfferOptions(offers);
+    });
+    return () => {
+      active = false;
+    };
+  }, [customOrderKey]);
 
   useEffect(() => {
     fetch("/api/automations", { cache: "no-store" })
@@ -161,6 +189,18 @@ export default function CampaignDetailPage() {
     campaign.followPromptMessage ||
     "quick favor before i send your link. i don't make any money from this, it's free. if you want to support me, just don't unfollow after, and star the repo on github if it helps you. tap the button once you're following and i'll send it over";
   const followButton = campaign.followPromptButtonLabel || "i'm following";
+  // The campaign's own offer order as it is used: offers deleted since drop
+  // out, paused ones are skipped.
+  const customOfferIds = campaign.offerIds ?? [];
+  const offersById = new Map(
+    (offerOptions ?? []).map((offer) => [offer.id, offer])
+  );
+  const customOffers = offerOptions
+    ? cleanCustomOrder(customOfferIds, offerOptions).flatMap((offerId) => {
+        const offer = offersById.get(offerId);
+        return offer ? [offer] : [];
+      })
+    : [];
 
   const trigger = campaign.matchAnyPost
     ? t("Any post or reel")
@@ -317,16 +357,65 @@ export default function CampaignDetailPage() {
           </Summary>
         )}
 
-        {campaign.deliveryTag && (
+        {(campaign.deliveryTag || campaign.offersEnabled) && (
           <Summary title={t("After the link")}>
-            <p className="text-xs text-muted">
-              {t("Tag people who got the link")}
-            </p>
-            {/* A tag can be one long word; let it wrap instead of widening
-                the page on a phone. */}
-            <FieldBox>
-              <span className="wrap-anywhere">{campaign.deliveryTag}</span>
-            </FieldBox>
+            {campaign.deliveryTag && (
+              <>
+                <p className="text-xs text-muted">
+                  {t("Tag people who got the link")}
+                </p>
+                {/* A tag can be one long word; let it wrap instead of
+                    widening the page on a phone. */}
+                <FieldBox>
+                  <span className="wrap-anywhere">{campaign.deliveryTag}</span>
+                </FieldBox>
+              </>
+            )}
+            {campaign.offersEnabled && (
+              <div className="space-y-1.5">
+                <p className="text-xs text-muted">
+                  {t("Then offer a lead magnet")}
+                </p>
+                {customOfferIds.length === 0 ? (
+                  <FieldBox>{t("Default order (Offers page)")}</FieldBox>
+                ) : offerOptions === undefined ? (
+                  <FieldBox>…</FieldBox>
+                ) : offerOptions === null ? (
+                  <p className="text-xs text-error">
+                    {t("Could not load the offers.")}
+                  </p>
+                ) : customOffers.length === 0 ? (
+                  <p className="text-xs text-warning">
+                    {t("No active offer in this order, so nobody gets an offer right now.")}
+                  </p>
+                ) : (
+                  <FieldBox>
+                    <ol className="space-y-1">
+                      {customOffers.map((offer, i) => (
+                        <li
+                          key={offer.id}
+                          className={`flex min-w-0 items-baseline gap-2 ${
+                            offer.isActive ? "" : "text-muted"
+                          }`}
+                        >
+                          <span className="shrink-0 text-xs tabular-nums text-muted">
+                            {i + 1}.
+                          </span>
+                          <span className="min-w-0 flex-1 truncate">
+                            {offer.name}
+                          </span>
+                          {!offer.isActive && (
+                            <span className="shrink-0 text-xs text-muted">
+                              {t("paused, skipped")}
+                            </span>
+                          )}
+                        </li>
+                      ))}
+                    </ol>
+                  </FieldBox>
+                )}
+              </div>
+            )}
           </Summary>
         )}
       </div>
@@ -407,6 +496,10 @@ export default function CampaignDetailPage() {
             followPromptMessage={campaign.followPromptMessage ?? ""}
             followPromptButtonLabel={
               campaign.followPromptButtonLabel ?? "i'm following"
+            }
+            followPromptRetryMessage={campaign.followPromptRetryMessage ?? ""}
+            followPromptRetryButtonLabel={
+              campaign.followPromptRetryButtonLabel ?? ""
             }
             followUpEnabled={campaign.followUpEnabled ?? false}
             followUpMessage={campaign.followUpMessage ?? ""}

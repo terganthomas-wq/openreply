@@ -26,10 +26,14 @@ export const OFFER_DELAY_MAX_SECONDS = 60;
  */
 export const REMINDER_DELAY_MAX_HOURS = 23;
 
-const MESSAGE_MAX = 1000;
-const NAME_MAX = 100;
-const TAG_MAX = 100;
-const URL_MAX = 2000;
+// Exported for the offer editor, so its fields stop where the API does.
+/** A message sent on its own, like a campaign's messages. */
+export const OFFER_MESSAGE_MAX = 1000;
+export const OFFER_NAME_MAX = 100;
+/** A funnel tag, as long as a campaign's delivery tag may be. */
+export const OFFER_TAG_MAX = 100;
+/** The card's image and the link behind its button. */
+export const OFFER_URL_MAX = 2000;
 
 // A required text: trimmed, then not empty.
 const line = (max: number) => z.string().trim().min(1).max(max);
@@ -59,15 +63,15 @@ const delays = z
  * offer starts active and an edit keeps the offer paused or active.
  */
 export const offerFieldsSchema = z.object({
-  name: line(NAME_MAX),
+  name: line(OFFER_NAME_MAX),
   isActive: z.boolean().optional(),
   // One DM each; the last one carries the "yes, send it" button.
-  offerMessages: z.array(line(MESSAGE_MAX)).min(1).max(OFFER_MESSAGES_MAX),
+  offerMessages: z.array(line(OFFER_MESSAGE_MAX)).min(1).max(OFFER_MESSAGES_MAX),
   offerDelaysSeconds: delays,
   offerButtonLabel: cutLine(BUTTON_LABEL_MAX),
   // Sent after the tap, before the card.
   confirmationMessages: z
-    .array(line(MESSAGE_MAX))
+    .array(line(OFFER_MESSAGE_MAX))
     .max(OFFER_MESSAGES_MAX)
     .default([]),
   confirmationDelaysSeconds: delays.default([]),
@@ -78,7 +82,7 @@ export const offerFieldsSchema = z.object({
     .string()
     .trim()
     .transform((value) => value || null)
-    .pipe(z.url({ protocol: /^https$/ }).max(URL_MAX).nullable())
+    .pipe(z.url({ protocol: /^https$/ }).max(OFFER_URL_MAX).nullable())
     .nullable()
     .default(null),
   cardTitle: cutLine(CARD_TEXT_MAX),
@@ -86,7 +90,7 @@ export const offerFieldsSchema = z.object({
   cardButtonLabel: cutLine(BUTTON_LABEL_MAX),
   // Behind the card's and the reminder's button. http(s) only: z.url() alone
   // also takes javascript: and mailto:. Drive and Docs share links pass.
-  destinationUrl: z.httpUrl().max(URL_MAX),
+  destinationUrl: z.httpUrl().max(OFFER_URL_MAX),
   reminderEnabled: z.boolean().default(true),
   reminderDelayHours: z
     .number()
@@ -97,10 +101,10 @@ export const offerFieldsSchema = z.object({
   // Goes out with the card's button, so it must fit a button message.
   reminderMessage: optionalCutText(BUTTON_TEXT_MAX),
   // The funnel tags (R2). Free text: two offers may share one.
-  tagOffered: line(TAG_MAX),
-  tagInterested: line(TAG_MAX),
-  tagSent: line(TAG_MAX),
-  tagClicked: line(TAG_MAX),
+  tagOffered: line(OFFER_TAG_MAX),
+  tagInterested: line(OFFER_TAG_MAX),
+  tagSent: line(OFFER_TAG_MAX),
+  tagClicked: line(OFFER_TAG_MAX),
 });
 
 /** A whole offer, as the editor saves it (POST, and PATCH with every field). */
