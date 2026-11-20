@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db/client";
 import { getDMQueue, getRedisConnection } from "@/lib/queue/client";
@@ -80,7 +81,23 @@ async function checkQueue(): Promise<HealthCheck & { counts?: unknown }> {
   }
 }
 
-export async function GET() {
+// Health answers only with `Authorization: Bearer <CRON_SECRET>`. Unauthorised
+// calls get a 401 before any check runs: the full report names the worker host
+// and raw DB/Redis errors, and every check wakes the database and spends Redis
+// operations, which matters on free tiers that meter compute time.
+function isAuthorized(request: Request): boolean {
+  const secret = process.env.CRON_SECRET;
+  if (!secret) return false;
+  const expected = Buffer.from(`Bearer ${secret}`);
+  const actual = Buffer.from(request.headers.get("authorization") ?? "");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+export async function GET(request: Request) {
+  if (!isAuthorized(request)) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const [database, redis, queue, worker] = await Promise.all([
     checkDatabase(),
     checkRedis(),
