@@ -15,6 +15,7 @@ const {
   mockReserveDMSlot,
   mockReleaseDMSlot,
   mockQueueAdd,
+  mockQueueRemove,
   mockReserveWorkspaceDMSend,
   mockReleaseWorkspaceDMReservation,
 } = vi.hoisted(() => ({
@@ -47,6 +48,16 @@ const {
     contactTag: {
       createMany: vi.fn(),
     },
+    contactOffer: {
+      findUnique: vi.fn(),
+      findFirst: vi.fn(),
+      findMany: vi.fn(),
+      create: vi.fn(),
+      updateMany: vi.fn(),
+    },
+    offer: {
+      findMany: vi.fn(),
+    },
   },
   mockSendPrivateReply: vi.fn(),
   mockSendPrivateReplyWithLinkButton: vi.fn(),
@@ -61,6 +72,7 @@ const {
   mockReserveDMSlot: vi.fn(),
   mockReleaseDMSlot: vi.fn(),
   mockQueueAdd: vi.fn(),
+  mockQueueRemove: vi.fn(),
   mockReserveWorkspaceDMSend: vi.fn(),
   mockReleaseWorkspaceDMReservation: vi.fn(),
 }));
@@ -125,12 +137,14 @@ vi.mock("@/lib/ops/worker-health", () => ({
 vi.mock("@/lib/queue/client", () => ({
   getDMQueue: () => ({
     add: mockQueueAdd,
+    remove: mockQueueRemove,
   }),
   getRedisConnection: vi.fn(),
   COMMENT_JOB_NAME: "process-comment",
   POSTBACK_JOB_NAME: "process-postback",
   FOLLOWUP_JOB_NAME: "process-followup",
   MESSAGE_JOB_NAME: "process-message",
+  OFFER_JOB_NAME: "process-offer",
 }));
 
 // The real work after a delivered link, observed: tests can read what a
@@ -139,6 +153,16 @@ vi.mock("../lib/queue/after-delivery", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("../lib/queue/after-delivery")>();
   return { ...actual, afterLinkDelivered: vi.fn(actual.afterLinkDelivered) };
+});
+
+// The offer engine, observed the same way: its own suite covers what it does
+// (offers-worker.test.ts); this one checks which jobs reach it.
+vi.mock("../lib/offers/worker", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/offers/worker")>();
+  return {
+    processOffer: vi.fn(actual.processOffer),
+    processOfferTap: vi.fn(actual.processOfferTap),
+  };
 });
 
 vi.mock("bullmq", () => {
@@ -159,6 +183,7 @@ vi.mock("bullmq", () => {
 
 import { createHash } from "node:crypto";
 import { MetaApiError, RateLimitError } from "@/lib/meta/client";
+import { processOffer, processOfferTap } from "../lib/offers/worker";
 import { afterLinkDelivered } from "../lib/queue/after-delivery";
 import { createDMWorker } from "../lib/queue/dm-worker";
 import { getRedisConnection } from "@/lib/queue/client";
@@ -281,6 +306,13 @@ beforeEach(() => {
   mockPrisma.contact.updateMany.mockReset().mockResolvedValue({ count: 1 });
   mockPrisma.contact.findUnique.mockReset().mockResolvedValue(null);
   mockPrisma.contactTag.createMany.mockReset().mockResolvedValue({ count: 1 });
+  mockPrisma.contactOffer.findUnique.mockReset().mockResolvedValue(null);
+  mockPrisma.contactOffer.findFirst.mockReset().mockResolvedValue(null);
+  mockPrisma.contactOffer.findMany.mockReset().mockResolvedValue([]);
+  mockPrisma.contactOffer.create.mockReset();
+  mockPrisma.contactOffer.updateMany.mockReset().mockResolvedValue({ count: 1 });
+  mockPrisma.offer.findMany.mockReset().mockResolvedValue([]);
+  mockQueueRemove.mockReset().mockResolvedValue(1);
   mockDecryptToken.mockReturnValue("decrypted_token");
   mockMatchKeywords.mockReturnValue({ matched: true, matchedKeyword: "LINK" });
   mockReserveWorkspaceDMSend.mockResolvedValue({
@@ -3142,5 +3174,297 @@ describe("DM Worker — second follow request", () => {
 
     expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
     expect(mockPrisma.operationalEvent.create).not.toHaveBeenCalled();
+  });
+});
+
+// ─── Lead-magnet offers after a delivered link (Weg 2) ─────────────────────
+
+describe("DM Worker — offers after a delivered link", () => {
+  const withOffers = { ...mockAutomation, offersEnabled: true };
+  const START_EVENT = "Offer skipped: the link was not delivered after a tap or DM";
+
+  // The job that starts the offer for one trigger. Its id follows the start
+  // key, so a repeat of the trigger is dropped while the first start waits.
+  function startAdd(startKey: string, interactionAt: number) {
+    const digest = createHash("sha256").update(startKey).digest("hex");
+    return [
+      "process-offer",
+      {
+        phase: "start",
+        workspaceId: "workspace_123",
+        accountConnectionId: "ig_account_row_1",
+        instagramAccountId: "ig_456",
+        automationId: "auto_789",
+        userId: "commenter_999",
+        interactionAt,
+        startKey,
+      },
+      {
+        jobId: `offerstart_auto_789_commenter_999_${digest}`,
+        removeOnComplete: true,
+      },
+    ];
+  }
+
+  const offerAdds = () =>
+    mockQueueAdd.mock.calls.filter(([name]) => name === "process-offer");
+
+  // A tap on the opening DM's button, as the webhook queues it.
+  function tap(mid: string, time = TAP_TIME) {
+    return {
+      ...createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        payload: "reveal:auto_789:open",
+        mid,
+      }),
+      id: `postback_ig_456_commenter_999_${mid}`,
+      timestamp: time,
+    };
+  }
+
+  // Link claims that behave like the PostbackDelivery table.
+  function durableClaims() {
+    const claims = new Set<string>();
+    mockPrisma.postbackDelivery.create.mockImplementation(
+      async ({ data }: { data: { id: string } }) => {
+        if (claims.has(data.id)) throw { code: "P2002" };
+        claims.add(data.id);
+        return data;
+      }
+    );
+  }
+
+  it("starts an offer once a tap delivered the link and it is recorded", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue(withOffers);
+
+    await getProcessor()(tap("mid_tap_1"));
+
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    expect(offerAdds()).toEqual([startAdd("auto_789:tap:mid_tap_1", TAP_TIME)]);
+    expect(mockPrisma.dmLog.upsert.mock.invocationCallOrder[0]).toBeLessThan(
+      mockQueueAdd.mock.invocationCallOrder[0]
+    );
+    expect(mockPrisma.operationalEvent.create).not.toHaveBeenCalled();
+  });
+
+  // The user's decision D1: like ManyChat, every new trigger of a campaign
+  // sends the link again and starts the next offer; a repeat of the same
+  // trigger starts nothing.
+  it("starts another offer for a new tap, none for the same tap redelivered", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue(withOffers);
+    durableClaims();
+    const process = getProcessor();
+
+    await process(tap("mid_tap_1"));
+    // The webhook again, once BullMQ no longer remembers the first job.
+    await process({ ...tap("mid_tap_1"), id: "postback_redelivered" });
+    // A tap on the next comment's opening DM.
+    await process(tap("mid_tap_2", TAP_TIME + 60_000));
+
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(2);
+    expect(offerAdds()).toEqual([
+      startAdd("auto_789:tap:mid_tap_1", TAP_TIME),
+      startAdd("auto_789:tap:mid_tap_2", TAP_TIME + 60_000),
+    ]);
+  });
+
+  it("keys a link a follow re-check delivers on the tap it repeats", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue({
+      ...withOffers,
+      requireFollow: true,
+    });
+    mockGetUserFollowStatus.mockResolvedValue(true);
+
+    await getProcessor()({
+      ...createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        payload: "followcheck:auto_789",
+        mid: "mid_tap_1",
+        followRecheck: true,
+        followRecheckAttempt: 1,
+        tappedAt: TAP_TIME,
+      }),
+      id: "postback_recheck_auto_789_commenter_999_1_88",
+      timestamp: TAP_TIME + 20_000,
+    });
+
+    expect(offerAdds()).toEqual([startAdd("auto_789:tap:mid_tap_1", TAP_TIME)]);
+  });
+
+  it("starts an offer for every new DM that brings the link, once per DM", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      { ...dmTriggerCampaign, offersEnabled: true },
+    ]);
+    durableClaims();
+    const process = getProcessor();
+
+    await process(inboundDmJob());
+    await process({ ...inboundDmJob(), id: "message_redelivered" });
+    await process({
+      ...inboundDmJob({ messageId: "mid_def" }),
+      timestamp: TAP_TIME + 60_000,
+    });
+
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(2);
+    expect(offerAdds()).toEqual([
+      startAdd("auto_789:dm:mid_abc", TAP_TIME),
+      startAdd("auto_789:dm:mid_def", TAP_TIME + 60_000),
+    ]);
+  });
+
+  it("skips the offer and says why after a read fallback delivered the link", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue(withOffers);
+
+    await getProcessor()(
+      createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        payload: "reveal:auto_789",
+        fallback: true,
+      })
+    );
+
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    expect(offerAdds()).toEqual([]);
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith({
+      data: {
+        workspaceId: "workspace_123",
+        source: "WORKER",
+        level: "INFO",
+        message: START_EVENT,
+        payload: {
+          automationId: "auto_789",
+          userId: "commenter_999",
+          via: "read-fallback",
+        },
+      },
+    });
+  });
+
+  it("skips the offer and says why after a link private reply", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([withOffers]);
+
+    await getProcessor()(createMockJob());
+
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+    expect(offerAdds()).toEqual([]);
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith({
+      data: {
+        workspaceId: "workspace_123",
+        source: "WORKER",
+        level: "INFO",
+        message: START_EVENT,
+        payload: {
+          automationId: "auto_789",
+          userId: "commenter_999",
+          via: "private-reply",
+        },
+      },
+    });
+  });
+
+  it("starts nothing after an opening DM, which carries no link", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      {
+        ...withOffers,
+        openingDmEnabled: true,
+        openingDmMessage: "Want the guide?",
+        openingDmButtonLabel: "Yes please",
+      },
+    ]);
+
+    await getProcessor()(createMockJob());
+
+    expect(mockSendPrivateReplyWithButton).toHaveBeenCalledTimes(1);
+    expect(offerAdds()).toEqual([]);
+    expect(mockPrisma.operationalEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("starts and records nothing for a campaign without offers", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue(mockAutomation);
+
+    await getProcessor()(tap("mid_tap_1"));
+
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    expect(offerAdds()).toEqual([]);
+    expect(mockPrisma.operationalEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("keeps a delivered tap SENT when the offer start cannot be queued", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      mockPrisma.automation.findFirst.mockResolvedValue(withOffers);
+      mockQueueAdd.mockRejectedValue(new Error("Redis connection lost"));
+
+      await expect(getProcessor()(tap("mid_tap_1"))).resolves.toBeUndefined();
+
+      expect(mockQueueAdd).toHaveBeenCalledTimes(1);
+      expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          create: expect.objectContaining({ status: "SENT" }),
+        })
+      );
+      expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          update: expect.objectContaining({ status: "FAILED" }),
+        })
+      );
+      expect(mockReleaseWorkspaceDMReservation).not.toHaveBeenCalled();
+      expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          workspaceId: "workspace_123",
+          level: "WARNING",
+          message: "Offer not started after a delivered link",
+        }),
+      });
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it("runs a process-offer job through the offer engine", async () => {
+    const job = {
+      name: "process-offer",
+      data: {
+        phase: "card",
+        workspaceId: "workspace_123",
+        accountConnectionId: "ig_account_row_1",
+        instagramAccountId: "ig_456",
+        contactOfferId: "co1",
+      },
+      id: "offer_co1_card",
+      attemptsMade: 0,
+    };
+
+    await getProcessor()(job);
+
+    expect(processOffer).toHaveBeenCalledWith(job);
+    expect(mockPrisma.contactOffer.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "co1", workspaceId: "workspace_123" } })
+    );
+    // Never read as a comment.
+    expect(mockPrisma.automation.findMany).not.toHaveBeenCalled();
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+  });
+
+  it("hands a tap on an offer's button to the offer engine without loading a campaign", async () => {
+    const job = createMockPostbackJob({
+      instagramAccountId: "ig_456",
+      userId: "commenter_999",
+      payload: "offer:co1",
+      mid: "mid_yes",
+    });
+
+    await getProcessor()(job);
+
+    expect(processOfferTap).toHaveBeenCalledWith(job);
+    expect(mockPrisma.contactOffer.findUnique).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "co1" } })
+    );
+    expect(mockPrisma.automation.findFirst).not.toHaveBeenCalled();
+    expect(mockPrisma.contact.upsert).not.toHaveBeenCalled();
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
   });
 });

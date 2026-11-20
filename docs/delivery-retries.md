@@ -38,3 +38,56 @@ SENT: it is never marked failed and never retried.
 
 No campaign is paused by this policy. New comments continue through the normal
 flow. No schema migration is required.
+
+## Lead-magnet offers
+
+A campaign with offers starts one only after its link went out following a
+button tap or an inbound DM, the only things that open Instagram's 24-hour
+messaging window. After a link sent as the comment's private reply or as a
+read fallback the offer is skipped, and an INFO event says so.
+
+Every new trigger of a campaign starts the next offer the person has not had
+yet, in the campaign's order: a new comment whose opening DM is tapped, a new
+tap with another message id, a new DM. A repeat of the same trigger starts
+nothing: a redelivered webhook, a retried job, a second tap that carries the
+same message id, the reconciler seeing a comment again. The start is keyed on
+the campaign and the trigger's id (`ContactOffer.startKey`, unique per contact;
+the start job's id is derived from it). A retried start job finds the row its
+first attempt created and queues the first message again; any later start for
+that trigger stops there. `ContactOffer` is unique per contact and offer, so
+nobody gets an offer twice, whichever campaign starts it. A crash between the
+delivered link and queueing the start loses that start: a second offer for one
+trigger would be worse, and the person's next trigger starts one.
+
+Every offer message (the offer texts, the confirmations, the card, the card
+again for a later tap, the reminder) is its own delayed job, removed once it
+completes, and follows one policy:
+
+- It counts toward the workspace's monthly DMs. Without a slot the offer stops
+  (PLAN_LIMIT, WARNING) and nothing is sent.
+- A durable claim per connected account, offer row, phase and step is taken
+  before Instagram is called, outside the send's error handling. A database
+  error on it gives the reservation back and retries the job. A claim taken
+  by an earlier run means the message went out, or may have: it is not sent
+  again, the reservation goes back and the sequence goes on.
+- An unknown outcome is recorded as a WARNING and never sent again; the claim
+  and the reservation stay and the sequence goes on.
+- A rate limit releases the claim and the reservation and is retried by BullMQ
+  after 5 and 15 minutes, still inside the window. On the last attempt the
+  offer stops (RATE_LIMITED, WARNING).
+- A closed window stops the offer with an INFO event (WINDOW_CLOSED), any other
+  refusal, an expired token included, with a WARNING (REJECTED). Both release
+  the claim and the reservation and end the job without a retry, so an expected
+  refusal never raises a worker alert.
+- The card's fallbacks (its text with the button, then plain text with the
+  link) and the reminder's text fallback run inside the message's one claim,
+  each only after a confirmed rejection of the previous form.
+
+Each message re-checks the window first, five minutes before it closes, and
+the reminder is scheduled no later than 23.5 hours after the person's last tap
+or DM, so its retries still land inside the window. A tap on the offer's
+button removes the waiting reminder. Until the card is out, every tap on that
+button queues the confirmations again, which the job ids and claims keep from
+sending anything twice; after it, a later tap gets the card once more, once per
+tap. Offer messages are never written to DmLog, and no offer job requires its
+campaign to be active: pausing a campaign does not cut off running offers.

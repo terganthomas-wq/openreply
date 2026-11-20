@@ -10,6 +10,8 @@
  */
 
 import { addContactTags, ensureContact } from "@/lib/contacts/store";
+import { enqueueOfferStart } from "@/lib/offers/jobs";
+import { offerStartKey } from "@/lib/offers/schedule";
 import { FOLLOWUP_JOB_NAME, getDMQueue } from "./client";
 import { formatError, logWorkerEvent } from "./send-helpers";
 
@@ -30,6 +32,7 @@ export interface LinkDelivery {
     followUpEnabled: boolean;
     followUpMessage: string | null;
     followUpDelayMinutes: number;
+    offersEnabled: boolean;
     instagramAccount: { instagramId: string };
   };
   userId: string;
@@ -42,6 +45,12 @@ export interface LinkDelivery {
   // of the messaging window. Null for a private reply and a read fallback,
   // which open no window.
   interactionAt: number | null;
+  // What set this delivery off, by the id Instagram gave it: the comment for
+  // a private reply, the button tap's mid for a tap (a follow re-check
+  // carries the mid of the tap it repeats), the inbound message's mid for a
+  // DM. A redelivered webhook, a retried job or a repeated tap with the same
+  // mid carries the same id.
+  triggerId: string;
 }
 
 export async function afterLinkDelivered({
@@ -51,6 +60,7 @@ export async function afterLinkDelivered({
   contactId,
   via,
   interactionAt,
+  triggerId,
 }: LinkDelivery): Promise<void> {
   // The campaign's delivery tag, e.g. "[LM] Guide sent": the person has this
   // campaign's link. It is set on every path that delivers the link, and only
@@ -131,6 +141,57 @@ export async function afterLinkDelivered({
       workspaceId: automation.workspaceId,
       level: "WARNING",
       message: "Follow-up not scheduled after a delivered link",
+      payload: {
+        automationId: automation.id,
+        userId,
+        via,
+        error: formatError(error),
+      },
+    });
+  }
+
+  // Lead-magnet offers (Weg 2). Instagram lets a business message a person
+  // only within 24 hours of the person's last tap or DM, and a comment's
+  // private reply is the one message allowed without either. A link that
+  // went out as a private reply or a read fallback therefore cannot be
+  // followed by an offer: that is skipped and recorded, so the owner sees
+  // why. Otherwise a start job picks the offer (lib/offers/worker.ts).
+  if (!automation.offersEnabled) return;
+  if (
+    interactionAt === null ||
+    via === "private-reply" ||
+    via === "read-fallback"
+  ) {
+    await logWorkerEvent({
+      workspaceId: automation.workspaceId,
+      level: "INFO",
+      message: "Offer skipped: the link was not delivered after a tap or DM",
+      payload: { automationId: automation.id, userId, via },
+    });
+    return;
+  }
+  // The start is keyed on the campaign and the trigger: every new tap or DM
+  // that brings the link starts the next offer this person has not had, and
+  // a repeat of the same trigger starts nothing. Like the follow-up, a lost
+  // start is recorded and the delivered link stays SENT. A start lost to a
+  // crash right after the delivery stays lost: a second offer for the same
+  // trigger would be worse, and the person gets one with their next trigger.
+  try {
+    await enqueueOfferStart({
+      workspaceId: automation.workspaceId,
+      accountConnectionId: automation.instagramAccountId,
+      instagramAccountId: automation.instagramAccount.instagramId,
+      automationId: automation.id,
+      userId,
+      interactionAt,
+      startKey: offerStartKey(automation.id, via, triggerId),
+    });
+  } catch (error) {
+    console.error("[DM Worker] Failed to start the offer:", formatError(error));
+    await logWorkerEvent({
+      workspaceId: automation.workspaceId,
+      level: "WARNING",
+      message: "Offer not started after a delivered link",
       payload: {
         automationId: automation.id,
         userId,

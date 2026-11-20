@@ -16,6 +16,8 @@ import {
 } from "./send-helpers";
 import { isQuestionComment } from "@/lib/automation/question-filter";
 import { ensureContactSafe, type ContactSummary } from "@/lib/contacts/store";
+import { OFFER_PAYLOAD_PREFIX } from "@/lib/offers/schedule";
+import { processOffer, processOfferTap } from "@/lib/offers/worker";
 import { createHash } from "node:crypto";
 import { UnrecoverableError, Worker, type Job } from "bullmq";
 import {
@@ -25,9 +27,11 @@ import {
   MESSAGE_JOB_NAME,
   POSTBACK_JOB_NAME,
   FOLLOWUP_JOB_NAME,
+  OFFER_JOB_NAME,
   type DmQueueJob,
   type ProcessCommentJob,
   type ProcessMessageJob,
+  type ProcessOfferJob,
   type ProcessPostbackJob,
   type ProcessFollowUpJob,
 } from "./client";
@@ -837,6 +841,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         contactId: contactId ?? null,
         via: "private-reply",
         interactionAt: null,
+        triggerId: commentId,
       });
     }
 
@@ -899,6 +904,11 @@ async function sendFollowRecheckAck({
  */
 async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
   const { instagramAccountId, userId, payload, fallback } = job.data;
+
+  // The "yes, send it" button of a lead-magnet offer. It belongs to the
+  // offer, not to a campaign: the campaign that started the offer may be
+  // paused or deleted by now, which must not leave the tap unanswered.
+  if (payload.startsWith(OFFER_PAYLOAD_PREFIX)) return processOfferTap(job);
 
   const isFollowCheck = payload.startsWith("followcheck:");
   if (!isFollowCheck && !payload.startsWith("reveal:")) return;
@@ -983,12 +993,15 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     interactionAt: realTap ? new Date(job.timestamp ?? Date.now()) : null,
   });
 
+  // This tap, by Instagram's message id. A follow re-check carries the mid
+  // of the tap it repeats, and a redelivered webhook the same mid again.
+  const tapId = job.data.mid ?? job.id ?? payload;
   const operationId = createHash("sha256")
     .update(JSON.stringify([
       automation.instagramAccountId,
       automation.id,
       userId,
-      job.data.mid ?? job.id ?? payload,
+      tapId,
     ]))
     .digest("hex");
 
@@ -1260,6 +1273,7 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     via: fallback ? "read-fallback" : "tap",
     // A link a re-check delivers counts from the tap, which opened the window.
     interactionAt: fallback ? null : tapTime(job),
+    triggerId: tapId,
   });
 }
 
@@ -1643,6 +1657,7 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
         contactId: contact?.id ?? null,
         via: "dm",
         interactionAt: job.timestamp ?? Date.now(),
+        triggerId: messageId,
       });
     }
   }
@@ -1698,6 +1713,9 @@ async function dispatchJob(job: Job<DmQueueJob>): Promise<void> {
   }
   if (job.name === MESSAGE_JOB_NAME) {
     return processMessage(job as Job<ProcessMessageJob>);
+  }
+  if (job.name === OFFER_JOB_NAME) {
+    return processOffer(job as Job<ProcessOfferJob>);
   }
   // Every other name used to fall through to processComment. A job type this
   // worker does not know yet (one added by a newer release, still delayed in
