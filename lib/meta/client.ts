@@ -950,6 +950,12 @@ export async function refreshLongLivedToken(
   };
 }
 
+export const INSTAGRAM_WEBHOOK_FIELDS = [
+  "comments",
+  "messages",
+  "messaging_postbacks",
+];
+
 export async function subscribeInstagramAccountToWebhooks(
   instagramAccountId: string,
   auth: MetaAuth
@@ -964,7 +970,11 @@ export async function subscribeInstagramAccountToWebhooks(
         Authorization: `Bearer ${accessToken}`,
       },
       body: JSON.stringify({
-        subscribed_fields: ["comments", "messages"],
+        // Button taps (follow gate, opening DM) arrive only with
+        // messaging_postbacks; "messages" does not include them. Read receipts
+        // (messaging_seen) are left out: they only feed the opening-DM
+        // fallback and would wake the database on every read.
+        subscribed_fields: INSTAGRAM_WEBHOOK_FIELDS,
       }),
     }
   );
