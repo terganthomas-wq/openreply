@@ -9,8 +9,11 @@ import { afterLinkDelivered } from "./after-delivery";
 import {
   formatError,
   isTemplateRejection,
+  logWorkerEvent,
   sendPostbackOnce,
 } from "./send-helpers";
+import { isQuestionComment } from "@/lib/automation/question-filter";
+import { ensureContactSafe, type ContactSummary } from "@/lib/contacts/store";
 import { createHash } from "node:crypto";
 import { UnrecoverableError, Worker, type Job } from "bullmq";
 import {
@@ -269,7 +272,29 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     orderBy: { createdAt: "asc" },
   });
 
+  // Campaigns bound to the commented post go before any-post campaigns. Only
+  // the first campaign to send can use the comment's one private reply, and a
+  // campaign set up for this very post is the one meant to answer it. Bound is
+  // read from postId, not matchAnyPost, which an edit can leave set next to a
+  // post. The sort is stable, so the oldest campaign of each group stays first.
+  const boundToThisPost = (postId: string | null) =>
+    Boolean(postId) && (postId === mediaId || postId === originalMediaId);
+  automations.sort(
+    (a, b) =>
+      Number(boundToThisPost(b.postId)) - Number(boundToThisPost(a.postId))
+  );
+
+  // Recorded once per job, by the first campaign with work to do for this
+  // comment. Undefined until then, null when that write failed.
+  let contactId: string | null | undefined;
+
   for (const automation of automations) {
+    // A campaign can leave questions to a human. The raw text is checked: the
+    // keyword matcher turns the question mark into a space.
+    if (automation.ignoreQuestionComments && isQuestionComment(commentText)) {
+      continue;
+    }
+
     // "Any word" campaigns fire on every comment; otherwise require a keyword hit.
     const matchResult = automation.matchAnyWord
       ? { matched: true, matchedKeyword: null }
@@ -310,13 +335,33 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
 
     // Skip only when there is genuinely nothing left to do. A comment whose DM
     // already went out but whose public reply never posted (e.g. it hit a rate
-    // limit) must still come back so the public reply can be retried.
-    if (existingLog?.status === "SKIPPED_PLAN_LIMIT") continue;
+    // limit) must still come back so the public reply can be retried. A dedupe
+    // skip is final: another campaign used the comment's private reply, and
+    // the public reply belongs to that campaign.
+    if (
+      existingLog?.status === "SKIPPED_PLAN_LIMIT" ||
+      existingLog?.status === "SKIPPED_DEDUP"
+    ) {
+      continue;
+    }
     if (
       !needsDm &&
       (!dmWentOut || alreadyPublicReplied || existingLog?.publicReplyDeliveryUnconfirmed || !automation.publicReplyEnabled)
     ) {
       continue;
+    }
+
+    // The commenter becomes, or stays, a contact. A comment opens no
+    // messaging window, so no interaction time is stamped. Best effort: a
+    // failed write must not hold up the DM.
+    if (contactId === undefined) {
+      const contact = await ensureContactSafe({
+        workspaceId: automation.workspaceId,
+        instagramAccountId: automation.instagramAccountId,
+        igsid: commenterId,
+        username: commenterName ?? null,
+      });
+      contactId = contact?.id ?? null;
     }
 
     if (!hasInstagramCredentials(automation.instagramAccount)) {
@@ -465,8 +510,10 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     // campaigns, or an any-post campaign overlapping a post-specific one), only
     // the first can deliver; the rest would fail with "The comment is invalid
     // for a private reply". Skip them explicitly instead of burning an API call
-    // and logging a failure the user can do nothing about. The public reply
-    // still goes out per campaign — only the DM leg is deduped.
+    // and logging a failure the user can do nothing about. Only the campaign
+    // that sent the DM posts a public reply: a second "check your DMs" under
+    // the same comment, from a campaign that sent nothing, adds noise and
+    // promises a message that never comes.
     const privateReplyUsedBy = await prisma.dmLog.findFirst({
       where: {
         commentId,
@@ -486,7 +533,6 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           errorMessage: `Another campaign (${privateReplyUsedBy.automation?.name ?? "unknown"}) already sent the one private reply Instagram allows for this comment`,
         },
       });
-      await postPublicReply();
       continue;
     }
 
@@ -608,6 +654,11 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           ? alreadyFollows === false
           : alreadyFollows !== true;
     }
+
+    // Whether this private reply carries the link. The opening DM and the
+    // follow prompt are logged SENT as well, but the link comes later, with
+    // the tap on their button.
+    const sendsLink = !useOpeningDm && !sendFollowPrompt;
 
     let claimed;
     try {
@@ -768,6 +819,19 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       throw sendError;
     }
 
+    // Outside the send's try block, like on every other delivery path: work
+    // that follows the link must never turn it into a failure.
+    if (sendsLink) {
+      await afterLinkDelivered({
+        automation,
+        userId: commenterId,
+        commenterName: commenterName ?? null,
+        contactId: contactId ?? null,
+        via: "private-reply",
+        interactionAt: null,
+      });
+    }
+
     await postPublicReply();
   }
 }
@@ -830,12 +894,16 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
 
   const isFollowCheck = payload.startsWith("followcheck:");
   if (!isFollowCheck && !payload.startsWith("reveal:")) return;
-  // The opening DM's button appends ":open" to the payload; the follow
+  // The opening DM's button appends ":open" to the payload; the first follow
   // prompt's button does not. Automation ids are cuids and contain no colon.
   const [automationId, marker] = payload
     .slice(isFollowCheck ? "followcheck:".length : "reveal:".length)
     .split(":");
   const fromOpeningDm = marker === "open";
+  // The second follow request's button appends ":retry". A tap on it gets the
+  // link without another check, so nobody who was asked twice ends up stuck
+  // when Instagram is slow to report the follow.
+  const retryTap = isFollowCheck && marker === "retry";
 
   const automation = await prisma.automation.findFirst({
     where: { id: automationId, isActive: true, ...connectionScope(job.data) },
@@ -892,6 +960,19 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     context: accessToken,
     workspaceId: automation.workspaceId,
     recipientId: userId,
+    instagramAccountRowId: automation.instagramAccountId,
+  });
+
+  // The tapper becomes, or stays, a contact. A tap opens Instagram's 24-hour
+  // messaging window, so it stamps the tap's time. A read fallback is no
+  // interaction, and a re-check repeats a tap that was stamped already.
+  const realTap = !fallback && !job.data.followRecheck;
+  const contact = await ensureContactSafe({
+    workspaceId: automation.workspaceId,
+    instagramAccountId: automation.instagramAccountId,
+    igsid: userId,
+    username: commenterName,
+    interactionAt: realTap ? new Date(job.timestamp ?? Date.now()) : null,
   });
 
   const operationId = createHash("sha256")
@@ -908,8 +989,22 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
   // on a read fallback a non-follower is silently skipped — the gate must not
   // be bypassable by just reading the DM and waiting. On a tap, following or
   // unverifiable (null) falls through and delivers the link — fail-open so a
-  // real follower is never trapped.
-  if ((isFollowCheck || fallback) && automation.requireFollow) {
+  // real follower is never trapped. A tap on the second follow request skips
+  // the check; that is recorded, so Diagnostics shows how often the link went
+  // out without a confirmed follow.
+  if (retryTap && automation.requireFollow) {
+    await logWorkerEvent({
+      workspaceId: automation.workspaceId,
+      level: "INFO",
+      message: "Follow gate skipped after the second follow request",
+      payload: {
+        automationId: automation.id,
+        automationName: automation.name,
+        userId,
+        commenterName,
+      },
+    });
+  } else if ((isFollowCheck || fallback) && automation.requireFollow) {
     const follows = await getUserFollowStatus({
       context: accessToken,
       recipientId: userId,
@@ -990,8 +1085,14 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
           .catch(() => {});
       }
 
+      // After an opening-DM tap this is the first follow request. Otherwise
+      // the person was asked before and the last re-check still saw no follow,
+      // so this is the second request: its own text and label, falling back
+      // to the first ones, and a ":retry" button whose tap gets the link.
+      const secondRequest = !fromOpeningDm;
       const promptText = renderMessageWithoutLink({
         message:
+          (secondRequest && automation.followPromptRetryMessage) ||
           automation.followPromptMessage ||
           "quick favor before i send your link. i don't make any money from this, it's free. if you want to support me, just don't unfollow after, and star the repo on github if it helps you. tap the button once you're following and i'll send it over",
         commenterName,
@@ -1006,8 +1107,12 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
               userId: userId,
               text: promptText,
               buttonTitle:
-                automation.followPromptButtonLabel || "i'm following",
-              payload: `followcheck:${automation.id}`,
+                (secondRequest && automation.followPromptRetryButtonLabel) ||
+                automation.followPromptButtonLabel ||
+                "i'm following",
+              payload: secondRequest
+                ? `followcheck:${automation.id}:retry`
+                : `followcheck:${automation.id}`,
             }),
         });
       } catch (error) {
@@ -1140,7 +1245,9 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     automation,
     userId,
     commenterName,
+    contactId: contact?.id ?? null,
     via: fallback ? "read-fallback" : "tap",
+    interactionAt: fallback ? null : job.timestamp ?? Date.now(),
   });
 }
 
@@ -1223,6 +1330,14 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
     },
     orderBy: { createdAt: "asc" },
   });
+
+  // Every inbound DM records its sender as a contact, whether or not a
+  // campaign answers it: the DM opens Instagram's 24-hour messaging window,
+  // which later messages to this person depend on.
+  const contact = await recordMessageSender(job, automations[0]);
+  // The name the contact has stored. A DM carries no handle, so a name found
+  // below is stored once, not again for every matching campaign.
+  let contactName = contact?.username ?? null;
 
   const dedupeId = `dm:${messageId}`;
 
@@ -1320,7 +1435,25 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
       context: accessToken,
       workspaceId: automation.workspaceId,
       recipientId: senderId,
+      instagramAccountRowId: automation.instagramAccountId,
     });
+    // A contact stored without a name keeps the one found here, for the
+    // contact list and the next message, which then needs no lookup. Best
+    // effort: the reply does not depend on it.
+    if (contact && commenterName && commenterName !== contactName) {
+      contactName = commenterName;
+      await prisma.contact
+        .updateMany({
+          where: { id: contact.id },
+          data: { username: commenterName },
+        })
+        .catch((error) =>
+          console.error(
+            "[DM Worker] Failed to store the contact's name:",
+            formatError(error)
+          )
+        );
+    }
 
     // Follow gate: anyone not confirmed as a follower gets the prompt instead of
     // the link, with the same `followcheck:` button that re-verifies on tap.
@@ -1479,9 +1612,52 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
         automation,
         userId: senderId,
         commenterName,
+        contactId: contact?.id ?? null,
         via: "dm",
+        interactionAt: job.timestamp ?? Date.now(),
       });
     }
+  }
+}
+
+/**
+ * Record the sender of an inbound DM as a contact, stamped with the time of
+ * the DM. A campaign that may answer it already names the account; without
+ * one the account is looked up. Best effort, like every contact write on a
+ * send path: a failure is logged and the DM is still handled.
+ */
+async function recordMessageSender(
+  job: Job<ProcessMessageJob>,
+  campaign: { instagramAccountId: string; workspaceId: string } | undefined
+): Promise<ContactSummary | null> {
+  const { instagramAccountId, accountConnectionId, senderId } = job.data;
+  try {
+    const account = campaign
+      ? { id: campaign.instagramAccountId, workspaceId: campaign.workspaceId }
+      : await prisma.instagramAccount.findUnique({
+          where: { instagramId: instagramAccountId },
+          select: { id: true, workspaceId: true },
+        });
+    // A job bound to a connection that has since been replaced is not
+    // credited to the new one, just as its campaigns are not (connectionScope).
+    if (
+      !account ||
+      (accountConnectionId && account.id !== accountConnectionId)
+    ) {
+      return null;
+    }
+    return await ensureContactSafe({
+      workspaceId: account.workspaceId,
+      instagramAccountId: account.id,
+      igsid: senderId,
+      interactionAt: new Date(job.timestamp ?? Date.now()),
+    });
+  } catch (error) {
+    console.error(
+      "[DM Worker] Failed to record the DM sender:",
+      formatError(error)
+    );
+    return null;
   }
 }
 

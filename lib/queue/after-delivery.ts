@@ -9,6 +9,7 @@
  * step catches its own errors, so one failing step does not skip the next.
  */
 
+import { addContactTags, ensureContact } from "@/lib/contacts/store";
 import { FOLLOWUP_JOB_NAME, getDMQueue } from "./client";
 import { formatError, logWorkerEvent } from "./send-helpers";
 
@@ -25,6 +26,7 @@ export interface LinkDelivery {
     id: string;
     workspaceId: string;
     instagramAccountId: string;
+    deliveryTag: string | null;
     followUpEnabled: boolean;
     followUpMessage: string | null;
     followUpDelayMinutes: number;
@@ -32,15 +34,67 @@ export interface LinkDelivery {
   };
   userId: string;
   commenterName: string | null;
+  // The contact the delivery path recorded for this person, or null when that
+  // write failed.
+  contactId: string | null;
   via: LinkDeliveryVia;
+  // When the tap or the DM behind this delivery happened (epoch ms), the start
+  // of the messaging window. Null for a private reply and a read fallback,
+  // which open no window.
+  interactionAt: number | null;
 }
 
 export async function afterLinkDelivered({
   automation,
   userId,
   commenterName,
+  contactId,
   via,
+  interactionAt,
 }: LinkDelivery): Promise<void> {
+  // The campaign's delivery tag, e.g. "[LM] Guide sent": the person has this
+  // campaign's link. It is set on every path that delivers the link, and only
+  // after the SENT write, never for an opening DM or a follow prompt. A tag
+  // the contact already has keeps the time it was first set.
+  const deliveryTag = automation.deliveryTag?.trim();
+  if (deliveryTag) {
+    try {
+      // No contactId means the delivery path's own contact write failed. That
+      // one is best effort so it never holds up a DM; the tag needs the row,
+      // so it is tried once more here.
+      const id =
+        contactId ??
+        (
+          await ensureContact({
+            workspaceId: automation.workspaceId,
+            instagramAccountId: automation.instagramAccountId,
+            igsid: userId,
+            username: commenterName,
+            interactionAt:
+              interactionAt === null ? null : new Date(interactionAt),
+          })
+        ).id;
+      await addContactTags(automation.workspaceId, id, [deliveryTag]);
+    } catch (error) {
+      console.error(
+        "[DM Worker] Failed to tag the contact:",
+        formatError(error),
+      );
+      await logWorkerEvent({
+        workspaceId: automation.workspaceId,
+        level: "WARNING",
+        message: "Delivery tag not added after a delivered link",
+        payload: {
+          automationId: automation.id,
+          userId,
+          via,
+          tag: deliveryTag,
+          error: formatError(error),
+        },
+      });
+    }
+  }
+
   // Optional appreciation follow-up: a short thank-you after the link. It is
   // its own delayed job so it can go out some minutes later
   // (followUpDelayMinutes) rather than immediately, and the deterministic job

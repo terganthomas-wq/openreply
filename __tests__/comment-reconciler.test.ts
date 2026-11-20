@@ -140,3 +140,100 @@ describe("comment polling does not recreate unsafe sends", () => {
     },
   );
 });
+
+describe("comments the worker leaves alone are not swept again", () => {
+  const campaign = {
+    id: "campaign",
+    name: "Campaign",
+    workspaceId: "workspace",
+    postId: POST,
+    matchAnyPost: false,
+    matchAnyWord: false,
+    keywords: ["AI"],
+    wholeWordMatch: true,
+    publicReplyEnabled: true,
+    instagramAccount: {
+      id: "connection",
+      instagramId: "owner",
+      provider: "META",
+      accessToken: "test",
+    },
+  };
+
+  function enqueuedComments(): string[] {
+    return queueAdd.mock.calls.map(([, data]) => data.commentId).sort();
+  }
+
+  beforeEach(() => {
+    queueAdd.mockReset();
+    mockPrisma.automation.findMany.mockReset();
+    mockPrisma.operationalEvent.create.mockResolvedValue({});
+    mockPrisma.$queryRaw.mockResolvedValue([]);
+    mockPrisma.dmLog.findMany.mockResolvedValue([]);
+    readComments.mockResolvedValue([
+      {
+        id: "question",
+        text: "Is AI free?",
+        from: { id: "reader" },
+        timestamp: new Date().toISOString(),
+      },
+      {
+        id: "request",
+        text: "AI",
+        from: { id: "another-reader" },
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+  });
+
+  it("reads the question setting with the campaigns", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([]);
+
+    await reconcileComments();
+
+    expect(mockPrisma.automation.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: expect.objectContaining({ ignoreQuestionComments: true }),
+      })
+    );
+  });
+
+  it("does not enqueue a question the campaign leaves to a human", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      { ...campaign, ignoreQuestionComments: true },
+    ]);
+
+    await reconcileComments();
+
+    expect(enqueuedComments()).toEqual(["request"]);
+  });
+
+  it("enqueues the question when the campaign takes questions", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      { ...campaign, ignoreQuestionComments: false },
+    ]);
+
+    await reconcileComments();
+
+    expect(enqueuedComments()).toEqual(["question", "request"]);
+  });
+
+  it("treats a comment another campaign answered as handled, even with a public reply due", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([campaign]);
+    mockPrisma.dmLog.findMany.mockResolvedValue([
+      {
+        commentId: "request",
+        status: "SKIPPED_DEDUP",
+        attempts: 0,
+        errorMessage: "Another campaign (Other) already sent the one private reply",
+        dmDeliveryUnconfirmed: false,
+        publicReplySentAt: null,
+        publicReplyDeliveryUnconfirmed: false,
+      },
+    ]);
+
+    await reconcileComments();
+
+    expect(enqueuedComments()).toEqual(["question"]);
+  });
+});

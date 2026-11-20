@@ -25,6 +25,7 @@
  * filter on the account to widen results.
  */
 
+import { isQuestionComment } from "@/lib/automation/question-filter";
 import { MAX_COMMENT_SEND_ATTEMPTS } from "@/lib/queue/comment-delivery";
 import { hasLegacyUnconfirmedDelivery } from "@/lib/instagram/delivery-errors";
 import { prisma } from "@/lib/db/client";
@@ -78,6 +79,7 @@ export async function reconcileComments(): Promise<void> {
       matchAnyWord: true,
       keywords: true,
       wholeWordMatch: true,
+      ignoreQuestionComments: true,
       publicReplyEnabled: true,
       workspaceId: true,
       instagramAccount: {
@@ -130,6 +132,7 @@ async function sweepCampaign({
     matchAnyWord: boolean;
     keywords: string[];
     wholeWordMatch: boolean;
+    ignoreQuestionComments: boolean;
     publicReplyEnabled: boolean;
     instagramAccount: {
       id: string;
@@ -212,6 +215,18 @@ async function sweepCampaign({
       const authorId = c.from?.id;
       if (!authorId || authorId === account.instagramId) return false;
 
+      // Questions the campaign leaves to a human are not work for the sweep.
+      // The worker skips them without writing a log row, so nothing would ever
+      // mark them handled: they would come back every sweep for the whole
+      // lookback and use up places in the per-sweep cap that comments the
+      // campaign does answer need.
+      if (
+        automation.ignoreQuestionComments &&
+        isQuestionComment(c.text ?? "")
+      ) {
+        return false;
+      }
+
       const matched = automation.matchAnyWord
         ? true
         : matchKeywords(
@@ -238,7 +253,9 @@ async function sweepCampaign({
     // reply, the completion signal is publicReplySentAt (a DM alone is not
     // enough — the reply still has to land); otherwise a SENT DM is enough. This
     // is what lets a comment whose DM sent but whose public reply failed come
-    // back and retry the reply.
+    // back and retry the reply. A comment another campaign answered is done
+    // for this one whatever its settings: the private reply was used, and the
+    // public reply is the answering campaign's.
     const logs = await prisma.dmLog.findMany({
       where: {
         automationId: automation.id,
@@ -251,6 +268,7 @@ async function sweepCampaign({
       },
     });
     const handledSet = new Set(logs.filter((log) => {
+      if (log.status === "SKIPPED_DEDUP") return true;
       const dmStopped = log.status === "SENT" || log.status === "SKIPPED_PLAN_LIMIT" ||
         log.dmDeliveryUnconfirmed || log.attempts >= MAX_COMMENT_SEND_ATTEMPTS ||
         (log.status === "FAILED" && hasLegacyUnconfirmedDelivery(log.errorMessage));
