@@ -9,10 +9,12 @@ import {
 } from "@/lib/tracking/analytics";
 import { buildTrackedUrl } from "@/lib/tracking/message";
 import { TRACKED_LINK_ORDER } from "@/lib/tracking/link-order";
+import { syncCampaignLinks } from "@/lib/campaigns/links";
 import {
-  buildInitialCampaignLinks,
-  syncCampaignLinks,
-} from "@/lib/campaigns/links";
+  newCampaignData,
+  offersExist,
+  uniqueOfferIds,
+} from "@/lib/campaigns/create";
 import {
   createAutomationSchema,
   OFFER_RULE_MESSAGE,
@@ -28,17 +30,6 @@ import {
 // This list is read-your-writes (created/imported campaigns must show up
 // immediately), so never cache it at the route or CDN layer.
 export const dynamic = "force-dynamic";
-
-// A campaign's custom offer order holds plain ids (no foreign key), so every
-// id must name an offer of this workspace that is still on the Offers page.
-// Archived offers are kept for their history but must not be offered again.
-async function offersExist(workspaceId: string, offerIds: string[]) {
-  if (offerIds.length === 0) return true;
-  const count = await prisma.offer.count({
-    where: { workspaceId, id: { in: offerIds }, archivedAt: null },
-  });
-  return count === offerIds.length;
-}
 
 function unknownOfferResponse() {
   return NextResponse.json(
@@ -237,9 +228,7 @@ export async function POST(request: NextRequest) {
     parsed.data.instagramAccountId && parsed.data.instagramAccountId !== "all"
       ? parsed.data.instagramAccountId
       : null;
-  // A repeated id adds nothing (an offer is never made twice to the same
-  // person), so only its first place counts.
-  const offerIds = [...new Set(parsed.data.offerIds)];
+  const offerIds = uniqueOfferIds(parsed.data.offerIds);
 
   const [workspace, instagramAccount, offersKnown] = await Promise.all([
     prisma.workspace.findUnique({
@@ -273,89 +262,12 @@ export async function POST(request: NextRequest) {
 
   if (!offersKnown) return unknownOfferResponse();
 
-  const linkCreates = buildInitialCampaignLinks({
-    workspaceId,
-    primaryUrl: parsed.data.trackedDestinationUrl,
-    secondaryUrl: parsed.data.secondaryDestinationUrl,
-    secondaryLabel: parsed.data.secondaryButtonLabel,
-  });
-
-  const { pendingNextReel, matchAnyPost, matchAnyWord, openingDmEnabled } =
-    parsed.data;
-  // A post is only stored for the "specific post" trigger.
-  const isSpecificPost = !pendingNextReel && !matchAnyPost;
-  const publicReplyList = (
-    parsed.data.publicReplyMessages.length > 0
-      ? parsed.data.publicReplyMessages
-      : parsed.data.publicReplyMessage
-        ? [parsed.data.publicReplyMessage]
-        : []
-  )
-    .map((m) => m.trim())
-    .filter(Boolean);
-
+  // The same row the import writes (lib/campaigns/create.ts).
   const automation = await prisma.automation.create({
-    data: {
-      name: parsed.data.name,
-      goal: parsed.data.goal,
-      // A next-reel campaign has no post yet; the cron binds it once a reel is posted.
-      postId: isSpecificPost ? parsed.data.postId : null,
-      postUrl: isSpecificPost ? parsed.data.postUrl : null,
-      pendingNextReel,
-      matchAnyPost,
-      keywords: matchAnyWord ? [] : parsed.data.keywords,
-      matchAnyWord,
-      dmTriggerEnabled: parsed.data.dmTriggerEnabled,
-      dmMessage: parsed.data.dmMessage,
-      openingDmEnabled,
-      openingDmMessage: openingDmEnabled
-        ? parsed.data.openingDmMessage || null
-        : null,
-      openingDmButtonLabel: openingDmEnabled
-        ? parsed.data.openingDmButtonLabel || null
-        : null,
-      linkButtonLabel: parsed.data.linkButtonLabel || null,
-      requireFollow: parsed.data.requireFollow,
-      followPromptMessage: parsed.data.requireFollow
-        ? parsed.data.followPromptMessage || null
-        : null,
-      followPromptButtonLabel: parsed.data.requireFollow
-        ? parsed.data.followPromptButtonLabel || null
-        : null,
-      followPromptRetryMessage: parsed.data.requireFollow
-        ? parsed.data.followPromptRetryMessage || null
-        : null,
-      followPromptRetryButtonLabel: parsed.data.requireFollow
-        ? parsed.data.followPromptRetryButtonLabel || null
-        : null,
-      followUpEnabled: parsed.data.followUpEnabled,
-      followUpMessage: parsed.data.followUpEnabled
-        ? parsed.data.followUpMessage || null
-        : null,
-      followUpDelayMinutes: parsed.data.followUpEnabled
-        ? parsed.data.followUpDelayMinutes
-        : 0,
-      publicReplyEnabled: parsed.data.publicReplyEnabled,
-      publicReplyMessages: parsed.data.publicReplyEnabled
-        ? publicReplyList
-        : [],
-      publicReplyMessage: parsed.data.publicReplyEnabled
-        ? publicReplyList[0] ?? parsed.data.publicReplyMessage ?? null
-        : null,
-      isActive: parsed.data.isActive,
-      wholeWordMatch: parsed.data.wholeWordMatch,
-      ignoreQuestionComments: parsed.data.ignoreQuestionComments,
-      // Trimmed by the schema; nothing left means no tag.
-      deliveryTag: parsed.data.deliveryTag || null,
-      offersEnabled: parsed.data.offersEnabled,
-      offerIds,
+    data: newCampaignData(parsed.data, {
       workspaceId,
       instagramAccountId: instagramAccount.id,
-      reportShareSlug: generateReportShareSlug(),
-      ...(linkCreates.length > 0
-        ? { trackedLinks: { create: linkCreates } }
-        : {}),
-    },
+    }),
     include: {
       trackedLinks: true,
     },
@@ -506,7 +418,7 @@ export async function PATCH(request: NextRequest) {
   }
 
   if (automationData.offerIds !== undefined) {
-    automationData.offerIds = [...new Set(automationData.offerIds)];
+    automationData.offerIds = uniqueOfferIds(automationData.offerIds);
     if (!(await offersExist(workspaceId, automationData.offerIds))) {
       return unknownOfferResponse();
     }

@@ -193,6 +193,21 @@ describe("sendOfferCard", () => {
       "a person Instagram cannot find",
       metaError(100, "The requested user cannot be found"),
     ],
+    // What handleResponse raises when Meta has no such recipient: a code 100
+    // that refuses the person, not the card.
+    [
+      "no matching user",
+      new PermissionError(
+        "(#100) No matching user found (/v25.0/ig_1/messages) [code=100 sub=2534014 type=OAuthException trace=t]",
+        "t",
+        2534014,
+        100
+      ),
+    ],
+    [
+      "a person who cannot be messaged right now",
+      metaError(100, "This person isn't available right now"),
+    ],
     ["a rate limit", new RateLimitError("Too many calls")],
     ["an expired token", new TokenExpiredError("Session has expired")],
     ["code 200", metaError(200, "Requires instagram_manage_messages")],
@@ -329,6 +344,40 @@ describe("isCardRejection", () => {
       metaError(100, "This message is invalid for a private reply"),
     ],
     ["an unknown person", metaError(100, "The requested user cannot be found")],
+    // Refusals of the recipient: a button message would be refused the same
+    // way, so the chain ends with the card.
+    ["no matching user", metaError(100, "(#100) No matching user found")],
+    [
+      "no matching user as handleResponse words it",
+      new PermissionError(
+        "(#100) No matching user found (/v25.0/ig_1/messages) [code=100 sub=2534014 type=OAuthException trace=t]",
+        "t",
+        2534014,
+        100
+      ),
+    ],
+    [
+      "a closed window as handleResponse words it",
+      new PermissionError(
+        "(#100) This message is sent outside of allowed window. (/v25.0/ig_1/messages) [code=100 sub=2534022 type=OAuthException trace=t]",
+        "t",
+        2534022,
+        100
+      ),
+    ],
+    [
+      "a person who isn't available",
+      metaError(100, "This person isn't available right now."),
+    ],
+    [
+      "a person who isn’t available (typographic apostrophe)",
+      metaError(100, "This person isn’t available right now."),
+    ],
+    ["an unavailable user", metaError(100, "User is unavailable")],
+    [
+      "a person who is not receiving messages",
+      metaError(100, "This person isn't receiving messages from you right now."),
+    ],
     // Excluded by class, whatever code they carry.
     [
       "a rate limit",

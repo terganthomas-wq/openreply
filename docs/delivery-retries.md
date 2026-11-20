@@ -27,7 +27,10 @@ Replies to DM keyword triggers take the same durable claim, one per connected
 account, campaign and inbound message, before Instagram is called. A retried
 job or a redelivered message cannot answer the same DM twice, even when its log
 row was never written, and an unknown send outcome ends the job without a
-retry, as for a button tap. Work that follows a delivered link (the follow-up
+retry, as for a button tap. The claim itself is taken outside the send's error
+handling: when the database fails while taking it, nothing was sent, so the job
+is retried like after any other database error instead of being recorded as an
+unconfirmed delivery. Work that follows a delivered link (the follow-up
 message, contact tags, lead-magnet offers) runs only after the SENT write and
 outside the send's error handling. When it fails, for example because Redis
 refuses the follow-up job, the failure is logged and the delivered DM stays

@@ -35,14 +35,22 @@ export function formatError(error: unknown): string {
 }
 
 // Meta rejections that a plain-text retry cannot fix: the send was refused for
-// the conversation, not for the button template. Retrying as text just burns
-// the attempt and — worse — overwrites the real error with a misleading one
-// ("invalid for a private reply", because the first attempt already used up the
-// comment's single allowed private reply).
+// the conversation or the person, not for the button template. Retrying as
+// text just burns the attempt and — worse — overwrites the real error with a
+// misleading one ("invalid for a private reply", because the first attempt
+// already used up the comment's single allowed private reply).
+//
+// The offer card (lib/offers/send.ts) falls back after any other code 100, so
+// every refusal of the recipient belongs here, whatever its code: Instagram
+// cannot find the person, the messaging window is closed, or the person cannot
+// be messaged right now. A button message would be refused the same way.
 export const NON_TEMPLATE_REJECTIONS = [
   /outside of allowed window/i,
   /invalid for a private reply/i,
   /requested user cannot be found/i,
+  /no matching user found/i,
+  /(?:person|user) (?:isn['’]t available|is not available|(?:is )?unavailable)/i,
+  /(?:isn['’]t|not) receiving messages/i,
 ];
 
 export function isTemplateRejection(error: unknown): boolean {
@@ -70,22 +78,43 @@ export function isUniqueViolation(error: unknown): boolean {
   );
 }
 
-export async function sendPostbackOnce({
+/**
+ * Take the durable claim on one message before it is sent. False when an
+ * earlier run holds it: that run sent the message, or may have, so it must not
+ * be sent again.
+ *
+ * Any other error comes from the database and is rethrown as it is. Nothing
+ * has been sent at that point, so the job may simply be retried. Callers that
+ * classify send errors must take the claim outside that handling: read as a
+ * send error, a lost connection here would count as an unknown delivery and
+ * end the job for good, with the message never sent.
+ */
+export async function claimPostbackDelivery(
+  operationId: string
+): Promise<boolean> {
+  try {
+    await prisma.postbackDelivery.create({ data: { id: operationId } });
+    return true;
+  } catch (error) {
+    if (isUniqueViolation(error)) return false;
+    throw error;
+  }
+}
+
+/**
+ * Send a message whose claim is taken (claimPostbackDelivery). A confirmed
+ * rejection releases the claim, so a retry may send; any other failure keeps
+ * it and arrives classified (classifySendError).
+ */
+export async function sendClaimedPostback({
   operationId,
   send,
 }: {
   operationId: string;
   send: () => Promise<unknown>;
-}): Promise<boolean> {
-  try {
-    await prisma.postbackDelivery.create({ data: { id: operationId } });
-  } catch (error) {
-    if (isUniqueViolation(error)) return false;
-    throw error;
-  }
+}): Promise<void> {
   try {
     await send();
-    return true;
   } catch (error) {
     // A durable claim survives queue eviction, concurrent redelivery, and a
     // process crash during delivery. Only confirmed rejections permit retry.
@@ -95,6 +124,19 @@ export async function sendPostbackOnce({
     }
     throw classifySendError(error);
   }
+}
+
+/** Claim and send in one step. False when the message was claimed before. */
+export async function sendPostbackOnce({
+  operationId,
+  send,
+}: {
+  operationId: string;
+  send: () => Promise<unknown>;
+}): Promise<boolean> {
+  if (!(await claimPostbackDelivery(operationId))) return false;
+  await sendClaimedPostback({ operationId, send });
+  return true;
 }
 
 // An entry for the Diagnostics timeline. Best effort: it runs next to sends

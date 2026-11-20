@@ -46,7 +46,9 @@ export type OfferCardVia = "CARD" | "BUTTON" | "TEXT";
  * the fallback cannot deliver twice, and a card is always a DM, never a
  * comment's single private reply that the first attempt could have used up.
  * The rejections in NON_TEMPLATE_REJECTIONS still end the chain: they refuse
- * the conversation, not the card, and would refuse every fallback as well.
+ * the conversation or the person (no matching user, a closed window, someone
+ * who cannot be messaged right now), not the card, and would refuse every
+ * fallback as well.
  */
 export function isCardRejection(error: unknown): boolean {
   if (

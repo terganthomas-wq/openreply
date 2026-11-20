@@ -173,4 +173,35 @@ describe("read receipts", () => {
       expect.anything()
     );
   });
+
+  // The answer to a DM keyword is no opening DM: it carried the link, or a
+  // follow prompt with its own button, so a fallback would send the link again.
+  it("queues no read fallback for the answer to a DM keyword", async () => {
+    mockPrisma.dmLog.findMany.mockResolvedValue([
+      { commentId: "dm:mid_1", automation: { id: "campaign_1" } },
+    ]);
+
+    await processInstagramWebhook({ payload: readReceipt, provider: "META" });
+
+    expect(queueAdd).not.toHaveBeenCalled();
+  });
+
+  it("queues a read fallback only for the campaign whose opening DM went out", async () => {
+    mockPrisma.dmLog.findMany.mockResolvedValue([
+      { commentId: "dm:mid_1", automation: { id: "campaign_1" } },
+      { commentId: "comment_2", automation: { id: "campaign_2" } },
+    ]);
+
+    await processInstagramWebhook({ payload: readReceipt, provider: "META" });
+
+    expect(queueAdd).toHaveBeenCalledTimes(1);
+    expect(queueAdd).toHaveBeenCalledWith(
+      "process-postback",
+      expect.objectContaining({ payload: "reveal:campaign_2", fallback: true }),
+      {
+        delay: 5 * 60 * 1000,
+        jobId: `read_fallback_${ACCOUNT}_${READER}_campaign_2`,
+      }
+    );
+  });
 });

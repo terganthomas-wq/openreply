@@ -133,6 +133,14 @@ vi.mock("@/lib/queue/client", () => ({
   MESSAGE_JOB_NAME: "process-message",
 }));
 
+// The real work after a delivered link, observed: tests can read what a
+// delivery path reported (how the link went out, when the window opened).
+vi.mock("../lib/queue/after-delivery", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../lib/queue/after-delivery")>();
+  return { ...actual, afterLinkDelivered: vi.fn(actual.afterLinkDelivered) };
+});
+
 vi.mock("bullmq", () => {
   function MockWorker(_name: string, processor: unknown) {
     (global as Record<string, unknown>).__dmWorkerProcessor = processor;
@@ -151,6 +159,7 @@ vi.mock("bullmq", () => {
 
 import { createHash } from "node:crypto";
 import { MetaApiError, RateLimitError } from "@/lib/meta/client";
+import { afterLinkDelivered } from "../lib/queue/after-delivery";
 import { createDMWorker } from "../lib/queue/dm-worker";
 import { getRedisConnection } from "@/lib/queue/client";
 import { hashRecipientId } from "@/lib/tracking/server";
@@ -1280,6 +1289,50 @@ describe("DM Worker — DM keyword trigger", () => {
     expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
   });
 
+  // Nothing is sent before the claim is stored, so a database error on it is
+  // retried like any other. It used to pass through the send's error handling
+  // and end the job as an unconfirmed delivery: no retry, and a log row that
+  // made every later run skip the message.
+  it("retries the job without sending when the claim cannot be stored", async () => {
+    const lostConnection = new Error("Connection terminated unexpectedly");
+    mockPrisma.postbackDelivery.create.mockRejectedValue(lostConnection);
+
+    await expect(getProcessor()(createMockMessageJob())).rejects.toBe(
+      lostConnection
+    );
+
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
+    expect(mockSendDirectMessageWithLinkButton).not.toHaveBeenCalled();
+    expect(mockSendDirectMessageWithButton).not.toHaveBeenCalled();
+    // The retry reserves again, so this attempt's reservation is given back.
+    expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledWith(
+      "workspace_123",
+      usagePeriodStart
+    );
+    expect(mockPrisma.postbackDelivery.delete).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
+  });
+
+  it("answers the message on the retry after the claim could not be stored", async () => {
+    mockPrisma.postbackDelivery.create
+      .mockRejectedValueOnce(new Error("Connection terminated unexpectedly"))
+      .mockResolvedValue({});
+
+    const process = getProcessor();
+    await expect(process(createMockMessageJob())).rejects.toThrow(
+      "Connection terminated unexpectedly"
+    );
+    await process({ ...createMockMessageJob(), attemptsMade: 1 });
+
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.dmLog.upsert).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ status: "SENT" }),
+      })
+    );
+  });
+
   it("answers a redelivered message only once even when its log row is missing", async () => {
     const claims = new Set<string>();
     mockPrisma.postbackDelivery.create.mockImplementation(
@@ -1896,6 +1949,87 @@ describe("DM Worker — follow-gate re-check", () => {
       expect.anything()
     );
     expect(mockSendDirectMessageWithButton).not.toHaveBeenCalled();
+  });
+
+  // A re-check job is queued by the pass before it, so its own timestamp is
+  // later than the tap. The tap opened Instagram's messaging window, and the
+  // work after a delivered link has to count from it.
+  describe("the time of the tap", () => {
+    const TAPPED_AT = Date.parse("2026-11-20T09:00:00.000Z");
+    const tap = {
+      instagramAccountId: "ig_456",
+      userId: "commenter_999",
+      payload: "followcheck:auto_789",
+    };
+
+    it("is carried from the tap through every re-check", async () => {
+      mockPrisma.automation.findFirst.mockResolvedValue(gated);
+      mockGetUserFollowStatus.mockResolvedValue(false);
+
+      await getProcessor()({
+        ...createMockPostbackJob(tap),
+        timestamp: TAPPED_AT,
+      });
+      expect(mockQueueAdd).toHaveBeenLastCalledWith(
+        "process-postback",
+        expect.objectContaining({ followRecheckAttempt: 1, tappedAt: TAPPED_AT }),
+        expect.anything()
+      );
+
+      await getProcessor()({
+        ...createMockPostbackJob(mockQueueAdd.mock.lastCall?.[1]),
+        timestamp: TAPPED_AT + 20_000,
+      });
+      expect(mockQueueAdd).toHaveBeenLastCalledWith(
+        "process-postback",
+        expect.objectContaining({ followRecheckAttempt: 2, tappedAt: TAPPED_AT }),
+        expect.anything()
+      );
+    });
+
+    it("is reported for a link a re-check delivers, not the re-check's own time", async () => {
+      mockPrisma.automation.findFirst.mockResolvedValue(gated);
+      mockGetUserFollowStatus.mockResolvedValue(true);
+
+      await getProcessor()({
+        ...createMockPostbackJob({
+          ...tap,
+          followRecheck: true,
+          followRecheckAttempt: 2,
+          tappedAt: TAPPED_AT,
+        }),
+        timestamp: TAPPED_AT + 60_000,
+      });
+
+      expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+      expect(afterLinkDelivered).toHaveBeenCalledTimes(1);
+      expect(afterLinkDelivered).toHaveBeenCalledWith(
+        expect.objectContaining({ via: "tap", interactionAt: TAPPED_AT })
+      );
+    });
+
+    it("is the job's own time for a tap and for a re-check queued without it", async () => {
+      mockPrisma.automation.findFirst.mockResolvedValue(gated);
+      mockGetUserFollowStatus.mockResolvedValue(true);
+
+      await getProcessor()({
+        ...createMockPostbackJob(tap),
+        timestamp: TAPPED_AT,
+      });
+      await getProcessor()({
+        ...createMockPostbackJob({
+          ...tap,
+          followRecheck: true,
+          followRecheckAttempt: 1,
+        }),
+        timestamp: TAPPED_AT + 20_000,
+      });
+
+      const reported = vi
+        .mocked(afterLinkDelivered)
+        .mock.calls.map(([delivery]) => delivery.interactionAt);
+      expect(reported).toEqual([TAPPED_AT, TAPPED_AT + 20_000]);
+    });
   });
 
   it("prompts a non-follower right away when the tap came from the opening DM", async () => {

@@ -50,6 +50,11 @@ import { OFFER_RULE_MESSAGE } from "../lib/campaigns/schema";
 // only 16 code points, so zod's own .max(20) would let it through.
 const LABEL_21_UNITS = "Ja, gerne! 🙌🙌🙌🙌🙌";
 const LABEL_20_UNITS = "Ja, gerne!! 🙌🙌🙌🙌";
+// The second follow request goes out as the text of a button message, which
+// Instagram cuts after 640 units. 641 units are 640 code points here, so
+// zod's own .max(640) would let this through.
+const TEXT_641_UNITS = `${"a".repeat(639)}🙌`;
+const TEXT_640_UNITS = `${"a".repeat(638)}🙌`;
 
 const newCampaign = {
   name: "Guide drop",
@@ -254,6 +259,49 @@ describe("POST /api/automations", () => {
 
     expect(response.status).toBe(201);
     expect(createData().openingDmButtonLabel).toBe(LABEL_20_UNITS);
+  });
+
+  it("rejects a second follow request of 641 UTF-16 units", async () => {
+    const response = await POST(
+      postRequest({
+        ...newCampaign,
+        requireFollow: true,
+        followPromptRetryMessage: TEXT_641_UNITS,
+      })
+    );
+
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.details.fieldErrors.followPromptRetryMessage).toEqual([
+      "At most 640 characters (emoji count as 2)",
+    ]);
+    expect(mockPrisma.automation.create).not.toHaveBeenCalled();
+  });
+
+  it("keeps a second follow request of exactly 640 UTF-16 units", async () => {
+    const response = await POST(
+      postRequest({
+        ...newCampaign,
+        requireFollow: true,
+        followPromptRetryMessage: TEXT_640_UNITS,
+      })
+    );
+
+    expect(response.status).toBe(201);
+    expect(createData().followPromptRetryMessage).toBe(TEXT_640_UNITS);
+  });
+
+  it("still takes 1000 characters for the first follow request", async () => {
+    const response = await POST(
+      postRequest({
+        ...newCampaign,
+        requireFollow: true,
+        followPromptMessage: "a".repeat(1000),
+      })
+    );
+
+    expect(response.status).toBe(201);
+    expect(createData().followPromptMessage).toHaveLength(1000);
   });
 
   it("ignores question comments by default, saves an empty tag as none and drops the second follow request without a follow gate", async () => {
@@ -466,6 +514,19 @@ describe("PATCH /api/automations", () => {
     );
 
     expect(response.status).toBe(400);
+    expect(mockPrisma.automation.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects a second follow request of 641 UTF-16 units", async () => {
+    const response = await PATCH(
+      patchRequest({ followPromptRetryMessage: TEXT_641_UNITS })
+    );
+
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.details.fieldErrors.followPromptRetryMessage).toEqual([
+      "At most 640 characters (emoji count as 2)",
+    ]);
     expect(mockPrisma.automation.update).not.toHaveBeenCalled();
   });
 

@@ -5,7 +5,11 @@
  */
 
 import { z } from "zod";
-import { BUTTON_LABEL_MAX, utf16Max } from "@/lib/validation/text";
+import {
+  BUTTON_LABEL_MAX,
+  BUTTON_TEXT_MAX,
+  utf16Max,
+} from "@/lib/validation/text";
 
 export const OFFER_RULE_MESSAGE =
   "Offers need the opening DM: Instagram only allows them after the person taps a button";
@@ -83,8 +87,9 @@ export const createAutomationSchema = z
     // ("Was ist ein Prompt?" is not a request). The column defaults to false
     // so campaigns created before the option behave as they did.
     ignoreQuestionComments: z.boolean().optional().default(true),
-    // The second follow request. Null or empty repeats the first one.
-    followPromptRetryMessage: z.string().max(1000).optional().nullable(),
+    // The second follow request. Null or empty repeats the first one. It is
+    // the text of a button message, which Instagram cuts after 640 units.
+    followPromptRetryMessage: utf16Max(BUTTON_TEXT_MAX).optional().nullable(),
     followPromptRetryButtonLabel: utf16Max(BUTTON_LABEL_MAX).optional().nullable(),
     // Tag for the contact once the link is delivered. Empty means none.
     deliveryTag: z.string().trim().max(100).optional().nullable(),
@@ -114,6 +119,9 @@ export const createAutomationSchema = z
     message: OFFER_RULE_MESSAGE,
     path: ["offersEnabled"],
   });
+
+/** A create body after validation, with every default filled in. */
+export type CreateAutomationInput = z.infer<typeof createAutomationSchema>;
 
 // No defaults here: the list and detail pages PATCH only { isActive }, and a
 // default would overwrite the stored value on every such toggle. Cross-field
@@ -159,7 +167,7 @@ export const updateAutomationSchema = z.object({
     .nullable(),
   secondaryButtonLabel: utf16Max(BUTTON_LABEL_MAX).optional().nullable(),
   ignoreQuestionComments: z.boolean().optional(),
-  followPromptRetryMessage: z.string().max(1000).optional().nullable(),
+  followPromptRetryMessage: utf16Max(BUTTON_TEXT_MAX).optional().nullable(),
   followPromptRetryButtonLabel: utf16Max(BUTTON_LABEL_MAX).optional().nullable(),
   deliveryTag: z.string().trim().max(100).optional().nullable(),
   offersEnabled: z.boolean().optional(),

@@ -54,6 +54,11 @@ export interface ProcessPostbackJob {
   // How many delayed re-checks have run, counting this one. Absent on jobs
   // queued before re-checks were counted, where `followRecheck` meant one.
   followRecheckAttempt?: number;
+  // On a re-check: when the tap it repeats happened (epoch ms). That tap
+  // opened Instagram's messaging window, while the re-check job itself was
+  // queued by the pass before it. Absent on taps and on re-checks queued
+  // before it was carried, which fall back to the job's own timestamp.
+  tappedAt?: number;
 }
 
 // Scheduled after the link is delivered, to send the appreciation follow-up.

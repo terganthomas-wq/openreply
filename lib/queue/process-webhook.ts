@@ -6,6 +6,13 @@ import { Prisma, type InstagramProvider } from '@/app/generated/prisma/client';
 const OPENING_DM_READ_FALLBACK_DELAY_MS = 5 * 60 * 1000;
 type InstagramPayload = Parameters<typeof parseCommentEvents>[0];
 
+// DmLog rows that stand for something other than a comment carry a prefix in
+// place of the comment id: "reveal:<user>" for a link a button tap delivered,
+// "dm:<mid>" for the answer to a DM keyword.
+function isCommentRow(commentId: string): boolean {
+  return !commentId.startsWith('reveal:') && !commentId.startsWith('dm:');
+}
+
 export async function processInstagramWebhook({ payload: incoming, provider, workspaceId }: {
   payload: InstagramPayload; provider: InstagramProvider; workspaceId?: string;
 }) {
@@ -179,6 +186,12 @@ export async function processInstagramWebhook({ payload: incoming, provider, wor
       const scheduledAutomationIds = new Set<string>();
       for (const log of openingLogs) {
         const automation = log.automation;
+        // Only a comment's row means an opening DM went out. A DM keyword is
+        // answered in the conversation the person started, with the link or
+        // with a follow prompt whose own button delivers it. There is no
+        // opening DM to fall back from, and a fallback would send the link a
+        // second time.
+        if (!isCommentRow(log.commentId)) continue;
         if (revealedAutomationIds.has(automation.id)) continue;
         if (scheduledAutomationIds.has(automation.id)) continue;
         scheduledAutomationIds.add(automation.id);

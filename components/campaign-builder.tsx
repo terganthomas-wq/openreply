@@ -24,7 +24,7 @@ import {
   IMPORT_ACCOUNT_KEY,
   type ImportRow,
 } from "@/lib/import-queue";
-import { BUTTON_LABEL_MAX } from "@/lib/validation/text";
+import { BUTTON_LABEL_MAX, BUTTON_TEXT_MAX } from "@/lib/validation/text";
 
 type TriggerScope = "specific" | "any" | "next";
 type MatchMode = "specific" | "any";
@@ -949,7 +949,9 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                 </p>
                 {/* The second request goes out once the automatic re-checks
                     still see no follow. The placeholders show what an empty
-                    field sends: the first request again. */}
+                    field sends: the first request again. Its text goes out
+                    with a button, so Instagram keeps 640 units of it, and the
+                    API takes no more. */}
                 <div className="space-y-2 border-t border-border pt-3">
                   <p className="text-sm text-foreground">
                     {t("If they still don't follow after tapping")}
@@ -963,7 +965,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                     }
                     rows={3}
                     className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none resize-none"
-                    maxLength={1000}
+                    maxLength={BUTTON_TEXT_MAX}
                   />
                   <ButtonLabelInput
                     value={followPromptRetryButtonLabel}

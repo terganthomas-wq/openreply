@@ -7,9 +7,11 @@ import {
 import { claimCommentDelivery, MAX_COMMENT_SEND_ATTEMPTS } from "./comment-delivery";
 import { afterLinkDelivered } from "./after-delivery";
 import {
+  claimPostbackDelivery,
   formatError,
   isTemplateRejection,
   logWorkerEvent,
+  sendClaimedPostback,
   sendPostbackOnce,
 } from "./send-helpers";
 import { isQuestionComment } from "@/lib/automation/question-filter";
@@ -226,6 +228,12 @@ async function sendRevealDirectMessage({
 
 function connectionScope(data: DmQueueJob) {
   return data.accountConnectionId ? { instagramAccountId: data.accountConnectionId } : {};
+}
+
+// When the tap behind a postback job happened (epoch ms). A follow re-check
+// carries the time of the tap it repeats; a tap is its own job's timestamp.
+function tapTime(job: Job<ProcessPostbackJob>): number {
+  return job.data.tappedAt ?? job.timestamp ?? Date.now();
 }
 
 async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
@@ -1045,6 +1053,9 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
               ...job.data,
               followRecheck: true,
               followRecheckAttempt: rechecksDone + 1,
+              // The tap's own time, kept through every pass: this job's
+              // timestamp will be the time of this pass, not of the tap.
+              tappedAt: tapTime(job),
             },
             {
               delay,
@@ -1247,7 +1258,8 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     commenterName,
     contactId: contact?.id ?? null,
     via: fallback ? "read-fallback" : "tap",
-    interactionAt: fallback ? null : job.timestamp ?? Date.now(),
+    // A link a re-check delivers counts from the tap, which opened the window.
+    interactionAt: fallback ? null : tapTime(job),
   });
 }
 
@@ -1510,9 +1522,33 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
       ]))
       .digest("hex");
 
+    // The claim stays outside the send's error handling, like the comment
+    // claim. A database error on it means nothing was sent: the reservation is
+    // released (the retry takes its own) and the error is rethrown as it is,
+    // so BullMQ retries the job. Read as a send error it would count as an
+    // unknown delivery and end the job for good, with the reply never sent.
+    let claimed: boolean;
+    try {
+      claimed = await claimPostbackDelivery(operationId);
+    } catch (error) {
+      await releaseWorkspaceDMReservation(
+        automation.workspaceId,
+        usage.periodStart
+      );
+      throw error;
+    }
+    if (!claimed) {
+      // An earlier run sent this reply, or may have: never send it again.
+      await releaseWorkspaceDMReservation(
+        automation.workspaceId,
+        usage.periodStart
+      );
+      continue;
+    }
+
     let linkSent = false;
     try {
-      const sent = await sendPostbackOnce({
+      await sendClaimedPostback({
         operationId,
         send: () =>
           sendFollowPrompt
@@ -1538,14 +1574,6 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
                 context: "message trigger",
               }),
       });
-      if (!sent) {
-        // An earlier run sent this reply, or may have: never send it again.
-        await releaseWorkspaceDMReservation(
-          automation.workspaceId,
-          usage.periodStart
-        );
-        continue;
-      }
       // The follow prompt carries no link, so nothing follows it yet: the tap
       // on its button delivers the link and schedules the follow-up.
       linkSent = !sendFollowPrompt;
