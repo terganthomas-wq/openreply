@@ -75,6 +75,10 @@ model Workspace {
   usagePeriodStart  DateTime @default(now())
   dmsSentThisPeriod Int      @default(0)
 
+  /// Editable default texts and toggles for new campaigns and offers.
+  /// Shape and validation: lib/campaigns/message-defaults.ts. Null until seeded.
+  messageDefaults   Json?
+
   zernioConnection  ZernioConnection?
   members           WorkspaceMember[]
   invitations       WorkspaceInvitation[]
@@ -86,6 +90,10 @@ model Workspace {
   webhookEvents     WebhookEvent[]
   operationalEvents OperationalEvent[]
   serviceKeys       ServiceKey[]
+  contacts          Contact[]
+  contactTags       ContactTag[]
+  offers            Offer[]
+  contactOffers     ContactOffer[]
 
   @@index([ownerId])
 }
@@ -164,6 +172,7 @@ model InstagramAccount {
   dmLogs      DmLog[]
   linkClicks  LinkClick[]
   followerSnapshots FollowerSnapshot[]
+  contacts    Contact[]
 
   @@index([workspaceId])
 }
@@ -225,6 +234,19 @@ model Automation {
   wholeWordMatch Boolean @default(true)
   reportShareSlug    String? @unique
   reportShareEnabled Boolean @default(true)
+  // Skip comments whose raw text contains ?, ？, ¿ or ؟ (R9a). Existing rows keep
+  // false; new campaigns get true from the API default and the editor.
+  ignoreQuestionComments       Boolean  @default(false)
+  // Second follow request, sent after the last automatic re-check (R9b).
+  // Null falls back to followPromptMessage / followPromptButtonLabel.
+  followPromptRetryMessage     String?
+  followPromptRetryButtonLabel String?
+  // Tag added to the contact when this campaign's link DM is delivered (R2).
+  deliveryTag                  String?
+  // Weg 2: start a lead-magnet offer after an interaction-backed delivery (R4).
+  offersEnabled                Boolean  @default(false)
+  // Custom offer order (Offer ids). Empty = workspace default order (R13).
+  offerIds                     String[] @default([])
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -234,6 +256,7 @@ model Automation {
   dmLogs           DmLog[]
   trackedLinks     TrackedLink[]
   linkClicks       LinkClick[]
+  contactOffers    ContactOffer[]
 
   @@index([workspaceId])
   @@index([instagramAccountId])
@@ -276,6 +299,7 @@ model DmLog {
   @@index([automationId])
   @@index([instagramAccountId])
   @@index([status])
+  @@index([commenterId])
 }
 
 // Legacy reconciliation model; currently unwired. Runtime code does not read
@@ -339,6 +363,128 @@ model LinkClick {
   @@index([trackedLinkId])
   @@index([createdAt])
   @@index([workspaceId, createdAt])
+  @@index([workspaceId, recipientHash])
+}
+
+/// One Instagram user as seen by one connected account (R1, R18).
+model Contact {
+  id                 String    @id @default(cuid())
+  workspaceId        String
+  /// InstagramAccount row id (as on DmLog), not the Instagram business id.
+  instagramAccountId String
+  /// Instagram-scoped user id; the comment author id equals the DM sender id.
+  igsid              String
+  username           String?
+  /// hashRecipientId(igsid), the ?r= token on tracked links (lib/tracking/server.ts:19-25).
+  /// Stored because the HMAC cannot be reversed; rewritten on every upsert.
+  recipientHash      String
+  /// Last button tap or inbound DM. Meta's 24 h window counts from here; comments never set it.
+  lastInteractionAt  DateTime?
+  createdAt          DateTime  @default(now())
+  /// Bumped by every upsert ("last seen").
+  updatedAt          DateTime  @updatedAt
+
+  workspace        Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  instagramAccount InstagramAccount @relation(fields: [instagramAccountId], references: [id], onDelete: Cascade)
+  tags             ContactTag[]
+  offers           ContactOffer[]
+
+  @@unique([instagramAccountId, igsid])
+  @@index([workspaceId, updatedAt])
+  @@index([workspaceId, recipientHash])
+}
+
+/// A free-text tag; createdAt is when it was first set (R2). Tag names are user content.
+model ContactTag {
+  id          String   @id @default(cuid())
+  workspaceId String
+  contactId   String
+  tag         String
+  createdAt   DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  contact   Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@unique([contactId, tag])
+  @@index([workspaceId, tag])
+}
+
+/// Workspace-level evergreen lead-magnet offer (R3, R13).
+model Offer {
+  id                        String    @id @default(cuid())
+  workspaceId               String
+  name                      String
+  /// false = paused: skipped when a new offer is chosen.
+  isActive                  Boolean   @default(true)
+  /// Workspace default order. Read with OFFER_ORDER (position, createdAt, id).
+  position                  Int       @default(0)
+  /// "Deleted" after it was offered: keeps funnel history and sent card links.
+  archivedAt                DateTime?
+  /// The last message carries the "Ja, gerne!" button (<= 640 UTF-16 units).
+  offerMessages             String[]  @default([])
+  /// Seconds to wait before each offer message; same length as offerMessages.
+  offerDelaysSeconds        Int[]     @default([])
+  offerButtonLabel          String
+  confirmationMessages      String[]  @default([])
+  confirmationDelaysSeconds Int[]     @default([])
+  cardImageUrl              String?
+  cardTitle                 String
+  cardSubtitle              String?
+  cardButtonLabel           String
+  /// Target of the card button and the reminder button, served by /o/<linkSlug>.
+  destinationUrl            String
+  /// Random public slug (generateTrackedLinkSlug), globally unique like TrackedLink.slug.
+  linkSlug                  String    @unique
+  reminderEnabled           Boolean   @default(true)
+  reminderDelayHours        Int       @default(23)
+  reminderMessage           String?
+  tagOffered                String
+  tagInterested             String
+  tagSent                   String
+  tagClicked                String
+  createdAt                 DateTime  @default(now())
+  updatedAt                 DateTime  @updatedAt
+
+  workspace     Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  contactOffers ContactOffer[]
+
+  @@index([workspaceId, position])
+}
+
+/// One offer to one contact: the "never twice" claim (R5), progress and funnel (R10).
+model ContactOffer {
+  id             String    @id @default(cuid())
+  workspaceId    String
+  contactId      String
+  offerId        String
+  /// Campaign whose link delivery started it; SetNull keeps history (R16).
+  automationId   String?
+  offeredAt      DateTime  @default(now())
+  /// The last offer message (with the button) went out; anchors the reminder.
+  pitchSentAt    DateTime?
+  interestedAt   DateTime?
+  /// mid of the tap that set interestedAt, to recognise a redelivered first tap.
+  interestedMid  String?
+  /// Card (or its fallback) or the reminder was delivered.
+  sentAt         DateTime?
+  /// CARD | BUTTON | TEXT | REMINDER
+  sentVia        String?
+  reminderSentAt DateTime?
+  clickedAt      DateTime?
+  /// Set when the sequence stopped early.
+  stoppedAt      DateTime?
+  /// WINDOW_CLOSED | REJECTED | RATE_LIMITED | PLAN_LIMIT | OFFER_ARCHIVED | ACCOUNT_UNAVAILABLE
+  stopReason     String?
+
+  workspace  Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  contact    Contact     @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  offer      Offer       @relation(fields: [offerId], references: [id], onDelete: Cascade)
+  automation Automation? @relation(fields: [automationId], references: [id], onDelete: SetNull)
+
+  @@unique([contactId, offerId])      // R5: never offer twice
+  @@unique([contactId, automationId]) // one start per contact and campaign (NULLs never collide)
+  @@index([workspaceId, offerId])     // funnel groupBy
+  @@index([automationId])             // SetNull on campaign delete
 }
 
 model WebhookEvent {
