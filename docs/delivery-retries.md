@@ -36,6 +36,23 @@ outside the send's error handling. When it fails, for example because Redis
 refuses the follow-up job, the failure is logged and the delivered DM stays
 SENT: it is never marked failed and never retried.
 
+A button tap takes its claim the same way, outside the send's error
+handling: a database error while taking it gives the usage reservation back
+and retries the job, instead of logging the tap FAILED and unconfirmed with
+the link never sent. When Instagram refuses a message and the database then
+fails to give its claim back, the refusal stays the outcome
+(`ClaimReleaseError` in `lib/queue/send-helpers.ts`) rather than being
+replaced by the database error. A campaign's tap or DM reply still records
+that case as unconfirmed, which never retries into the claim left behind;
+the offer engine records it as the refusal it is (below).
+
+A read fallback (the opening DM was read but its button not tapped) is
+skipped once the campaign answered the person: a tap that delivered the link,
+or a DM keyword that the campaign's DM trigger answered because the person
+typed the keyword instead of tapping. Both checks run when the job is queued
+and again when it runs, so a campaign with an opening DM and the DM trigger
+sends its link once.
+
 No campaign is paused by this policy. New comments continue through the normal
 flow. No schema migration is required.
 
@@ -79,6 +96,17 @@ completes, and follows one policy:
   refusal, an expired token included, with a WARNING (REJECTED). Both release
   the claim and the reservation and end the job without a retry, so an expected
   refusal never raises a worker alert.
+- A refusal whose claim the database fails to give back is still a refusal:
+  the reservation goes back, the offer stops for the refusal's reason, and a
+  WARNING ("Offer message claim not released after a refusal") names the
+  claim left behind. There is no retry, not even for a rate limit, because a
+  retry would find the claim and take the message for sent. If recording the
+  refusal fails as well, the job ends without a retry.
+- Once the link reached the person (the card, one of its fallbacks or the
+  reminder), a later failure does not mark the offer stopped: the card sent
+  again for a later tap, a confirmation or the card after the reminder. It is
+  logged as "Offer message not sent: …", and the funnel's "stopped" counts
+  only offers that ended before the person got the link.
 - The card's fallbacks (its text with the button, then plain text with the
   link) and the reminder's text fallback run inside the message's one claim,
   each only after a confirmed rejection of the previous form.
@@ -95,3 +123,20 @@ then the card, which replaces REMINDER with the form it went out in and keeps
 the time the link was first sent. Offer messages are never written to DmLog,
 and no offer job requires its campaign to be active: pausing a campaign does
 not cut off running offers.
+
+A click on the card's or the reminder's link sets the row's `clickedAt` and
+the offer's "clicked" tag in one transaction. Later clicks no longer find a
+clicked row, so a tag written after the time could be lost for good; now a
+failed write leaves neither, and the next click records both.
+
+Deleting an offer archives it when it was ever offered, so the card links
+already sent keep redirecting, and deletes it otherwise. Whether it was
+offered is read from `Offer.firstOfferedAt`, which the start sets before the
+offer's first `ContactOffer` row and which stays when the rows go: they are
+deleted with their contacts when an Instagram account is disconnected. Either
+way the offer's id leaves every campaign's own order. A campaign whose own
+order held only that offer gets its offers switched off (`offersEnabled`
+false): an empty order reads as the workspace's default order, and the
+campaign would start offers nobody picked for it. It keeps sending its link,
+and the DELETE response names it in `campaignsWithoutOffers`, so the Offers
+page can say which campaigns need new offers.

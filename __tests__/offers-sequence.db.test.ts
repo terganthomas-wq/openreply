@@ -346,20 +346,30 @@ describe.skipIf(!databaseUrl)("offer messages on a real Postgres", () => {
     expect(await tagsOf(igsid)).toEqual(["Guide Interesse", "Guide gesendet"]);
   });
 
-  it("lifts a stop for a later tap after the reminder, and the card goes out", async () => {
+  it("does not mark an offer the reminder delivered stopped when its card is refused, and a later tap gets the card", async () => {
     const igsid = "igsid_stopped_after_reminder";
     const id = await remindedPerson(igsid);
 
     await processOfferTap(tapJob(igsid, id, "mid_yes"));
-    // Instagram refuses the card: the offer stops.
+    // Instagram refuses the card. The reminder brought the link already, so
+    // the offer did not stop early: the funnel's "stopped" leaves it out.
     mockSendDirectMessageWithCard.mockRejectedValueOnce(
       new MetaApiError(551, undefined, undefined, "This person isn't available right now.")
     );
     await drain();
-    expect(await row(id)).toMatchObject({ stopReason: "REJECTED", sentVia: "REMINDER" });
+    expect(await row(id)).toMatchObject({
+      stoppedAt: null,
+      stopReason: null,
+      sentVia: "REMINDER",
+    });
+    expect(
+      await realDb.operationalEvent.count({
+        where: { workspaceId, message: "Offer message not sent: Instagram refused a message" },
+      })
+    ).toBe(1);
 
-    // The next tap opens a new window and lifts the stop; the confirmations
-    // went out before and are not sent again.
+    // The next tap opens a new window and queues the rest again; the
+    // confirmations went out before and are not sent again.
     await processOfferTap(tapJob(igsid, id, "mid_again"));
     await drain();
 

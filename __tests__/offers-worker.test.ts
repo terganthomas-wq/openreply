@@ -37,7 +37,7 @@ const {
       create: vi.fn(),
       updateMany: vi.fn(),
     },
-    offer: { findMany: vi.fn() },
+    offer: { findMany: vi.fn(), updateMany: vi.fn() },
     postbackDelivery: { create: vi.fn(), delete: vi.fn() },
     operationalEvent: { create: vi.fn() },
     zernioConnection: { findUnique: vi.fn() },
@@ -306,9 +306,10 @@ function tagWrite(tag: string) {
   };
 }
 
+// A stop never marks an offer whose link reached the person: sentAt null.
 function stopWrite(reason: string) {
   return {
-    where: { id: "co1", stoppedAt: null },
+    where: { id: "co1", stoppedAt: null, sentAt: null },
     data: { stoppedAt: new Date(NOW), stopReason: reason },
   };
 }
@@ -361,7 +362,12 @@ beforeEach(() => {
   mockPrisma.contactOffer.updateMany.mockReset().mockResolvedValue({ count: 1 });
   mockPrisma.offer.findMany
     .mockReset()
-    .mockResolvedValue([{ id: "offer_a" }, { id: "offer_b" }, { id: "offer_c" }]);
+    .mockResolvedValue([
+      { id: "offer_a", firstOfferedAt: null },
+      { id: "offer_b", firstOfferedAt: null },
+      { id: "offer_c", firstOfferedAt: null },
+    ]);
+  mockPrisma.offer.updateMany.mockReset().mockResolvedValue({ count: 1 });
   mockPrisma.postbackDelivery.create.mockReset().mockResolvedValue({});
   mockPrisma.postbackDelivery.delete.mockReset().mockResolvedValue({});
   mockPrisma.operationalEvent.create.mockReset().mockResolvedValue({});
@@ -414,7 +420,7 @@ describe("start", () => {
     expect(mockPrisma.offer.findMany).toHaveBeenCalledWith({
       where: { workspaceId: "workspace_123", isActive: true, archivedAt: null },
       orderBy: OFFER_ORDER,
-      select: { id: true },
+      select: { id: true, firstOfferedAt: true },
     });
     expect(mockPrisma.contactOffer.create).toHaveBeenCalledTimes(1);
     expect(mockPrisma.contactOffer.create).toHaveBeenCalledWith(
@@ -429,6 +435,32 @@ describe("start", () => {
         },
       })
     );
+  });
+
+  // The mark outlives the offer's rows, which go with their contacts when an
+  // account is disconnected: deleting the offer then still archives it.
+  it("marks an offer as offered before its first row is written", async () => {
+    await processOffer(startJob());
+
+    expect(mockPrisma.offer.updateMany).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.offer.updateMany).toHaveBeenCalledWith({
+      where: { id: "offer_a", workspaceId: "workspace_123", firstOfferedAt: null },
+      data: { firstOfferedAt: new Date(NOW) },
+    });
+    expect(mockPrisma.offer.updateMany.mock.invocationCallOrder[0]).toBeLessThan(
+      mockPrisma.contactOffer.create.mock.invocationCallOrder[0]
+    );
+  });
+
+  it("does not mark an offer that was offered before again", async () => {
+    mockPrisma.offer.findMany.mockResolvedValue([
+      { id: "offer_a", firstOfferedAt: new Date(NOW - HOUR) },
+    ]);
+
+    await processOffer(startJob());
+
+    expect(mockPrisma.contactOffer.create).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.offer.updateMany).not.toHaveBeenCalled();
   });
 
   it("writes the offered tag and queues the first message after its delay", async () => {
@@ -1078,6 +1110,88 @@ describe("offer messages", () => {
     );
   });
 
+  // Instagram refused the message, then the database failed while giving
+  // its claim back. Nothing went out, so it is a refusal all the same; but
+  // the claim is still taken, and a retry would take the message for sent.
+  describe("when a refused message's claim cannot be given back", () => {
+    const lost = () => new Error("Connection terminated unexpectedly");
+
+    beforeEach(() => {
+      mockPrisma.postbackDelivery.delete.mockRejectedValue(lost());
+      vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+
+    it("still stops the offer for the refusal and reports the claim on its own", async () => {
+      mockSendDirectMessage.mockRejectedValue(
+        new MetaApiError(100, undefined, undefined, "Invalid parameter")
+      );
+
+      await expect(step(0)).resolves.toBeUndefined();
+
+      expect(mockPrisma.postbackDelivery.delete).toHaveBeenCalledWith({
+        where: { id: claimId("offer", 0) },
+      });
+      expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledTimes(1);
+      expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledWith(stopWrite("REJECTED"));
+      expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+        event("WARNING", "Offer stopped: Instagram refused a message", {
+          reason: "REJECTED",
+          error: "MetaApiError 100: Invalid parameter",
+        })
+      );
+      expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+        event("WARNING", "Offer message claim not released after a refusal", {
+          phase: "offer",
+          step: 0,
+          claim: claimId("offer", 0),
+          error: "Connection terminated unexpectedly",
+        })
+      );
+      // Nothing was delivered: the monthly slot goes back.
+      expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledTimes(1);
+      expect(mockQueueAdd).not.toHaveBeenCalled();
+    });
+
+    it("stops a rate limit at once instead of retrying it into a claimed message", async () => {
+      mockSendDirectMessage.mockRejectedValue(new RateLimitError("Too many messages"));
+
+      await expect(step(0)).resolves.toBeUndefined();
+
+      expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledWith(stopWrite("RATE_LIMITED"));
+      expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledTimes(1);
+      expect(mockQueueAdd).not.toHaveBeenCalled();
+    });
+
+    it("stops quietly for a closed window", async () => {
+      mockSendDirectMessage.mockRejectedValue(
+        new MetaApiError(10, 2018278, undefined, "(#10) This message is sent outside of allowed window.")
+      );
+
+      await expect(step(0)).resolves.toBeUndefined();
+
+      expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledWith(stopWrite("WINDOW_CLOSED"));
+      expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+        event("INFO", "Offer stopped: messaging window closed", { reason: "WINDOW_CLOSED" })
+      );
+    });
+
+    it("ends the job for good when the refusal cannot be recorded either", async () => {
+      mockSendDirectMessage.mockRejectedValue(
+        new MetaApiError(100, undefined, undefined, "Invalid parameter")
+      );
+      mockPrisma.contactOffer.updateMany.mockRejectedValue(lost());
+
+      // Not retried: the retry would find the claim and carry on as if the
+      // message had gone out.
+      await expect(step(0)).rejects.toMatchObject({
+        name: "UnrecoverableError",
+        message: expect.stringContaining("Connection terminated unexpectedly"),
+      });
+
+      expect(mockQueueAdd).not.toHaveBeenCalled();
+    });
+  });
+
   it("stops with PLAN_LIMIT and sends nothing without a monthly slot", async () => {
     mockReserveWorkspaceDMSend.mockResolvedValue({
       allowed: false,
@@ -1380,6 +1494,54 @@ describe("the tap on the button", () => {
     expect(mockQueueAdd).not.toHaveBeenCalled();
   });
 
+  // The person has the card. Whatever fails after that does not make it an
+  // offer that stopped early, which is what the funnel's "stopped" counts.
+  it.each([
+    {
+      label: "Instagram refuses it",
+      error: () =>
+        new MetaApiError(551, undefined, undefined, "This person isn't available right now."),
+      level: "WARNING",
+      message: "Offer message not sent: Instagram refused a message",
+      reason: "REJECTED",
+    },
+    {
+      label: "the window closed again",
+      error: () =>
+        new MetaApiError(10, undefined, undefined, "This message is sent outside of allowed window."),
+      level: "INFO",
+      message: "Offer message not sent: messaging window closed",
+      reason: "WINDOW_CLOSED",
+    },
+  ])(
+    "does not mark a delivered offer stopped when the card for a later tap fails because $label",
+    async ({ error, level, message, reason }) => {
+      mockPrisma.contactOffer.findUnique.mockResolvedValue(
+        pitched({
+          interestedAt: new Date(NOW - 2 * HOUR),
+          interestedMid: "mid_yes",
+          sentAt: new Date(NOW - 2 * HOUR),
+          sentVia: "CARD",
+        })
+      );
+      mockPrisma.contactOffer.updateMany.mockResolvedValue({ count: 0 });
+      mockSendDirectMessageWithCard.mockRejectedValue(error());
+
+      await expect(processOfferTap(tapJob({ mid: "mid_later" }))).resolves.toBeUndefined();
+
+      expect(mockSendDirectMessageWithCard).toHaveBeenCalledTimes(1);
+      expect(mockPrisma.contactOffer.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ stopReason: expect.anything() }),
+        })
+      );
+      expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+        event(level, message, { reason, phase: "retap", step: "mid_later" })
+      );
+      expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledTimes(1);
+    }
+  );
+
   it("only writes an INFO event for a tap on a deleted offer", async () => {
     mockPrisma.contactOffer.findUnique.mockResolvedValue(
       pitched({}, { archivedAt: new Date(NOW - HOUR) })
@@ -1549,6 +1711,95 @@ describe("confirmations and card", () => {
     expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledWith(stopWrite("WINDOW_CLOSED"));
     expect(mockPrisma.contactTag.createMany).not.toHaveBeenCalled();
   });
+
+  // The refused card's claim stays taken. A retry would find it, record the
+  // card as sent and tag the person, so the refusal ends the card here.
+  it("records nothing as sent for a refused card whose claim cannot be given back", async () => {
+    mockSendDirectMessageWithCard.mockRejectedValue(
+      new MetaApiError(10, undefined, undefined, "This message is sent outside of allowed window.")
+    );
+    mockPrisma.postbackDelivery.delete.mockRejectedValue(
+      new Error("Connection terminated unexpectedly")
+    );
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(
+      processOffer(offerJob({ phase: "card", contactOfferId: "co1" }))
+    ).resolves.toBeUndefined();
+
+    expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledWith(stopWrite("WINDOW_CLOSED"));
+    expect(mockPrisma.contactTag.createMany).not.toHaveBeenCalled();
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+      event("WARNING", "Offer message claim not released after a refusal", {
+        phase: "card",
+        claim: claimId("card", 0),
+      })
+    );
+  });
+
+  // The reminder brought the link: the person got the offer. A confirmation
+  // or the card failing after their tap does not make it one that stopped
+  // early, which is what the funnel's "stopped" counts.
+  it.each([
+    {
+      label: "the card is refused",
+      phase: "card" as const,
+      contact: { lastInteractionAt: new Date(NOW - 5000) },
+      refuse: () =>
+        mockSendDirectMessageWithCard.mockRejectedValue(
+          new MetaApiError(10, undefined, undefined, "This message is sent outside of allowed window.")
+        ),
+      expectedSends: 1,
+    },
+    {
+      label: "a confirmation is refused",
+      phase: "confirm" as const,
+      contact: { lastInteractionAt: new Date(NOW - 5000) },
+      refuse: () =>
+        mockSendDirectMessage.mockRejectedValue(
+          new MetaApiError(10, undefined, undefined, "This message is sent outside of allowed window.")
+        ),
+      expectedSends: 1,
+    },
+    {
+      label: "the window closed before the card",
+      phase: "card" as const,
+      contact: { lastInteractionAt: new Date(NOW - 24 * HOUR) },
+      refuse: () => {},
+      expectedSends: 0,
+    },
+  ])(
+    "does not mark an offer the reminder delivered stopped when $label",
+    async ({ phase, contact, refuse, expectedSends }) => {
+      mockPrisma.contactOffer.findFirst.mockResolvedValue(
+        contactOffer(
+          {
+            ...REMINDED,
+            interestedAt: new Date(NOW - 5000),
+            interestedMid: "mid_yes",
+          },
+          {},
+          contact
+        )
+      );
+      refuse();
+
+      await expect(
+        processOffer(offerJob({ phase, contactOfferId: "co1", step: 0 }))
+      ).resolves.toBeUndefined();
+
+      expect(sends()).toBe(expectedSends);
+      expect(mockPrisma.contactOffer.updateMany).not.toHaveBeenCalled();
+      expect(mockPrisma.contactTag.createMany).not.toHaveBeenCalled();
+      expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+        event("INFO", "Offer message not sent: messaging window closed", {
+          reason: "WINDOW_CLOSED",
+        })
+      );
+      expect(mockQueueAdd).not.toHaveBeenCalled();
+    }
+  );
 });
 
 describe("the reminder", () => {

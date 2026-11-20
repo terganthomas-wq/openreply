@@ -174,13 +174,19 @@ export async function processInstagramWebhook({ payload: incoming, provider, wor
       });
 
       // A tap that delivered the link leaves a SENT "reveal:<user>" row, and
-      // the fallback job returns as soon as it reads that row. Every later
-      // message this person reads sends another receipt, so skip those
-      // campaigns here rather than queue jobs that only wake the database to
-      // do nothing. The rows come with the query above; no extra query.
+      // the fallback job returns as soon as it reads that row. So does a DM
+      // keyword the campaign answered ("dm:<mid>"): the person typed the
+      // keyword instead of tapping. Every later message this person reads
+      // sends another receipt, so skip those campaigns here rather than queue
+      // jobs that only wake the database to do nothing. The rows come with
+      // the query above; no extra query.
       const revealedAutomationIds = new Set(
         openingLogs
-          .filter((log) => log.commentId === `reveal:${event.userId}`)
+          .filter(
+            (log) =>
+              log.commentId === `reveal:${event.userId}` ||
+              log.commentId.startsWith('dm:')
+          )
           .map((log) => log.automation.id)
       );
       const scheduledAutomationIds = new Set<string>();

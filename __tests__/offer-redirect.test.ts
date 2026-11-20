@@ -16,6 +16,7 @@ const { mockPrisma, afterCallbacks } = vi.hoisted(() => ({
     linkClick: {
       create: vi.fn(),
     },
+    $transaction: vi.fn(),
   },
   afterCallbacks: [] as (() => unknown)[],
 }));
@@ -76,6 +77,10 @@ beforeEach(() => {
   ]);
   mockPrisma.contactOffer.updateMany.mockResolvedValue({ count: 1 });
   mockPrisma.contactTag.createMany.mockResolvedValue({ count: 1 });
+  // An interactive transaction, run on the same mocks.
+  mockPrisma.$transaction.mockImplementation(
+    async (run: (tx: typeof mockPrisma) => unknown) => run(mockPrisma)
+  );
 });
 
 afterEach(() => {
@@ -149,6 +154,53 @@ describe("offer redirect /o/<slug>", () => {
     });
     // Campaign click rates count campaign links only.
     expect(mockPrisma.linkClick.create).not.toHaveBeenCalled();
+  });
+
+  // Once clickedAt is set, later clicks no longer find the row: a tag that
+  // failed after it would never be written. So both go in one transaction,
+  // and a failed tag write takes clickedAt back with it.
+  it("writes clickedAt and the clicked tag in one transaction", async () => {
+    const steps: string[] = [];
+    const tx = {
+      contactOffer: {
+        updateMany: vi.fn(async () => {
+          steps.push("clickedAt");
+          return { count: 1 };
+        }),
+      },
+      contactTag: {
+        createMany: vi.fn(async () => {
+          steps.push("tag");
+          return { count: 1 };
+        }),
+      },
+    };
+    mockPrisma.$transaction.mockImplementation(
+      async (run: (client: typeof tx) => unknown) => {
+        steps.push("begin");
+        const result = await run(tx);
+        steps.push("commit");
+        return result;
+      }
+    );
+
+    await open();
+    await runAfterCallbacks();
+
+    expect(steps).toEqual(["begin", "clickedAt", "tag", "commit"]);
+    expect(tx.contactOffer.updateMany).toHaveBeenCalledWith({
+      where: { id: "contact_offer_1", workspaceId: "workspace_123", clickedAt: null },
+      data: { clickedAt: expect.any(Date) },
+    });
+    expect(tx.contactTag.createMany).toHaveBeenCalledWith({
+      data: [
+        { workspaceId: "workspace_123", contactId: "contact_1", tag: "Guide geklickt" },
+      ],
+      skipDuplicates: true,
+    });
+    // Nothing outside the transaction.
+    expect(mockPrisma.contactOffer.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.contactTag.createMany).not.toHaveBeenCalled();
   });
 
   it("adds no tag when a click at the same moment already set clickedAt", async () => {

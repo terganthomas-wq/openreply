@@ -12,9 +12,13 @@
  * refreshes what is already there.
  */
 
+import type { Prisma } from "@/app/generated/prisma/client";
 import { prisma } from "@/lib/db/client";
 import { formatError, isUniqueViolation } from "@/lib/queue/send-helpers";
 import { hashRecipientId } from "@/lib/tracking/server";
+
+/** The client a tag is written with: the app's, or an open transaction. */
+export type TagWriter = Pick<Prisma.TransactionClient, "contactTag">;
 
 export interface ContactIdentity {
   workspaceId: string;
@@ -136,19 +140,21 @@ export async function touchContactInteraction(
 /**
  * Tag a contact. A tag it already has keeps the time it was first set, so a
  * repeated delivery or a retried job changes nothing. Returns how many of the
- * tags were new.
+ * tags were new. Pass a transaction as `db` to write the tags together with
+ * what they record.
  */
 export async function addContactTags(
   workspaceId: string,
   contactId: string,
   tags: readonly string[],
+  db: TagWriter = prisma,
 ): Promise<number> {
   const unique = [
     ...new Set(tags.map((tag) => tag.trim()).filter(Boolean)),
   ].slice(0, MAX_TAGS_PER_CALL);
   if (unique.length === 0) return 0;
 
-  const { count } = await prisma.contactTag.createMany({
+  const { count } = await db.contactTag.createMany({
     data: unique.map((tag) => ({ workspaceId, contactId, tag })),
     skipDuplicates: true,
   });

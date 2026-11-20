@@ -420,6 +420,10 @@ model Offer {
   position                  Int       @default(0)
   /// "Deleted" after it was offered: keeps funnel history and sent card links.
   archivedAt                DateTime?
+  /// When it was first started for someone. Kept when the ContactOffer rows go
+  /// (disconnecting an account deletes its contacts' offers), so deleting an offer
+  /// whose card links may be in someone's inbox archives it instead.
+  firstOfferedAt            DateTime?
   /// The last message carries the "Ja, gerne!" button (<= 640 UTF-16 units).
   offerMessages             String[]  @default([])
   /// Seconds to wait before each offer message; same length as offerMessages.

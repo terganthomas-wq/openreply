@@ -22,7 +22,7 @@
  */
 
 import { createHash } from "node:crypto";
-import type { Job } from "bullmq";
+import { UnrecoverableError, type Job } from "bullmq";
 import type {
   OperationalEventLevel,
   Prisma,
@@ -55,6 +55,7 @@ import {
 import type { ProcessOfferJob, ProcessPostbackJob } from "@/lib/queue/client";
 import {
   claimPostbackDelivery,
+  ClaimReleaseError,
   formatError,
   isTemplateRejection,
   isUniqueViolation,
@@ -296,7 +297,7 @@ async function claimNextOffer({
   const active = await prisma.offer.findMany({
     where: { workspaceId, isActive: true, archivedAt: null },
     orderBy: OFFER_ORDER,
-    select: { id: true },
+    select: { id: true, firstOfferedAt: true },
   });
   const had = await prisma.contactOffer.findMany({
     where: { contactId },
@@ -304,8 +305,20 @@ async function claimNextOffer({
   });
   const taken = new Set(had.map((row) => row.offerId));
 
-  for (const { id: offerId } of resolveOfferOrder(automation.offerIds, active)) {
+  for (const offer of resolveOfferOrder(automation.offerIds, active)) {
+    const offerId = offer.id;
     if (taken.has(offerId)) continue;
+    // The offer is marked as offered before its first row is written, and
+    // the mark outlives the rows: disconnecting an account deletes its
+    // contacts' offers. Deleting the offer then still archives it, as its
+    // card links may be in someone's inbox. A mark for a row that is not
+    // written after all only archives an offer that could have gone.
+    if (!offer.firstOfferedAt) {
+      await prisma.offer.updateMany({
+        where: { id: offerId, workspaceId, firstOfferedAt: null },
+        data: { firstOfferedAt: new Date() },
+      });
+    }
     try {
       return await prisma.contactOffer.create({
         data: {
@@ -614,12 +627,7 @@ async function sendReminder(
     return;
   }
   if (!withinWindow(contact.lastInteractionAt)) {
-    return stopOffer(
-      co,
-      "WINDOW_CLOSED",
-      "INFO",
-      "Offer reminder skipped: messaging window closed"
-    );
+    return stopOffer(co, "WINDOW_CLOSED", {}, "Offer reminder skipped");
   }
 
   // Not renderMessageWithTracking, which only adds a link where the text has
@@ -676,6 +684,8 @@ async function sendReminder(
  * - A rate limit is retried by BullMQ (after 5 and 15 minutes, still inside
  *   the window) and stops the offer on the last attempt.
  * - A closed window or any other refusal stops the offer and is recorded.
+ * - A refusal stays a refusal when its claim cannot be given back; the claim
+ *   left taken is reported on its own (refusedWithClaimKept).
  *
  * Only rate limits and database errors leave the job failed, so an expected
  * refusal never raises a worker alert.
@@ -706,11 +716,7 @@ async function sendOfferMessage(
 
   const usage = await reserveWorkspaceDMSend(co.workspaceId);
   if (!usage.allowed) {
-    await stopOffer(co, "PLAN_LIMIT", "WARNING", "Offer stopped: monthly DM limit reached", {
-      phase,
-      step,
-      limit: usage.limit,
-    });
+    await stopOffer(co, "PLAN_LIMIT", { phase, step, limit: usage.limit });
     return "stopped";
   }
   const release = () =>
@@ -741,6 +747,9 @@ async function sendOfferMessage(
     await sendClaimedPostback({ operationId, send: () => send(context) });
     return "sent";
   } catch (error) {
+    if (error instanceof ClaimReleaseError) {
+      return refusedWithClaimKept(co, phase, step, operationId, error, release);
+    }
     if (isDeliveryUnconfirmed(error)) {
       await logWorkerEvent({
         workspaceId: co.workspaceId,
@@ -750,82 +759,146 @@ async function sendOfferMessage(
       });
       return "sent";
     }
-    // Every send error arrives as a refusal or an unknown outcome. Anything
-    // else is the database failing to release the claim of a refused
-    // message: retried like any database error.
+    // Every send error arrives as a refusal or an unknown outcome; anything
+    // else is a failure of this worker, retried like a database error.
     if (!isConfirmedSendRejection(error)) throw error;
     await release();
 
-    if (error instanceof RateLimitError) {
-      if (job.attemptsMade + 1 < (job.opts?.attempts ?? 3)) throw error;
-      await stopOffer(co, "RATE_LIMITED", "WARNING", "Offer stopped: Instagram rate limit reached", {
-        phase,
-        step,
-        error: formatError(error),
-      });
-      return "stopped";
-    }
     if (
-      error instanceof MetaApiError &&
-      /outside of allowed window/i.test(error.message)
+      error instanceof RateLimitError &&
+      job.attemptsMade + 1 < (job.opts?.attempts ?? 3)
     ) {
-      await stopOffer(co, "WINDOW_CLOSED", "INFO", "Offer stopped: messaging window closed", {
-        phase,
-        step,
-      });
-      return "stopped";
+      throw error;
     }
-    await stopOffer(co, "REJECTED", "WARNING", "Offer stopped: Instagram refused a message", {
-      phase,
-      step,
-      error: formatError(error),
-    });
+    await stopRefused(co, phase, step, error);
     return "stopped";
   }
 }
 
 /**
+ * Instagram refused the message, and the database failed while giving its
+ * claim back. Nothing was delivered, so this is a refusal like any other:
+ * the reservation goes back and the offer stops for the refusal's reason.
+ * The claim stays taken, though, and a retry of this job would take the
+ * message for sent and carry on as if it had gone out. So there is no retry,
+ * not even for a rate limit, and the claim left behind is reported on its
+ * own. Should recording the refusal fail as well, the job ends for good
+ * rather than being retried into that mistake.
+ */
+async function refusedWithClaimKept(
+  co: LoadedContactOffer,
+  phase: SendPhase,
+  step: number | string,
+  operationId: string,
+  error: ClaimReleaseError,
+  release: () => Promise<unknown>
+): Promise<"stopped"> {
+  console.error(
+    "[Offers] Claim of a refused message not released:",
+    formatError(error.releaseError)
+  );
+  await logWorkerEvent({
+    workspaceId: co.workspaceId,
+    level: "WARNING",
+    message: "Offer message claim not released after a refusal",
+    payload: eventPayload(co, {
+      phase,
+      step,
+      claim: operationId,
+      error: formatError(error.releaseError),
+    }),
+  });
+  try {
+    await release();
+    await stopRefused(co, phase, step, error.refusal);
+  } catch (writeError) {
+    throw new UnrecoverableError(
+      `Offer message refused, its claim kept and the refusal not recorded: ${formatError(writeError)}`
+    );
+  }
+  return "stopped";
+}
+
+/** Stop the offer for a confirmed rejection of one of its messages. */
+function stopRefused(
+  co: LoadedContactOffer,
+  phase: SendPhase,
+  step: number | string,
+  error: unknown
+): Promise<void> {
+  if (error instanceof RateLimitError) {
+    return stopOffer(co, "RATE_LIMITED", { phase, step, error: formatError(error) });
+  }
+  if (
+    error instanceof MetaApiError &&
+    /outside of allowed window/i.test(error.message)
+  ) {
+    return stopOffer(co, "WINDOW_CLOSED", { phase, step });
+  }
+  return stopOffer(co, "REJECTED", { phase, step, error: formatError(error) });
+}
+
+// How each stop is reported in Diagnostics: a closed window and a deleted
+// offer are expected, anything else needs a look.
+const STOPS: Record<StopReason, { level: OperationalEventLevel; why: string }> = {
+  WINDOW_CLOSED: { level: "INFO", why: "messaging window closed" },
+  OFFER_ARCHIVED: { level: "INFO", why: "offer was deleted" },
+  REJECTED: { level: "WARNING", why: "Instagram refused a message" },
+  RATE_LIMITED: { level: "WARNING", why: "Instagram rate limit reached" },
+  PLAN_LIMIT: { level: "WARNING", why: "monthly DM limit reached" },
+  ACCOUNT_UNAVAILABLE: {
+    level: "WARNING",
+    why: "the Instagram account is unavailable",
+  },
+};
+
+/**
  * End the offer early and say why in Diagnostics. The first stop's reason
  * is kept.
+ *
+ * An offer whose link reached the person (the card, one of its fallbacks or
+ * the reminder: sentAt) did not stop early, whatever fails after that: the
+ * card sent again for a later tap, or a confirmation or the card after the
+ * reminder. Such a failure is still reported, as a message not sent, but
+ * the row is not marked, so the funnel's "stopped" only counts offers that
+ * ended before the person got the link.
  */
 async function stopOffer(
   co: LoadedContactOffer,
   reason: StopReason,
-  level: OperationalEventLevel,
-  message: string,
-  details: Record<string, Prisma.InputJsonValue | null> = {}
+  details: Record<string, Prisma.InputJsonValue | null> = {},
+  headline = "Offer stopped"
 ): Promise<void> {
-  await prisma.contactOffer.updateMany({
-    where: { id: co.id, stoppedAt: null },
-    data: { stoppedAt: new Date(), stopReason: reason },
-  });
+  const { level, why } = STOPS[reason];
+  const delivered = co.sentAt !== null;
+  if (!delivered) {
+    await prisma.contactOffer.updateMany({
+      // sentAt as well: a delivery recorded since this job read the row.
+      where: { id: co.id, stoppedAt: null, sentAt: null },
+      data: { stoppedAt: new Date(), stopReason: reason },
+    });
+  }
   await logWorkerEvent({
     workspaceId: co.workspaceId,
     level,
-    message,
+    message: `${delivered ? "Offer message not sent" : headline}: ${why}`,
     payload: eventPayload(co, { reason, ...details }),
   });
 }
 
 function stopArchived(co: LoadedContactOffer): Promise<void> {
-  return stopOffer(co, "OFFER_ARCHIVED", "INFO", "Offer stopped: offer was deleted");
+  return stopOffer(co, "OFFER_ARCHIVED");
 }
 
 function stopWindowClosed(co: LoadedContactOffer): Promise<void> {
-  return stopOffer(co, "WINDOW_CLOSED", "INFO", "Offer stopped: messaging window closed");
+  return stopOffer(co, "WINDOW_CLOSED");
 }
 
 function stopAccountUnavailable(
   co: LoadedContactOffer,
   error?: string
 ): Promise<void> {
-  return stopOffer(
-    co,
-    "ACCOUNT_UNAVAILABLE",
-    "WARNING",
-    "Offer stopped: the Instagram account is unavailable",
-    error ? { error } : {}
-  );
+  return stopOffer(co, "ACCOUNT_UNAVAILABLE", error ? { error } : {});
 }
 
 function eventPayload(

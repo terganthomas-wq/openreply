@@ -313,6 +313,48 @@ describe.skipIf(!databaseUrl)("offer starts on a real Postgres", () => {
     expect(queuedFirstMessages()).toHaveLength(1);
   });
 
+  // Deleting an offer archives it once it was ever offered, so the card
+  // links in people's inboxes keep working. The rows cannot tell: they go
+  // with their contacts when an account is disconnected. The mark stays.
+  it("marks an offer as offered at its first start, once, and keeps the mark when its rows go", async () => {
+    await createOffer("offer_marked", 9);
+    await realDb.automation.create({
+      data: {
+        id: "campaign_marked",
+        workspaceId,
+        instagramAccountId: "account",
+        name: "campaign_marked",
+        keywords: ["GUIDE"],
+        dmMessage: "Your link",
+        offersEnabled: true,
+        offerIds: ["offer_marked"],
+      },
+    });
+    const markOf = async () =>
+      (await realDb.offer.findUniqueOrThrow({ where: { id: "offer_marked" } }))
+        .firstOfferedAt;
+    expect(await markOf()).toBeNull();
+
+    const before = Date.now();
+    await processOffer(startJob("campaign_marked", "igsid_marked_1", "tap:mid_1"));
+    const marked = await markOf();
+    expect(marked).toBeInstanceOf(Date);
+    expect(marked!.getTime()).toBeGreaterThanOrEqual(before - 1000);
+    expect(queuedFirstMessages()).toHaveLength(1);
+
+    // A later start for someone else keeps the first time.
+    await processOffer(startJob("campaign_marked", "igsid_marked_2", "tap:mid_2"));
+    expect(queuedFirstMessages()).toHaveLength(2);
+    expect(await markOf()).toEqual(marked);
+
+    // As when the account is disconnected: the contacts go, their offers too.
+    await realDb.contact.deleteMany({
+      where: { igsid: { in: ["igsid_marked_1", "igsid_marked_2"] } },
+    });
+    expect(await realDb.contactOffer.count({ where: { offerId: "offer_marked" } })).toBe(0);
+    expect(await markOf()).toEqual(marked);
+  });
+
   it("starts nothing and records why when the messaging window has closed", async () => {
     const igsid = "igsid_closed";
     const job = startJob("campaign", igsid, "tap:mid_old");

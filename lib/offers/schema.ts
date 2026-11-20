@@ -71,10 +71,14 @@ export const offerFieldsSchema = z.object({
     .max(OFFER_MESSAGES_MAX)
     .default([]),
   confirmationDelaysSeconds: delays.default([]),
-  // Meta downloads the image itself, over https only.
+  // Meta downloads the image itself, over https only. Empty or left out means
+  // none, like the optional texts: an image field the editor leaves blank
+  // sends "".
   cardImageUrl: z
-    .url({ protocol: /^https$/ })
-    .max(URL_MAX)
+    .string()
+    .trim()
+    .transform((value) => value || null)
+    .pipe(z.url({ protocol: /^https$/ }).max(URL_MAX).nullable())
     .nullable()
     .default(null),
   cardTitle: cutLine(CARD_TEXT_MAX),

@@ -186,6 +186,26 @@ describe("read receipts", () => {
     expect(queueAdd).not.toHaveBeenCalled();
   });
 
+  // The reader answered the opening DM by typing the keyword, and the
+  // campaign's DM trigger answered that: the fallback job would only return.
+  it("queues no read fallback for a campaign whose DM trigger already answered the reader", async () => {
+    mockPrisma.dmLog.findMany.mockResolvedValue([
+      { commentId: "comment_1", automation: { id: "campaign_1" } },
+      { commentId: "dm:mid_typed", automation: { id: "campaign_1" } },
+      { commentId: "comment_2", automation: { id: "campaign_2" } },
+    ]);
+
+    await processInstagramWebhook({ payload: readReceipt, provider: "META" });
+
+    expect(queueAdd).toHaveBeenCalledTimes(1);
+    expect(queueAdd).toHaveBeenCalledWith(
+      "process-postback",
+      expect.objectContaining({ payload: "reveal:campaign_2", fallback: true }),
+      expect.anything()
+    );
+    expect(mockPrisma.dmLog.findMany).toHaveBeenCalledTimes(1);
+  });
+
   it("queues a read fallback only for the campaign whose opening DM went out", async () => {
     mockPrisma.dmLog.findMany.mockResolvedValue([
       { commentId: "dm:mid_1", automation: { id: "campaign_1" } },

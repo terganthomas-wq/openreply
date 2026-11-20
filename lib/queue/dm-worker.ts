@@ -961,6 +961,23 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
       existingReveal?.dmDeliveryUnconfirmed
     )
       return;
+
+    // The person may have answered the opening DM by typing the keyword
+    // instead of tapping. With the DM trigger on, this campaign answered
+    // that DM itself, logged as "dm:<mid>": with the link, or with a follow
+    // prompt whose button brings it. Either way the conversation holds the
+    // campaign's next step already, and a fallback would send the link a
+    // second time.
+    const answeredByDm = await prisma.dmLog.findFirst({
+      where: {
+        automationId: automation.id,
+        commenterId: userId,
+        commentId: { startsWith: "dm:" },
+        OR: [{ status: "SENT" }, { dmDeliveryUnconfirmed: true }],
+      },
+      select: { id: true },
+    });
+    if (answeredByDm) return;
   }
 
   let accessToken: InstagramContext;
@@ -1174,8 +1191,33 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     return;
   }
 
+  // The claim stays outside the send's error handling, as for a DM keyword
+  // reply. A database error on it means nothing was sent: the reservation is
+  // released (the retry takes its own) and the error is rethrown as it is,
+  // so BullMQ retries the job. Read as a send error it would count as an
+  // unknown delivery: the tap would be logged FAILED and unconfirmed and the
+  // job ended for good, with the link never sent.
+  let claimed: boolean;
   try {
-    const delivered = await sendPostbackOnce({
+    claimed = await claimPostbackDelivery(operationId);
+  } catch (error) {
+    await releaseWorkspaceDMReservation(
+      automation.workspaceId,
+      usage.periodStart,
+    );
+    throw error;
+  }
+  if (!claimed) {
+    // An earlier run sent this link, or may have: never send it again.
+    await releaseWorkspaceDMReservation(
+      automation.workspaceId,
+      usage.periodStart,
+    );
+    return;
+  }
+
+  try {
+    await sendClaimedPostback({
       operationId,
       send: () =>
         sendRevealDirectMessage({
@@ -1186,13 +1228,6 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
           context: "postback",
         }),
     });
-    if (!delivered) {
-      await releaseWorkspaceDMReservation(
-        automation.workspaceId,
-        usage.periodStart,
-      );
-      return;
-    }
     await prisma.dmLog.upsert({
       where: {
         automationId_commentId: {

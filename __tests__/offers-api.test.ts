@@ -16,6 +16,9 @@ const { mockPrisma, mockWorkspaceId, mockContext } = vi.hoisted(() => {
       groupBy: vi.fn(),
       count: vi.fn(),
     },
+    automation: {
+      updateManyAndReturn: vi.fn(),
+    },
     $transaction: vi.fn(),
     $executeRaw: vi.fn(),
   };
@@ -126,8 +129,22 @@ function expectNoWrites() {
   expect(mockPrisma.offer.update).not.toHaveBeenCalled();
   expect(mockPrisma.offer.updateMany).not.toHaveBeenCalled();
   expect(mockPrisma.offer.delete).not.toHaveBeenCalled();
+  expect(mockPrisma.automation.updateManyAndReturn).not.toHaveBeenCalled();
   expect(mockPrisma.$transaction).not.toHaveBeenCalled();
   expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+}
+
+/**
+ * The statement that switches offers off for the campaigns whose own order
+ * holds only this offer: emptied, that order would read as the default one.
+ */
+function expectOffersOffFor(offerId: string) {
+  expect(mockPrisma.automation.updateManyAndReturn).toHaveBeenCalledTimes(1);
+  expect(mockPrisma.automation.updateManyAndReturn).toHaveBeenCalledWith({
+    where: { workspaceId: WORKSPACE, offersEnabled: true, offerIds: { equals: [offerId] } },
+    data: { offersEnabled: false },
+    select: { id: true, name: true },
+  });
 }
 
 /** The statement that takes an offer out of every campaign's custom order. */
@@ -145,7 +162,9 @@ beforeEach(() => {
   mockWorkspaceId.mockResolvedValue(WORKSPACE);
   mockContext.mockResolvedValue({ workspaceId: WORKSPACE, role: "OWNER" });
   mockPrisma.offer.findMany.mockResolvedValue([{ id: "offer_1" }]);
-  mockPrisma.offer.findFirst.mockResolvedValue({ id: "offer_1" });
+  // As the lookup selects it: PATCH reads the id, DELETE also the mark the
+  // worker sets once the offer was first started for someone.
+  mockPrisma.offer.findFirst.mockResolvedValue({ id: "offer_1", firstOfferedAt: null });
   mockPrisma.offer.aggregate.mockResolvedValue({ _max: { position: null } });
   mockPrisma.offer.create.mockImplementation(
     async ({ data }: { data: Record<string, unknown> }) =>
@@ -159,6 +178,7 @@ beforeEach(() => {
   mockPrisma.offer.delete.mockResolvedValue(storedOffer());
   mockPrisma.contactOffer.groupBy.mockResolvedValue([]);
   mockPrisma.contactOffer.count.mockResolvedValue(0);
+  mockPrisma.automation.updateManyAndReturn.mockResolvedValue([]);
   mockPrisma.$executeRaw.mockResolvedValue(0);
   mockPrisma.$transaction.mockImplementation(async (operations: unknown) =>
     Array.isArray(operations) ? Promise.all(operations) : operations
@@ -318,13 +338,14 @@ describe("POST /api/offers", () => {
     expect(createData().position).toBe(0);
   });
 
-  it("takes neither the workspace nor the slug, position or archive time from the body", async () => {
+  it("takes neither the workspace nor the slug, position, archive time or offered mark from the body", async () => {
     await post({
       ...validOffer,
       workspaceId: "workspace_other",
       linkSlug: "chosen-slug",
       position: 99,
       archivedAt: "2026-11-01T00:00:00.000Z",
+      firstOfferedAt: "2026-11-01T00:00:00.000Z",
     });
 
     const data = createData();
@@ -332,6 +353,8 @@ describe("POST /api/offers", () => {
     expect(data.linkSlug).not.toBe("chosen-slug");
     expect(data.position).toBe(0);
     expect(data).not.toHaveProperty("archivedAt");
+    // Only the worker sets it, when the offer is first started for someone.
+    expect(data).not.toHaveProperty("firstOfferedAt");
   });
 
   it("draws a new slug once when the first one is taken", async () => {
@@ -432,6 +455,30 @@ describe("POST /api/offers", () => {
       reminderEnabled: false,
       reminderMessage: null,
     });
+  });
+
+  // The editor sends what its field holds, and a blank image field holds "".
+  it.each([
+    ["an empty image URL", ""],
+    ["an image URL of spaces", "   "],
+  ])("saves %s as no image", async (_case, cardImageUrl) => {
+    const created = await post({ ...validOffer, cardImageUrl });
+    expect(created.status).toBe(201);
+    expect(createData().cardImageUrl).toBeNull();
+
+    const edited = await patch({ ...validOffer, cardImageUrl });
+    expect(edited.status).toBe(200);
+    expect(mockPrisma.offer.update.mock.calls[0][0].data.cardImageUrl).toBeNull();
+  });
+
+  it("trims the image URL before checking it", async () => {
+    const response = await post({
+      ...validOffer,
+      cardImageUrl: "  https://cdn.example.com/guide-cover.jpg ",
+    });
+
+    expect(response.status).toBe(201);
+    expect(createData().cardImageUrl).toBe("https://cdn.example.com/guide-cover.jpg");
   });
 
   it("answers a malformed body with 400", async () => {
@@ -610,8 +657,10 @@ describe("DELETE /api/offers", () => {
   it("archives an offer someone was offered and takes it out of every campaign's order in one transaction", async () => {
     mockPrisma.contactOffer.count.mockResolvedValue(3);
     const archive = Promise.resolve(storedOffer());
+    const offersOff = Promise.resolve([]);
     const cleanup = Promise.resolve(2);
     mockPrisma.offer.update.mockReturnValue(archive);
+    mockPrisma.automation.updateManyAndReturn.mockReturnValue(offersOff);
     mockPrisma.$executeRaw.mockReturnValue(cleanup);
 
     const response = await remove();
@@ -619,7 +668,7 @@ describe("DELETE /api/offers", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
       success: true,
-      data: { deleted: true, archived: true },
+      data: { deleted: true, archived: true, campaignsWithoutOffers: [] },
     });
     expect(mockPrisma.contactOffer.count).toHaveBeenCalledWith({
       where: { workspaceId: WORKSPACE, offerId: "offer_1" },
@@ -629,18 +678,23 @@ describe("DELETE /api/offers", () => {
       data: { archivedAt: expect.any(Date), isActive: false },
     });
     expect(mockPrisma.offer.delete).not.toHaveBeenCalled();
+    expectOffersOffFor("offer_1");
     expectOrderCleanup("offer_1");
     expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
     const [operations] = mockPrisma.$transaction.mock.calls[0];
-    expect(operations).toHaveLength(2);
+    // Offers go off before the cleanup empties the order they are read from.
+    expect(operations).toHaveLength(3);
     expect(operations[0]).toBe(archive);
-    expect(operations[1]).toBe(cleanup);
+    expect(operations[1]).toBe(offersOff);
+    expect(operations[2]).toBe(cleanup);
   });
 
   it("deletes an offer nobody was offered, with the same cleanup in the same transaction", async () => {
     const deletion = Promise.resolve(storedOffer());
+    const offersOff = Promise.resolve([]);
     const cleanup = Promise.resolve(0);
     mockPrisma.offer.delete.mockReturnValue(deletion);
+    mockPrisma.automation.updateManyAndReturn.mockReturnValue(offersOff);
     mockPrisma.$executeRaw.mockReturnValue(cleanup);
 
     const response = await remove();
@@ -648,17 +702,72 @@ describe("DELETE /api/offers", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
       success: true,
-      data: { deleted: true, archived: false },
+      data: { deleted: true, archived: false, campaignsWithoutOffers: [] },
     });
     expect(mockPrisma.offer.delete).toHaveBeenCalledWith({
       where: { id: "offer_1", workspaceId: WORKSPACE },
     });
     expect(mockPrisma.offer.update).not.toHaveBeenCalled();
+    expectOffersOffFor("offer_1");
     expectOrderCleanup("offer_1");
     const [operations] = mockPrisma.$transaction.mock.calls[0];
-    expect(operations).toHaveLength(2);
+    expect(operations).toHaveLength(3);
     expect(operations[0]).toBe(deletion);
-    expect(operations[1]).toBe(cleanup);
+    expect(operations[1]).toBe(offersOff);
+    expect(operations[2]).toBe(cleanup);
+  });
+
+  // Disconnecting an account deletes its contacts and their ContactOffer
+  // rows, while the cards stay in their inboxes. The mark the worker set at
+  // the first start is still there.
+  it("archives an offer that was offered once, though none of its rows is left", async () => {
+    mockPrisma.offer.findFirst.mockResolvedValue({
+      id: "offer_1",
+      firstOfferedAt: new Date("2026-11-19T09:00:00.000Z"),
+    });
+    mockPrisma.contactOffer.count.mockResolvedValue(0);
+
+    const response = await remove();
+
+    expect(await response.json()).toMatchObject({
+      success: true,
+      data: { deleted: true, archived: true },
+    });
+    expect(mockPrisma.offer.update).toHaveBeenCalledWith({
+      where: { id: "offer_1", workspaceId: WORKSPACE },
+      data: { archivedAt: expect.any(Date), isActive: false },
+    });
+    expect(mockPrisma.offer.delete).not.toHaveBeenCalled();
+    // The mark decides: no rows to count.
+    expect(mockPrisma.contactOffer.count).not.toHaveBeenCalled();
+  });
+
+  // Emptied, a campaign's own order would read as the workspace's default
+  // order, and the campaign would start offers nobody picked for it.
+  it("switches offers off for campaigns whose own order held only this offer, and names them", async () => {
+    mockPrisma.automation.updateManyAndReturn.mockResolvedValue([
+      { id: "campaign_reel_12", name: "Reel 12" },
+    ]);
+
+    const response = await remove();
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      success: true,
+      data: {
+        deleted: true,
+        archived: false,
+        campaignsWithoutOffers: [{ id: "campaign_reel_12", name: "Reel 12" }],
+      },
+    });
+    expectOffersOffFor("offer_1");
+    // In the same transaction as the deletion and before the cleanup, which
+    // empties the order the statement reads.
+    expect(
+      mockPrisma.automation.updateManyAndReturn.mock.invocationCallOrder[0]
+    ).toBeLessThan(mockPrisma.$executeRaw.mock.invocationCallOrder[0]);
+    const [operations] = mockPrisma.$transaction.mock.calls[0];
+    expect(operations).toHaveLength(3);
   });
 
   it.each([["another workspace's"], ["an archived"]])(
@@ -671,7 +780,7 @@ describe("DELETE /api/offers", () => {
       expect(response.status).toBe(404);
       expect(mockPrisma.offer.findFirst).toHaveBeenCalledWith({
         where: { id: "offer_1", workspaceId: WORKSPACE, archivedAt: null },
-        select: { id: true },
+        select: { id: true, firstOfferedAt: true },
       });
       expect(mockPrisma.contactOffer.count).not.toHaveBeenCalled();
       expectNoWrites();

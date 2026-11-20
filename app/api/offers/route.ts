@@ -254,23 +254,43 @@ export async function DELETE(request: NextRequest) {
   const id = request.nextUrl.searchParams.get("id");
   if (!id) return fail(400, "Missing offer ID");
 
-  const existing = await findCurrentOffer(workspaceId, id);
+  const existing = await prisma.offer.findFirst({
+    where: { id, workspaceId, archivedAt: null },
+    select: { id: true, firstOfferedAt: true },
+  });
   if (!existing) return fail(404, "Offer not found");
 
   // An offer someone already got is archived, not deleted: its funnel stays
   // and the card links already sent keep redirecting. The worker checks
   // archivedAt before every message, so its running sequences stop. One
-  // nobody got goes for good.
+  // nobody got goes for good. Whether anyone got it is read from the mark
+  // the worker sets before the first ContactOffer row, which outlives the
+  // rows: disconnecting an account deletes its contacts and their offers,
+  // while the links stay in their inboxes. Rows written without the mark
+  // count as well.
   const used =
+    existing.firstOfferedAt !== null ||
     (await prisma.contactOffer.count({ where: { workspaceId, offerId: id } })) >
-    0;
-  await prisma.$transaction([
+      0;
+  const [, campaignsWithoutOffers] = await prisma.$transaction([
     used
       ? prisma.offer.update({
           where: { id, workspaceId },
           data: { archivedAt: new Date(), isActive: false },
         })
       : prisma.offer.delete({ where: { id, workspaceId } }),
+    // A campaign's own order lists the only offers it may start. Once its
+    // last one is gone the list is empty, which reads as the workspace's
+    // default order, and the campaign would start offers nobody picked for
+    // it. Its offers are switched off instead: it keeps sending its link
+    // (Weg 1), its editor shows offers off, and the response names it, so
+    // the Offers page can say which campaigns need new offers. Before the
+    // cleanup below, which empties the list.
+    prisma.automation.updateManyAndReturn({
+      where: { workspaceId, offersEnabled: true, offerIds: { equals: [id] } },
+      data: { offersEnabled: false },
+      select: { id: true, name: true },
+    }),
     // A campaign's custom order holds plain ids, with no foreign key to
     // clean up after the offer: take this one out of every campaign of the
     // workspace.
@@ -279,6 +299,6 @@ export async function DELETE(request: NextRequest) {
 
   return NextResponse.json({
     success: true,
-    data: { deleted: true, archived: used },
+    data: { deleted: true, archived: used, campaignsWithoutOffers },
   });
 }

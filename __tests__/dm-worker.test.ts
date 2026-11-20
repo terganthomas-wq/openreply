@@ -281,13 +281,15 @@ beforeEach(() => {
   mockPrisma.automation.findFirst.mockResolvedValue(null);
   mockPrisma.dmLog.findUnique.mockResolvedValue(null);
   mockPrisma.dmLog.create.mockResolvedValue({});
-  // Two different lookups share findFirst: the cross-campaign private-reply
-  // check (keyed on status SENT) and the postback's name lookup. Only the
-  // latter should resolve by default, or every comment would look like a
-  // duplicate of an already-answered one.
+  // Three different lookups share findFirst: the cross-campaign private-reply
+  // check (keyed on status SENT), a read fallback's check for a DM keyword
+  // the campaign answered, and the name lookup (keyed on a stored name).
+  // Only the name lookup should resolve by default, or every comment would
+  // look like a duplicate of an already-answered one and every read fallback
+  // like one the DM trigger made pointless.
   mockPrisma.dmLog.findFirst.mockImplementation(
-    async (args: { where?: { status?: string } } = {}) =>
-      args.where?.status === "SENT" ? null : { commenterName: "commenter_user" }
+    async (args: { where?: { commenterName?: unknown } } = {}) =>
+      args.where?.commenterName ? { commenterName: "commenter_user" } : null
   );
   mockPrisma.dmLog.upsert.mockResolvedValue({});
   mockPrisma.dmLog.update.mockReset().mockResolvedValue({});
@@ -842,6 +844,94 @@ describe("DM Worker — Full Pipeline", () => {
 
     expect(mockSendDirectMessage).not.toHaveBeenCalled();
     expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
+  });
+
+  // A campaign with an opening DM and the DM trigger: the person reads the
+  // opening DM and answers it by typing the keyword instead of tapping. The
+  // DM trigger sends the link; the fallback queued when they read the
+  // opening DM must not send it again.
+  it("should not send the link again from a read fallback once the DM trigger answered the person", async () => {
+    const campaign = {
+      ...mockAutomation,
+      openingDmEnabled: true,
+      openingDmMessage: "Want the link?",
+      openingDmButtonLabel: "Send it",
+      dmTriggerEnabled: true,
+      trackedLinks: [],
+    };
+    mockPrisma.automation.findMany.mockResolvedValue([campaign]);
+    mockPrisma.automation.findFirst.mockResolvedValue(campaign);
+    // DmLog rows as the table keeps them, for the lookups below.
+    const rows: Record<string, unknown>[] = [];
+    mockPrisma.dmLog.upsert.mockImplementation(
+      async ({ create }: { create: Record<string, unknown> }) => {
+        rows.push(create);
+        return create;
+      }
+    );
+    mockPrisma.dmLog.findFirst.mockImplementation(
+      async (
+        args: {
+          where?: {
+            automationId?: string;
+            commenterId?: string;
+            commenterName?: unknown;
+            commentId?: { startsWith?: string };
+          };
+        } = {}
+      ) => {
+        const where = args.where ?? {};
+        if (where.commenterName) return { commenterName: "commenter_user" };
+        const prefix = where.commentId?.startsWith;
+        if (!prefix) return null;
+        const row = rows.find(
+          (log) =>
+            log.automationId === where.automationId &&
+            log.commenterId === where.commenterId &&
+            String(log.commentId).startsWith(prefix) &&
+            (log.status === "SENT" || log.dmDeliveryUnconfirmed === true)
+        );
+        return row ? { id: row.commentId } : null;
+      }
+    );
+
+    const process = getProcessor();
+    await process({
+      name: "process-message",
+      data: {
+        instagramAccountId: "ig_456",
+        messageId: "mid_typed_keyword",
+        messageText: "LINK",
+        senderId: "commenter_999",
+      },
+      id: "message_job_typed",
+      attemptsMade: 0,
+    });
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+
+    // Five minutes after they read the opening DM.
+    await process(
+      createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        payload: "reveal:auto_789",
+        fallback: true,
+      })
+    );
+
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    expect(mockSendDirectMessageWithLinkButton).not.toHaveBeenCalled();
+    // An unconfirmed answer counts as well: it may have reached the inbox.
+    expect(mockPrisma.dmLog.findFirst).toHaveBeenCalledWith({
+      where: {
+        automationId: "auto_789",
+        commenterId: "commenter_999",
+        commentId: { startsWith: "dm:" },
+        OR: [{ status: "SENT" }, { dmDeliveryUnconfirmed: true }],
+      },
+      select: { id: true },
+    });
+    expect(mockReserveWorkspaceDMSend).toHaveBeenCalledTimes(1);
   });
 
   it("should not let a read fallback bypass the follow gate", async () => {
@@ -1457,6 +1547,90 @@ describe("DM Worker — DM keyword trigger", () => {
 
     expect(mockSendDirectMessageWithButton).toHaveBeenCalledTimes(1);
     expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+});
+
+describe("DM Worker — the claim of a button tap", () => {
+  function tap() {
+    return createMockPostbackJob({
+      instagramAccountId: "ig_456",
+      userId: "commenter_999",
+      payload: "reveal:auto_789",
+      mid: "mid_tap",
+    });
+  }
+
+  beforeEach(() => {
+    mockPrisma.automation.findMany.mockResolvedValue([]);
+    mockPrisma.automation.findFirst.mockResolvedValue(mockAutomation);
+  });
+
+  // Nothing is sent before the claim is stored, so a database error on it is
+  // retried like any other. Taken inside the send's error handling, it ended
+  // the job as an unconfirmed delivery instead: no retry, the tap logged
+  // FAILED and unconfirmed, and the link never sent.
+  it("retries the tap without sending when its claim cannot be stored", async () => {
+    const lostConnection = new Error("Connection terminated unexpectedly");
+    mockPrisma.postbackDelivery.create.mockRejectedValue(lostConnection);
+
+    await expect(getProcessor()(tap())).rejects.toBe(lostConnection);
+
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
+    expect(mockSendDirectMessageWithLinkButton).not.toHaveBeenCalled();
+    // The retry reserves again, so this attempt's reservation is given back.
+    expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledWith(
+      "workspace_123",
+      usagePeriodStart
+    );
+    expect(mockPrisma.postbackDelivery.delete).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
+  });
+
+  it("delivers the link on the retry after the claim could not be stored", async () => {
+    mockPrisma.postbackDelivery.create
+      .mockRejectedValueOnce(new Error("Connection terminated unexpectedly"))
+      .mockResolvedValue({});
+
+    const process = getProcessor();
+    await expect(process(tap())).rejects.toThrow(
+      "Connection terminated unexpectedly"
+    );
+    await process({ ...tap(), attemptsMade: 1 });
+
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.dmLog.upsert).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ status: "SENT" }),
+      })
+    );
+  });
+
+  // Instagram refused the link, then the database failed while giving the
+  // claim back. A retry would only find the claim, so the tap ends without
+  // one, as an unconfirmed delivery; its error names the refusal, not only
+  // the database's failure.
+  it("ends a refused tap whose claim cannot be given back without a retry, naming the refusal", async () => {
+    mockSendDirectMessage.mockRejectedValue(
+      new MetaApiError(100, undefined, undefined, "Invalid parameter")
+    );
+    mockPrisma.postbackDelivery.delete.mockRejectedValue(
+      new Error("Connection terminated unexpectedly")
+    );
+
+    await expect(getProcessor()(tap())).rejects.toMatchObject({
+      name: "UnrecoverableError",
+    });
+
+    expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({
+          status: "FAILED",
+          dmDeliveryUnconfirmed: true,
+          errorMessage: expect.stringContaining("MetaApiError 100: Invalid parameter"),
+        }),
+      })
+    );
   });
 });
 

@@ -264,7 +264,7 @@ describe.skipIf(!databaseUrl)("offers API on a real Postgres", () => {
     const archived = await DELETE(apiRequest("DELETE", `?id=${a.id}`));
     expect(await archived.json()).toEqual({
       success: true,
-      data: { deleted: true, archived: true },
+      data: { deleted: true, archived: true, campaignsWithoutOffers: [] },
     });
     const archivedRow = await db.offer.findUniqueOrThrow({ where: { id: a.id } });
     expect(archivedRow.archivedAt).toBeInstanceOf(Date);
@@ -277,7 +277,7 @@ describe.skipIf(!databaseUrl)("offers API on a real Postgres", () => {
     const deleted = await DELETE(apiRequest("DELETE", `?id=${b.id}`));
     expect(await deleted.json()).toEqual({
       success: true,
-      data: { deleted: true, archived: false },
+      data: { deleted: true, archived: false, campaignsWithoutOffers: [] },
     });
     expect(await db.offer.findUnique({ where: { id: b.id } })).toBeNull();
     expect(await offerIdsOf(`campaign_${WORKSPACE}`)).toEqual([c.id]);
@@ -292,6 +292,166 @@ describe.skipIf(!databaseUrl)("offers API on a real Postgres", () => {
     // A sent card still leads somewhere.
     const response = await click(a.linkSlug, "igsid_1");
     expect(response.headers.get("location")).toBe("https://example.test/A");
+  });
+
+  // Disconnecting an account deletes its row, and with it its contacts and
+  // their ContactOffer rows. The cards are still in those people's inboxes.
+  it("archives an offer whose rows went with a disconnected account, so its sent links keep working", async () => {
+    const offer = await createOffer("Guide");
+    await db.instagramAccount.create({
+      data: {
+        id: "account_disconnected",
+        workspaceId: WORKSPACE,
+        instagramId: "ig_account_disconnected",
+        username: "disconnected",
+        accessToken: "local-test-only",
+      },
+    });
+    await db.contact.create({
+      data: {
+        id: "contact_disconnected",
+        workspaceId: WORKSPACE,
+        instagramAccountId: "account_disconnected",
+        igsid: "igsid_disconnected",
+        recipientHash: hashRecipientId("igsid_disconnected"),
+      },
+    });
+    await db.contactOffer.create({
+      data: {
+        workspaceId: WORKSPACE,
+        contactId: "contact_disconnected",
+        offerId: offer.id,
+        sentAt: new Date(),
+      },
+    });
+    // What the worker records before the offer's first row
+    // (offers-start.db.test.ts).
+    await db.offer.update({
+      where: { id: offer.id },
+      data: { firstOfferedAt: new Date() },
+    });
+    await db.instagramAccount.delete({ where: { id: "account_disconnected" } });
+    expect(await db.contactOffer.count({ where: { offerId: offer.id } })).toBe(0);
+
+    const response = await DELETE(apiRequest("DELETE", `?id=${offer.id}`));
+
+    expect(await response.json()).toEqual({
+      success: true,
+      data: { deleted: true, archived: true, campaignsWithoutOffers: [] },
+    });
+    const row = await db.offer.findUniqueOrThrow({ where: { id: offer.id } });
+    expect(row.archivedAt).toBeInstanceOf(Date);
+    const link = await click(offer.linkSlug, "igsid_disconnected");
+    expect(link.headers.get("location")).toBe("https://example.test/Guide");
+  });
+
+  // A campaign's own order lists the only offers it may start; emptied, it
+  // would read as the workspace's default order.
+  it("switches offers off for a campaign whose own order held only the deleted offer, and names it", async () => {
+    const a = await createOffer("A");
+    const b = await createOffer("B");
+    const campaigns = [
+      { id: "campaign_only_a", offersEnabled: true, offerIds: [a.id] },
+      { id: "campaign_a_and_b", offersEnabled: true, offerIds: [a.id, b.id] },
+      { id: "campaign_default_order", offersEnabled: true, offerIds: [] },
+      { id: "campaign_offers_off", offersEnabled: false, offerIds: [a.id] },
+    ];
+    for (const campaign of campaigns) {
+      await db.automation.create({
+        data: {
+          ...campaign,
+          workspaceId: WORKSPACE,
+          instagramAccountId: "account",
+          name: `Name of ${campaign.id}`,
+          keywords: ["GUIDE"],
+          dmMessage: "Your link",
+        },
+      });
+    }
+    // Another workspace's campaign naming the same id is left alone.
+    await db.automation.update({
+      where: { id: `campaign_${OTHER_WORKSPACE}` },
+      data: { offersEnabled: true, offerIds: [a.id] },
+    });
+
+    try {
+      const response = await DELETE(apiRequest("DELETE", `?id=${a.id}`));
+
+      expect(await response.json()).toEqual({
+        success: true,
+        data: {
+          deleted: true,
+          archived: false,
+          campaignsWithoutOffers: [
+            { id: "campaign_only_a", name: "Name of campaign_only_a" },
+          ],
+        },
+      });
+      const rows = await db.automation.findMany({
+        where: { id: { in: campaigns.map((campaign) => campaign.id) } },
+        select: { id: true, offersEnabled: true, offerIds: true },
+      });
+      expect(
+        Object.fromEntries(rows.map(({ id, ...rest }) => [id, rest]))
+      ).toEqual({
+        campaign_only_a: { offersEnabled: false, offerIds: [] },
+        campaign_a_and_b: { offersEnabled: true, offerIds: [b.id] },
+        campaign_default_order: { offersEnabled: true, offerIds: [] },
+        campaign_offers_off: { offersEnabled: false, offerIds: [] },
+      });
+      const other = await db.automation.findUniqueOrThrow({
+        where: { id: `campaign_${OTHER_WORKSPACE}` },
+        select: { offersEnabled: true, offerIds: true },
+      });
+      expect(other).toEqual({ offersEnabled: true, offerIds: [a.id] });
+    } finally {
+      await db.automation.deleteMany({
+        where: { id: { in: campaigns.map((campaign) => campaign.id) } },
+      });
+      await db.automation.update({
+        where: { id: `campaign_${OTHER_WORKSPACE}` },
+        data: { offersEnabled: false, offerIds: [] },
+      });
+    }
+  });
+
+  // A failed tag write must not leave clickedAt behind: later clicks no
+  // longer find a clicked row, so the tag would never be written.
+  it("records a click and its tag together, so the next click makes good a tag that could not be written", async () => {
+    const offer = await createOffer("Fragile");
+    await db.contactOffer.create({
+      data: { workspaceId: WORKSPACE, contactId: "contact_igsid_1", offerId: offer.id },
+    });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    // The tag insert fails once, as on a lost connection.
+    await sql.query(
+      `ALTER TABLE "${schema}"."ContactTag" ADD CONSTRAINT "test_click_tag_fails" CHECK ("tag" <> 'Fragile geklickt')`
+    );
+    try {
+      const response = await click(offer.linkSlug, "igsid_1");
+      expect(response.headers.get("location")).toBe("https://example.test/Fragile");
+    } finally {
+      await sql.query(
+        `ALTER TABLE "${schema}"."ContactTag" DROP CONSTRAINT "test_click_tag_fails"`
+      );
+    }
+    expect(consoleError).toHaveBeenCalledWith(
+      "[Offer redirect] Click not recorded:",
+      expect.anything()
+    );
+    consoleError.mockRestore();
+
+    // Neither the click nor the tag: the funnel and the contact list agree.
+    const missed = await db.contactOffer.findFirstOrThrow({ where: { offerId: offer.id } });
+    expect(missed.clickedAt).toBeNull();
+    expect(await db.contactTag.count({ where: { contactId: "contact_igsid_1" } })).toBe(0);
+
+    await click(offer.linkSlug, "igsid_1");
+
+    const clicked = await db.contactOffer.findFirstOrThrow({ where: { offerId: offer.id } });
+    expect(clicked.clickedAt).toBeInstanceOf(Date);
+    const tags = await db.contactTag.findMany({ where: { contactId: "contact_igsid_1" } });
+    expect(tags.map((tag) => tag.tag)).toEqual(["Fragile geklickt"]);
   });
 
   it("marks a click on the person's own offer once and tags them", async () => {

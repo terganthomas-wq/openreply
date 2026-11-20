@@ -102,9 +102,33 @@ export async function claimPostbackDelivery(
 }
 
 /**
+ * A message Instagram refused whose claim could not be given back: the
+ * database failed while deleting it. The refusal is the outcome, nothing was
+ * delivered. The claim is still taken, though, so a later run of the same
+ * message would take it for sent; that is reported apart from the refusal.
+ */
+export class ClaimReleaseError extends Error {
+  /** The confirmed rejection of the send. */
+  readonly refusal: unknown;
+  /** Why the claim could not be deleted. */
+  readonly releaseError: unknown;
+
+  constructor(refusal: unknown, releaseError: unknown) {
+    super(
+      `A refused message kept its claim: ${formatError(releaseError)} (refusal: ${formatError(refusal)})`
+    );
+    this.name = "ClaimReleaseError";
+    this.refusal = refusal;
+    this.releaseError = releaseError;
+  }
+}
+
+/**
  * Send a message whose claim is taken (claimPostbackDelivery). A confirmed
  * rejection releases the claim, so a retry may send; any other failure keeps
- * it and arrives classified (classifySendError).
+ * it and arrives classified (classifySendError). A rejection whose claim
+ * cannot be released arrives as ClaimReleaseError, never as the database
+ * error alone, which would hide that Instagram refused the message.
  */
 export async function sendClaimedPostback({
   operationId,
@@ -119,7 +143,11 @@ export async function sendClaimedPostback({
     // A durable claim survives queue eviction, concurrent redelivery, and a
     // process crash during delivery. Only confirmed rejections permit retry.
     if (isConfirmedSendRejection(error)) {
-      await prisma.postbackDelivery.delete({ where: { id: operationId } });
+      try {
+        await prisma.postbackDelivery.delete({ where: { id: operationId } });
+      } catch (releaseError) {
+        throw new ClaimReleaseError(error, releaseError);
+      }
       throw error;
     }
     throw classifySendError(error);

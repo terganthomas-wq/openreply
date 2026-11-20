@@ -7,6 +7,12 @@
  * clickedAt and the offer's "clicked" tag, and every later one changes
  * nothing. No LinkClick row is written, so campaign click rates keep counting
  * campaign links only.
+ *
+ * clickedAt and the tag are written in one transaction. Once clickedAt is
+ * set, later clicks no longer find the row, so a tag that failed after it
+ * would never have been written: the funnel would count the click while the
+ * contact list showed nobody with the tag. Now a failed write leaves neither,
+ * and the next click records both.
  */
 
 import { addContactTags } from "@/lib/contacts/store";
@@ -43,14 +49,18 @@ export async function recordOfferClick({
   const now = new Date();
   let recorded = 0;
   for (const row of rows) {
-    // Two clicks at once both find the row; only one of them sets the time.
-    const { count } = await prisma.contactOffer.updateMany({
-      where: { id: row.id, workspaceId, clickedAt: null },
-      data: { clickedAt: now },
+    const marked = await prisma.$transaction(async (tx) => {
+      // Two clicks at once both find the row; only one of them sets the
+      // time, and only that one adds the tag.
+      const { count } = await tx.contactOffer.updateMany({
+        where: { id: row.id, workspaceId, clickedAt: null },
+        data: { clickedAt: now },
+      });
+      if (count === 0) return false;
+      await addContactTags(workspaceId, row.contactId, [tagClicked], tx);
+      return true;
     });
-    if (count === 0) continue;
-    await addContactTags(workspaceId, row.contactId, [tagClicked]);
-    recorded += 1;
+    if (marked) recorded += 1;
   }
   return recorded;
 }
