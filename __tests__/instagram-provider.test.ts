@@ -6,16 +6,20 @@ vi.mock("@/lib/meta/oauth", () => ({
   decryptToken: (value: string) => `decrypted:${value}`,
 }));
 import {
+  cardFallbackText,
   createInstagramContext,
   sendPrivateReplyWithButton,
+  sendDirectMessageWithCard,
   sendDirectMessageWithLinkButton,
   getRecentMediaComments,
   getUserFollowStatus,
   getUserMedia,
   sendPrivateReply,
+  type CardMessage,
 } from "@/lib/instagram/provider";
 import { zernioRequest } from "@/lib/zernio/client";
 import { RateLimitError, TokenExpiredError } from "@/lib/meta/client";
+import { getMetaGraphApiVersion } from "@/lib/env";
 import { prisma } from "@/lib/db/client";
 const context = {
   provider: "ZERNIO" as const,
@@ -195,6 +199,167 @@ describe("Instagram provider boundary", () => {
       /^https:\/\/graph\.facebook\.com\/v[\d.]+\/person\?/
     );
   });
+
+  // The offer card. Both Meta logins post the same generic template to the
+  // same path, only the host differs; Zernio has no cards and gets the text
+  // and the button in one request.
+  const card: CardMessage = {
+    title: "ChatGPT Prompting Guide",
+    subtitle: "In 7 Schritten zu besseren Antworten",
+    imageUrl: "https://cdn.example.com/cover.jpg",
+    button: { title: "Jetzt holen", url: "https://app.example.com/o/abc?r=tok" },
+  };
+  function sentCardElement(call = 0) {
+    return JSON.parse(fetchMock.mock.calls[call][1].body).message.attachment
+      .payload.elements[0];
+  }
+
+  it.each([
+    ["an Instagram Login", instagramLogin, "graph.instagram.com"],
+    ["a Unified login", unifiedLogin, "graph.facebook.com"],
+  ] as const)(
+    "sends a card from %s account as a generic template",
+    async (_login, auth, host) => {
+      respond({ recipient_id: "person", message_id: "mid" });
+      await expect(
+        sendDirectMessageWithCard({
+          context: auth,
+          instagramAccountId: "ig1",
+          userId: "person",
+          card,
+        })
+      ).resolves.toEqual({ recipient_id: "person", message_id: "mid" });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0];
+      // The token travels in the header only, never in the URL.
+      expect(url).toBe(
+        `https://${host}/${getMetaGraphApiVersion()}/ig1/messages`
+      );
+      expect(init.method).toBe("POST");
+      expect(init.headers).toEqual({
+        "Content-Type": "application/json",
+        Authorization: "Bearer meta",
+      });
+      expect(JSON.parse(init.body)).toEqual({
+        recipient: { id: "person" },
+        message: {
+          attachment: {
+            type: "template",
+            payload: {
+              template_type: "generic",
+              elements: [
+                {
+                  title: "ChatGPT Prompting Guide",
+                  subtitle: "In 7 Schritten zu besseren Antworten",
+                  image_url: "https://cdn.example.com/cover.jpg",
+                  buttons: [
+                    {
+                      type: "web_url",
+                      url: "https://app.example.com/o/abc?r=tok",
+                      title: "Jetzt holen",
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        },
+      });
+    }
+  );
+  it("cuts a card's title and subtitle to 80 units and its button title to 20", async () => {
+    respond({ recipient_id: "person", message_id: "mid" });
+    await sendDirectMessageWithCard({
+      context: unifiedLogin,
+      instagramAccountId: "ig1",
+      userId: "person",
+      card: {
+        title: "T".repeat(81),
+        subtitle: "S".repeat(120),
+        button: { title: "B".repeat(21), url: "https://app.example.com/o/abc" },
+      },
+    });
+    expect(sentCardElement()).toEqual({
+      title: "T".repeat(80),
+      subtitle: "S".repeat(80),
+      buttons: [
+        {
+          type: "web_url",
+          url: "https://app.example.com/o/abc",
+          title: "B".repeat(20),
+        },
+      ],
+    });
+  });
+  it.each([
+    ["absent", {}],
+    ["null", { subtitle: null, imageUrl: null }],
+    ["empty", { subtitle: "", imageUrl: "" }],
+  ])(
+    "leaves a subtitle and an image that are %s out of the card",
+    async (_case, optional) => {
+      respond({ recipient_id: "person", message_id: "mid" });
+      await sendDirectMessageWithCard({
+        context: instagramLogin,
+        instagramAccountId: "ig1",
+        userId: "person",
+        card: { title: "Guide", button: card.button, ...optional },
+      });
+      const element = sentCardElement();
+      expect(element).not.toHaveProperty("subtitle");
+      expect(element).not.toHaveProperty("image_url");
+      expect(element).toEqual({
+        title: "Guide",
+        buttons: [
+          {
+            type: "web_url",
+            url: "https://app.example.com/o/abc?r=tok",
+            title: "Jetzt holen",
+          },
+        ],
+      });
+    }
+  );
+  it("sends a card through Zernio as its text and one url button, without another send", async () => {
+    respond({ data: { messageId: "mid" } });
+    await expect(
+      sendDirectMessageWithCard({
+        context,
+        instagramAccountId: "ig",
+        userId: "recipient",
+        card,
+      })
+    ).resolves.toEqual({ message_id: "mid", recipient_id: "recipient" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "https://zernio.com/api/v1/inbox/conversations/recipient/messages"
+    );
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      accountId: "selected",
+      message: "ChatGPT Prompting Guide\nIn 7 Schritten zu besseren Antworten",
+      buttons: [
+        {
+          type: "url",
+          title: "Jetzt holen",
+          url: "https://app.example.com/o/abc?r=tok",
+        },
+      ],
+    });
+  });
+  it("renders a card as its title, then its subtitle on the next line", () => {
+    expect(cardFallbackText(card)).toBe(
+      "ChatGPT Prompting Guide\nIn 7 Schritten zu besseren Antworten"
+    );
+    expect(cardFallbackText({ title: "Guide", button: card.button })).toBe(
+      "Guide"
+    );
+    expect(
+      cardFallbackText({ title: "Guide", subtitle: "", button: card.button })
+    ).toBe("Guide");
+  });
+
   it.each([
     [429, RateLimitError],
     [401, TokenExpiredError],

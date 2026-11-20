@@ -37,18 +37,45 @@ export function replaceUrlWithTrackedPlaceholder(
 /**
  * Personalize {username} and strip the {link} token — used when the link is
  * delivered as a separate button rather than inline in the message text.
+ *
+ * Without a name, {username} becomes `fallbackName`. Campaign messages keep
+ * the English "there". Offer messages pass "", so a German text never gets an
+ * English word; the token then takes its surrounding spaces along and leaves
+ * one only where it stood between two words: "Hey {username} schau" reads
+ * "Hey schau", not "Hey  schau", and "Hey {username}, schau" reads
+ * "Hey, schau". The rest of the text keeps its spacing.
  */
 export function renderMessageWithoutLink({
   message,
   commenterName,
+  fallbackName = "there",
 }: {
   message: string;
   commenterName?: string | null;
+  fallbackName?: string;
 }) {
-  return message
-    .replace(/\{username\}/gi, commenterName ?? "there")
-    .replace(/\s*\{link\}\s*/gi, " ")
-    .trim();
+  const name = commenterName ?? fallbackName;
+  const personalized =
+    name || fallbackName
+      ? message.replace(/\{username\}/gi, name)
+      : message.replace(
+          /([ \t]*)\{username\}([ \t]*)/gi,
+          (_token, before: string, after: string) =>
+            before && after ? " " : ""
+        );
+  return personalized.replace(/\s*\{link\}\s*/gi, " ").trim();
+}
+
+// The web app's origin: the page's own in the browser, NEXTAUTH_URL on the
+// server. The web app and the worker get the same NEXTAUTH_URL, so links the
+// worker sends point at the app that serves them.
+function resolveBaseUrl(baseUrl?: string) {
+  const resolvedBaseUrl =
+    baseUrl ??
+    (typeof window !== "undefined"
+      ? window.location.origin
+      : process.env.NEXTAUTH_URL ?? "http://localhost:3000");
+  return resolvedBaseUrl.replace(/\/$/, "");
 }
 
 export function buildTrackedUrl(
@@ -56,13 +83,22 @@ export function buildTrackedUrl(
   baseUrl?: string,
   recipientToken?: string
 ) {
-  const resolvedBaseUrl =
-    baseUrl ??
-    (typeof window !== "undefined"
-      ? window.location.origin
-      : process.env.NEXTAUTH_URL ?? "http://localhost:3000");
+  const url = `${resolveBaseUrl(baseUrl)}/r/${slug}`;
+  return recipientToken ? `${url}?r=${recipientToken}` : url;
+}
 
-  const url = `${resolvedBaseUrl.replace(/\/$/, "")}/r/${slug}`;
+/**
+ * The link behind an offer's card and reminder buttons: the offer's own
+ * redirect, not a campaign's tracked link, so campaign click counts keep
+ * their meaning and deleting a campaign never breaks a card already sent.
+ * The recipient token is what lets a click tag the contact.
+ */
+export function buildOfferUrl(
+  slug: string,
+  recipientToken?: string,
+  baseUrl?: string
+) {
+  const url = `${resolveBaseUrl(baseUrl)}/o/${slug}`;
   return recipientToken ? `${url}?r=${recipientToken}` : url;
 }
 

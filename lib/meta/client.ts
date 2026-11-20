@@ -481,6 +481,73 @@ export async function sendDirectMessageWithLinkButton(
   return handleResponse(response);
 }
 
+/**
+ * A card in a DM: Instagram's generic template with a single element. The
+ * title is required; the subtitle and the image are optional.
+ */
+export interface CardMessage {
+  title: string;
+  subtitle?: string | null;
+  /**
+   * A public https URL of the image itself. Instagram fetches it, so a page
+   * that shows the image (a Drive share link, for one) does not work.
+   */
+  imageUrl?: string | null;
+  button: LinkButton;
+}
+
+/**
+ * Send a direct message as a card (generic template): an optional image, a
+ * title, an optional subtitle and one web_url button.
+ *
+ * The title and the subtitle are cut to Meta's limit of 80, as the button
+ * template's text is cut to 640. An absent subtitle or image is left out of
+ * the element rather than sent empty. There is no default_action (a tap on
+ * the card outside its button): how Instagram handles one has not been
+ * verified, so the button stays the only way to the link.
+ */
+export async function sendDirectMessageWithCard(
+  auth: MetaAuth,
+  instagramAccountId: string,
+  userId: string,
+  card: CardMessage
+): Promise<{ recipient_id: string; message_id: string }> {
+  const accessToken = tokenOf(auth);
+  const response = await fetch(
+    `${instagramGraphBase(auth)}/${instagramAccountId}/messages`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({
+        recipient: { id: userId },
+        message: {
+          attachment: {
+            type: "template",
+            payload: {
+              template_type: "generic",
+              elements: [
+                {
+                  title: card.title.slice(0, 80),
+                  ...(card.subtitle
+                    ? { subtitle: card.subtitle.slice(0, 80) }
+                    : {}),
+                  ...(card.imageUrl ? { image_url: card.imageUrl } : {}),
+                  buttons: toWebUrlButtons([card.button]),
+                },
+              ],
+            },
+          },
+        },
+      }),
+    }
+  );
+
+  return handleResponse(response);
+}
+
 export async function sendCommentReply(
   auth: MetaAuth,
   commentId: string,

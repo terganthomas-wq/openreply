@@ -245,6 +245,44 @@ export async function sendDirectMessageWithLinkButton({
   });
 }
 
+/**
+ * The text of a card where the card itself cannot be sent: the title, then
+ * the subtitle on its own line. Shared by the Zernio send below and the
+ * fallbacks for a card Meta refuses, so a card reads the same either way.
+ */
+export function cardFallbackText(card: meta.CardMessage): string {
+  return [card.title, card.subtitle].filter(Boolean).join("\n");
+}
+
+export async function sendDirectMessageWithCard({
+  context,
+  instagramAccountId,
+  userId,
+  card,
+}: {
+  context: InstagramContext;
+  instagramAccountId: string;
+  userId: string;
+  card: meta.CardMessage;
+}) {
+  if (context.provider === "META")
+    return meta.sendDirectMessageWithCard(
+      context,
+      instagramAccountId,
+      userId,
+      card
+    );
+  // Zernio messages carry text with url or postback buttons and nothing else,
+  // so the card goes out as its text and its button in this one request,
+  // without the image.
+  return sendZernioMessage({
+    context,
+    recipientId: userId,
+    text: cardFallbackText(card),
+    buttons: linkButtons([card.button]),
+  });
+}
+
 export async function sendCommentReply({
   context,
   commentId,

@@ -9,6 +9,7 @@ const {
   mockSendDirectMessageWithButton,
   mockSendDirectMessage,
   mockSendDirectMessageWithLinkButton,
+  mockSendDirectMessageWithCard,
   mockDecryptToken,
   mockMatchKeywords,
   mockReserveDMSlot,
@@ -54,6 +55,7 @@ const {
   mockSendDirectMessageWithButton: vi.fn(),
   mockSendDirectMessage: vi.fn(),
   mockSendDirectMessageWithLinkButton: vi.fn(),
+  mockSendDirectMessageWithCard: vi.fn(),
   mockDecryptToken: vi.fn(),
   mockMatchKeywords: vi.fn(),
   mockReserveDMSlot: vi.fn(),
@@ -75,6 +77,7 @@ vi.mock("@/lib/meta/client", () => ({
   sendDirectMessageWithButton: mockSendDirectMessageWithButton,
   sendDirectMessage: mockSendDirectMessage,
   sendDirectMessageWithLinkButton: mockSendDirectMessageWithLinkButton,
+  sendDirectMessageWithCard: mockSendDirectMessageWithCard,
   sendCommentReply: vi.fn(),
   MetaApiError: class MetaApiError extends Error {
     code: number;

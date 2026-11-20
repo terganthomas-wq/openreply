@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   calculateCtr,
   countUniqueClicks,
@@ -8,11 +8,17 @@ import {
 } from "../lib/tracking/analytics";
 import { hashRecipientId, parseRecipientToken } from "../lib/tracking/server";
 import {
+  buildOfferUrl,
   buildTrackedUrl,
   extractFirstUrl,
+  renderMessageWithoutLink,
   renderMessageWithTracking,
   replaceUrlWithTrackedPlaceholder,
 } from "../lib/tracking/message";
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 describe("tracked link messages", () => {
   it("extracts a destination URL and replaces it with the tracked placeholder", () => {
@@ -78,6 +84,110 @@ describe("tracked link messages", () => {
   it("builds redirect URLs from a base URL", () => {
     expect(buildTrackedUrl("abc123", "https://manychat-alternative.com/")).toBe(
       "https://manychat-alternative.com/r/abc123"
+    );
+  });
+});
+
+describe("messages sent next to a link button", () => {
+  // The function as it was before fallbackName existed. Campaign DMs call it
+  // without the option, so for them nothing may change, not even a space.
+  function renderedBefore({
+    message,
+    commenterName,
+  }: {
+    message: string;
+    commenterName?: string | null;
+  }) {
+    return message
+      .replace(/\{username\}/gi, commenterName ?? "there")
+      .replace(/\s*\{link\}\s*/gi, " ")
+      .trim();
+  }
+
+  it.each([
+    ["Hey {username}! Here is the link: {link}", "Maya"],
+    ["Hey {username}! Here is the link: {link}", null],
+    ["Hey {username}, tap below {link} now", undefined],
+    ["Hey {username} schau", ""],
+    ["Hey {username}, schau", ""],
+    ["  {USERNAME}  ", null],
+    ["{username}\n\n{link}\n{Username}", "maya"],
+    ["Line one\n\nLine  two {link}", null],
+  ])(
+    "renders %j for the name %j exactly as before by default",
+    (message, commenterName) => {
+      expect(renderMessageWithoutLink({ message, commenterName })).toBe(
+        renderedBefore({ message, commenterName })
+      );
+    }
+  );
+
+  it("drops {username} and its extra space without a name or a fallback", () => {
+    expect(
+      renderMessageWithoutLink({
+        message: "Hey {username} schau",
+        fallbackName: "",
+      })
+    ).toBe("Hey schau");
+    expect(
+      renderMessageWithoutLink({
+        message: "Hey {username} schau",
+        commenterName: null,
+        fallbackName: "",
+      })
+    ).toBe("Hey schau");
+    expect(
+      renderMessageWithoutLink({
+        message: "Hey {username} schau",
+        commenterName: "",
+        fallbackName: "",
+      })
+    ).toBe("Hey schau");
+  });
+
+  it("leaves no space before punctuation and keeps the rest of the text as written", () => {
+    const render = (message: string) =>
+      renderMessageWithoutLink({ message, fallbackName: "" });
+
+    expect(render("Hey {username}, schau mal")).toBe("Hey, schau mal");
+    expect(render("Danke {username}!")).toBe("Danke!");
+    expect(render("{username} schau mal")).toBe("schau mal");
+    expect(render("Hallo {username}\n\nHier  ist er {link}")).toBe(
+      "Hallo\n\nHier  ist er"
+    );
+  });
+
+  it("still puts in the name when there is one", () => {
+    expect(
+      renderMessageWithoutLink({
+        message: "Hey {username} schau",
+        commenterName: "maya",
+        fallbackName: "",
+      })
+    ).toBe("Hey maya schau");
+  });
+});
+
+describe("offer links", () => {
+  it("points at the offer's redirect with the recipient token", () => {
+    const token = hashRecipientId("17841400000000001");
+
+    expect(buildOfferUrl("abc", token, "https://x.test")).toBe(
+      "https://x.test/o/abc?r=" + token
+    );
+  });
+
+  it("resolves the base like campaign links do", () => {
+    expect(buildOfferUrl("abc", undefined, "https://x.test/")).toBe(
+      "https://x.test/o/abc"
+    );
+
+    vi.stubEnv("NEXTAUTH_URL", "https://app.example.com/");
+    expect(buildOfferUrl("abc", "tok")).toBe(
+      "https://app.example.com/o/abc?r=tok"
+    );
+    expect(buildTrackedUrl("abc", undefined, "tok")).toBe(
+      "https://app.example.com/r/abc?r=tok"
     );
   });
 });

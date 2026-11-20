@@ -10,6 +10,7 @@ export type {
   InstagramMediaInsights,
   FollowerCountPoint,
   LinkButton,
+  CardMessage,
 } from "@/lib/meta/client";
 export * from "./context";
 export * from "./send-messages";
