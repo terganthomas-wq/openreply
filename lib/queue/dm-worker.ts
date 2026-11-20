@@ -356,14 +356,17 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     const alreadyPublicReplied = Boolean(existingLog?.publicReplySentAt);
     const needsDm = !alreadyDmd && !existingLog?.dmDeliveryUnconfirmed &&
       (existingLog?.attempts ?? 0) < MAX_COMMENT_SEND_ATTEMPTS;
+    // The public reply follows the DM, so it is owed only once the DM went out
+    // (or may have).
+    const dmWentOut = alreadyDmd || Boolean(existingLog?.dmDeliveryUnconfirmed);
 
     // Skip only when there is genuinely nothing left to do. A comment whose DM
-    // already sent but whose public reply never posted (e.g. it hit a rate
+    // already went out but whose public reply never posted (e.g. it hit a rate
     // limit) must still come back so the public reply can be retried.
     if (existingLog?.status === "SKIPPED_PLAN_LIMIT") continue;
     if (
       !needsDm &&
-      (alreadyPublicReplied || existingLog?.publicReplyDeliveryUnconfirmed || !automation.publicReplyEnabled)
+      (!dmWentOut || alreadyPublicReplied || existingLog?.publicReplyDeliveryUnconfirmed || !automation.publicReplyEnabled)
     ) {
       continue;
     }
@@ -443,22 +446,27 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       update: {},
     });
 
-    // Public reply leg — decoupled from the DM and posted first so a DM failure
-    // (e.g. a non-follower whose messaging is restricted) never suppresses it.
+    // Public reply leg. It is posted after the DM leg, and only when the DM went
+    // out or may have: a "check your DMs" reply under a comment whose DM was
+    // refused or skipped would promise a message that never comes. A DM that
+    // waits for a retry gets its public reply on the pass that sends it.
     // Idempotent across retries via publicReplySentAt.
-    const replyPool =
-      automation.publicReplyMessages.length > 0
-        ? automation.publicReplyMessages
-        : automation.publicReplyMessage
-          ? [automation.publicReplyMessage]
-          : [];
-    if (
-      automation.publicReplyEnabled &&
-      replyPool.length > 0 &&
-      !existingLog?.publicReplySentAt &&
-      !existingLog?.publicReplyDeliveryUnconfirmed &&
-      await claimCommentDelivery(automation.id, commentId, "public")
-    ) {
+    const postPublicReply = async (): Promise<void> => {
+      const replyPool =
+        automation.publicReplyMessages.length > 0
+          ? automation.publicReplyMessages
+          : automation.publicReplyMessage
+            ? [automation.publicReplyMessage]
+            : [];
+      if (
+        !automation.publicReplyEnabled ||
+        replyPool.length === 0 ||
+        existingLog?.publicReplySentAt ||
+        existingLog?.publicReplyDeliveryUnconfirmed ||
+        !(await claimCommentDelivery(automation.id, commentId, "public"))
+      ) {
+        return;
+      }
       try {
         const chosen = replyPool[Math.floor(Math.random() * replyPool.length)];
         const publicReply = renderMessageWithTracking({
@@ -495,11 +503,14 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           })
           .catch(() => {});
       }
-    }
+    };
 
-    // DM already sent on an earlier pass; the public reply retry above was all
-    // this run needed. Don't re-send the DM.
-    if (!needsDm) continue;
+    // DM already handled on an earlier pass: only the public reply can be
+    // left, and only if that DM went out. Don't re-send the DM.
+    if (!needsDm) {
+      if (dmWentOut) await postPublicReply();
+      continue;
+    }
 
     // Meta allows exactly ONE private reply per comment, ever — across every
     // campaign. When several campaigns match the same comment (duplicated
@@ -507,7 +518,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     // the first can deliver; the rest would fail with "The comment is invalid
     // for a private reply". Skip them explicitly instead of burning an API call
     // and logging a failure the user can do nothing about. The public reply
-    // above still goes out per campaign — only the DM leg is deduped.
+    // still goes out per campaign — only the DM leg is deduped.
     const privateReplyUsedBy = await prisma.dmLog.findFirst({
       where: {
         commentId,
@@ -527,6 +538,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           errorMessage: `Another campaign (${privateReplyUsedBy.automation?.name ?? "unknown"}) already sent the one private reply Instagram allows for this comment`,
         },
       });
+      await postPublicReply();
       continue;
     }
 
@@ -795,8 +807,20 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           dmDeliveryUnconfirmed: isDeliveryUnconfirmed(sendError),
         },
       });
+      // A DM that may have arrived still gets its public reply. This job is
+      // not retried (see processJob), so no later pass would post it.
+      if (delivered || isDeliveryUnconfirmed(sendError)) {
+        await postPublicReply().catch((replyError) =>
+          console.error(
+            "[DM Worker] Public comment reply failed:",
+            formatError(replyError)
+          )
+        );
+      }
       throw sendError;
     }
+
+    await postPublicReply();
   }
 }
 

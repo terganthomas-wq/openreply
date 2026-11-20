@@ -1762,7 +1762,15 @@ it("retains the public reply claim if sending succeeded but its log write failed
   const { sendCommentReply } = await import("@/lib/meta/client");
   vi.mocked(sendCommentReply).mockResolvedValue({ id: "public-reply" });
   mockPrisma.automation.findMany.mockResolvedValue([{ ...mockAutomation, publicReplyEnabled: true, publicReplyMessages: ["Sent!"] }]);
-  mockPrisma.dmLog.update.mockRejectedValueOnce(new Error("Lost database connection after public send"));
+  // Fail only the public reply's own log write, whichever write comes first.
+  let failed = false;
+  mockPrisma.dmLog.update.mockImplementation(async (args: { data?: Record<string, unknown> }) => {
+    if (!failed && args.data?.publicReplySentAt) {
+      failed = true;
+      throw new Error("Lost database connection after public send");
+    }
+    return {};
+  });
   const process = getProcessor();
   await process(createMockJob());
   expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ publicReplyDeliveryUnconfirmed: true }) }));
@@ -1770,4 +1778,89 @@ it("retains the public reply claim if sending succeeded but its log write failed
   await process({ ...createMockJob(), id: "next-poll" });
   expect(sendCommentReply).toHaveBeenCalledTimes(1);
   expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+});
+
+// The public reply ("check your DMs") is posted after the DM leg, and only when
+// the DM went out, so it never promises a message that Meta refused.
+describe("DM Worker — public reply after the DM", () => {
+  const withPublicReply = {
+    ...mockAutomation,
+    publicReplyEnabled: true,
+    publicReplyMessages: ["Check your DMs"],
+  };
+
+  it("posts the public reply only after the DM went out", async () => {
+    const { sendCommentReply } = await import("@/lib/meta/client");
+    vi.mocked(sendCommentReply).mockResolvedValue({ id: "public-reply" });
+    mockPrisma.automation.findMany.mockResolvedValue([withPublicReply]);
+
+    await getProcessor()(createMockJob());
+
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+    expect(sendCommentReply).toHaveBeenCalledTimes(1);
+    expect(mockSendPrivateReply.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(sendCommentReply).mock.invocationCallOrder[0]
+    );
+  });
+
+  it("posts the follow-gate prompt before the public reply", async () => {
+    const { sendCommentReply } = await import("@/lib/meta/client");
+    vi.mocked(sendCommentReply).mockResolvedValue({ id: "public-reply" });
+    mockGetUserFollowStatus.mockResolvedValue(null);
+    mockPrisma.automation.findMany.mockResolvedValue([
+      { ...withPublicReply, requireFollow: true },
+    ]);
+
+    await getProcessor()(createMockJob());
+
+    expect(mockSendPrivateReplyWithButton).toHaveBeenCalledTimes(1);
+    expect(mockSendPrivateReplyWithButton.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(sendCommentReply).mock.invocationCallOrder[0]
+    );
+  });
+
+  it("does not post the public reply when Meta refuses the DM", async () => {
+    const { sendCommentReply, MetaApiError } = await import("@/lib/meta/client");
+    mockPrisma.automation.findMany.mockResolvedValue([withPublicReply]);
+    mockSendPrivateReply.mockRejectedValue(
+      new MetaApiError(100, 2534025, undefined, "The comment is invalid for a private reply")
+    );
+
+    await expect(getProcessor()(createMockJob())).rejects.toThrow(
+      "The comment is invalid for a private reply"
+    );
+    expect(sendCommentReply).not.toHaveBeenCalled();
+  });
+
+  it("posts a missing public reply on a later pass once the DM went out", async () => {
+    const { sendCommentReply } = await import("@/lib/meta/client");
+    vi.mocked(sendCommentReply).mockResolvedValue({ id: "public-reply" });
+    mockPrisma.automation.findMany.mockResolvedValue([withPublicReply]);
+    mockPrisma.dmLog.findUnique.mockResolvedValue({
+      status: "SENT",
+      publicReplySentAt: null,
+      publicReplyDeliveryUnconfirmed: false,
+    });
+
+    await getProcessor()(createMockJob());
+
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(sendCommentReply).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not post the public reply on a later pass after the DM failed for good", async () => {
+    const { sendCommentReply } = await import("@/lib/meta/client");
+    mockPrisma.automation.findMany.mockResolvedValue([withPublicReply]);
+    mockPrisma.dmLog.findUnique.mockResolvedValue({
+      status: "FAILED",
+      attempts: 3,
+      publicReplySentAt: null,
+      publicReplyDeliveryUnconfirmed: false,
+    });
+
+    await getProcessor()(createMockJob());
+
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(sendCommentReply).not.toHaveBeenCalled();
+  });
 });
