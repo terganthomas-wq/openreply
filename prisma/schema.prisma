@@ -459,6 +459,11 @@ model ContactOffer {
   offerId        String
   /// Campaign whose link delivery started it; SetNull keeps history (R16).
   automationId   String?
+  /// The trigger behind that delivery: the campaign plus the comment id, button-tap
+  /// mid or DM mid. A campaign starts the next offer on every new trigger, so this
+  /// key, not the campaign, keeps a redelivered webhook, a retried job or a repeated
+  /// tap with the same mid from starting a second offer.
+  startKey       String?
   offeredAt      DateTime  @default(now())
   /// The last offer message (with the button) went out; anchors the reminder.
   pitchSentAt    DateTime?
@@ -482,7 +487,8 @@ model ContactOffer {
   automation Automation? @relation(fields: [automationId], references: [id], onDelete: SetNull)
 
   @@unique([contactId, offerId])      // R5: never offer twice
-  @@unique([contactId, automationId]) // one start per contact and campaign (NULLs never collide)
+  @@unique([contactId, startKey])     // one start per trigger (NULLs never collide)
+  @@index([contactId, automationId])  // not unique: every new trigger may start an offer
   @@index([workspaceId, offerId])     // funnel groupBy
   @@index([automationId])             // SetNull on campaign delete
 }

@@ -79,6 +79,7 @@ CREATE TABLE "ContactOffer" (
     "contactId" TEXT NOT NULL,
     "offerId" TEXT NOT NULL,
     "automationId" TEXT,
+    "startKey" TEXT,
     "offeredAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "pitchSentAt" TIMESTAMP(3),
     "interestedAt" TIMESTAMP(3),
@@ -115,6 +116,9 @@ CREATE UNIQUE INDEX "Offer_linkSlug_key" ON "Offer"("linkSlug");
 CREATE INDEX "Offer_workspaceId_position_idx" ON "Offer"("workspaceId", "position");
 
 -- CreateIndex
+CREATE INDEX "ContactOffer_contactId_automationId_idx" ON "ContactOffer"("contactId", "automationId");
+
+-- CreateIndex
 CREATE INDEX "ContactOffer_workspaceId_offerId_idx" ON "ContactOffer"("workspaceId", "offerId");
 
 -- CreateIndex
@@ -124,7 +128,7 @@ CREATE INDEX "ContactOffer_automationId_idx" ON "ContactOffer"("automationId");
 CREATE UNIQUE INDEX "ContactOffer_contactId_offerId_key" ON "ContactOffer"("contactId", "offerId");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "ContactOffer_contactId_automationId_key" ON "ContactOffer"("contactId", "automationId");
+CREATE UNIQUE INDEX "ContactOffer_contactId_startKey_key" ON "ContactOffer"("contactId", "startKey");
 
 -- CreateIndex
 CREATE INDEX "DmLog_commenterId_idx" ON "DmLog"("commenterId");

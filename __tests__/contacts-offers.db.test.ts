@@ -1,9 +1,9 @@
 /**
  * Contacts, tags and offers, tested against a real Postgres.
  *
- * "Never offer twice", "one start per contact and campaign" and the cleanup
- * on disconnect are enforced by unique indexes and foreign keys, which no
- * mock reproduces, so this suite needs a database and is skipped without one
+ * "Never offer twice", "one offer start per trigger" and the cleanup on
+ * disconnect are enforced by unique indexes and foreign keys, which no mock
+ * reproduces, so this suite needs a database and is skipped without one
  * (TEST_DATABASE_URL, as in tracked-link-order.db.test.ts).
  *
  * Each run builds the schema from prisma/migrations inside its own throwaway
@@ -56,8 +56,13 @@ function createOffer(id: string, options: { workspaceId?: string; linkSlug?: str
   });
 }
 
-function createContactOffer(contactId: string, offerId: string, automationId: string | null) {
-  return db.contactOffer.create({ data: { workspaceId, contactId, offerId, automationId } });
+function createContactOffer(
+  contactId: string,
+  offerId: string,
+  automationId: string | null,
+  startKey?: string,
+) {
+  return db.contactOffer.create({ data: { workspaceId, contactId, offerId, automationId, startKey } });
 }
 
 function createCampaign(id: string, instagramAccountId = "account") {
@@ -118,7 +123,7 @@ describe.skipIf(!databaseUrl)("contacts, tags and offers on a real Postgres", ()
       },
     });
     await createCampaign("campaign_b");
-    for (const id of ["offer_a", "offer_b"]) await createOffer(id);
+    for (const id of ["offer_a", "offer_b", "offer_c"]) await createOffer(id);
   }, 60_000);
 
   afterAll(async () => {
@@ -202,14 +207,30 @@ describe.skipIf(!databaseUrl)("contacts, tags and offers on a real Postgres", ()
     );
   });
 
-  it("starts at most one offer per contact and campaign", async () => {
+  it("starts the next offer on every new trigger of a campaign, but once per trigger", async () => {
     await createContact("contact_campaign", "igsid_campaign");
-    await createContactOffer("contact_campaign", "offer_a", "campaign");
-    expect(await uniqueViolation(createContactOffer("contact_campaign", "offer_b", "campaign"))).toContain(
-      "ContactOffer_contactId_automationId_key",
+    // A comment and, later, a new button tap of the same campaign each start
+    // the next offer this person has not had yet.
+    await createContactOffer("contact_campaign", "offer_a", "campaign", "comment_1");
+    await createContactOffer("contact_campaign", "offer_b", "campaign", "tap_mid_2");
+    expect(
+      await db.contactOffer.count({ where: { contactId: "contact_campaign", automationId: "campaign" } }),
+    ).toBe(2);
+    // A redelivered webhook or a retried job carries the same trigger and
+    // starts nothing, although an offer is still left for this person.
+    expect(
+      await uniqueViolation(createContactOffer("contact_campaign", "offer_c", "campaign", "tap_mid_2")),
+    ).toContain("ContactOffer_contactId_startKey_key");
+    // A new trigger still never repeats an offer.
+    expect(
+      await uniqueViolation(createContactOffer("contact_campaign", "offer_a", "campaign", "tap_mid_3")),
+    ).toContain("ContactOffer_contactId_offerId_key");
+    // Lookups by contact and campaign keep an index, just not a unique one.
+    const { rows } = await sql.query<{ indexdef: string }>(
+      "SELECT indexdef FROM pg_indexes WHERE schemaname = $1 AND indexname = $2",
+      [schema, "ContactOffer_contactId_automationId_idx"],
     );
-    // Another campaign starts the next offer for the same person.
-    await createContactOffer("contact_campaign", "offer_b", "campaign_b");
+    expect(rows.map((r) => r.indexdef.startsWith("CREATE INDEX"))).toEqual([true]);
   });
 
   it("lets offer rows without a campaign coexist for one contact", async () => {
@@ -225,9 +246,9 @@ describe.skipIf(!databaseUrl)("contacts, tags and offers on a real Postgres", ()
     await createCampaign("campaign_deleted");
     await createContact("contact_history", "igsid_history");
     await db.contactTag.create({ data: { workspaceId, contactId: "contact_history", tag: "Guide sent" } });
-    // An earlier row already lost its campaign, so the delete adds a second NULL.
-    await createContactOffer("contact_history", "offer_a", null);
-    await createContactOffer("contact_history", "offer_b", "campaign_deleted");
+    // Two triggers of the campaign started two offers.
+    await createContactOffer("contact_history", "offer_a", "campaign_deleted", "comment_1");
+    await createContactOffer("contact_history", "offer_b", "campaign_deleted", "tap_mid_2");
 
     await db.automation.delete({ where: { id: "campaign_deleted" } });
 
