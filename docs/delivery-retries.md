@@ -89,5 +89,9 @@ or DM, so its retries still land inside the window. A tap on the offer's
 button removes the waiting reminder. Until the card is out, every tap on that
 button queues the confirmations again, which the job ids and claims keep from
 sending anything twice; after it, a later tap gets the card once more, once per
-tap. Offer messages are never written to DmLog, and no offer job requires its
-campaign to be active: pausing a campaign does not cut off running offers.
+tap. The reminder carries the link and counts as sent (`sentVia` REMINDER), but
+it is not the card: a tap after the reminder still gets the confirmations and
+then the card, which replaces REMINDER with the form it went out in and keeps
+the time the link was first sent. Offer messages are never written to DmLog,
+and no offer job requires its campaign to be active: pausing a campaign does
+not cut off running offers.

@@ -1163,6 +1163,15 @@ describe("offer messages", () => {
   });
 });
 
+// The reminder went out, a day after the offer. It carried the link, so the
+// row counts as sent, but the card has not gone out.
+const REMINDED = {
+  pitchSentAt: new Date(NOW - 23 * HOUR),
+  reminderSentAt: new Date(NOW - HOUR),
+  sentAt: new Date(NOW - HOUR),
+  sentVia: "REMINDER",
+};
+
 describe("the tap on the button", () => {
   const pitched = (row: Record<string, unknown> = {}, offer: Partial<typeof OFFER> = {}) =>
     contactOffer({ pitchSentAt: new Date(NOW - 10 * MINUTE), ...row }, offer);
@@ -1242,13 +1251,17 @@ describe("the tap on the button", () => {
     expect(sends()).toBe(0);
   });
 
-  it("does nothing for the first tap once more after its card went out", async () => {
+  it.each([
+    { label: "as a card", row: { sentVia: "CARD" } },
+    { label: "in a form not known", row: { sentVia: null } },
+    { label: "after the reminder", row: { ...REMINDED, sentVia: "CARD" } },
+  ])("does nothing for the first tap once more after its card went out $label", async ({ row }) => {
     mockPrisma.contactOffer.findUnique.mockResolvedValue(
       pitched({
         interestedAt: new Date(NOW - 5 * MINUTE),
         interestedMid: "mid_yes",
         sentAt: new Date(NOW - 4 * MINUTE),
-        sentVia: "CARD",
+        ...row,
       })
     );
     mockPrisma.contactOffer.updateMany.mockResolvedValue({ count: 0 });
@@ -1260,9 +1273,14 @@ describe("the tap on the button", () => {
     expect(mockPrisma.contactTag.createMany).not.toHaveBeenCalled();
   });
 
-  it("queues the confirmations again for a later tap before the card is out", async () => {
+  it.each([
+    { label: "while nothing was sent", row: {} },
+    // The reminder carried the link, but not as the card.
+    { label: "after the reminder", row: REMINDED },
+  ])("queues the confirmations again for a later tap before the card is out, $label", async ({ row }) => {
     mockPrisma.contactOffer.findUnique.mockResolvedValue(
       pitched({
+        ...row,
         interestedAt: new Date(NOW - 5 * MINUTE),
         interestedMid: "mid_yes",
         stoppedAt: new Date(NOW - 4 * MINUTE),
@@ -1273,8 +1291,9 @@ describe("the tap on the button", () => {
 
     await processOfferTap(tapJob({ mid: "mid_later" }));
 
+    // The stop is lifted only as long as the card is not out.
     expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledWith({
-      where: { id: "co1", sentAt: null },
+      where: { id: "co1", OR: [{ sentAt: null }, { sentVia: "REMINDER" }] },
       data: { stoppedAt: null, stopReason: null },
     });
     expect(mockQueueAdd).toHaveBeenCalledWith(
@@ -1283,14 +1302,40 @@ describe("the tap on the button", () => {
     expect(sends()).toBe(0);
   });
 
+  // A second tap while the first one's confirmations still wait: their job id
+  // swallows the add, so no card overtakes "Alles klar!".
+  it("sends no card ahead of the confirmations for a quick second tap after the reminder", async () => {
+    mockPrisma.contactOffer.findUnique.mockResolvedValue(
+      pitched({
+        ...REMINDED,
+        interestedAt: new Date(NOW - 2000),
+        interestedMid: "mid_yes",
+      })
+    );
+    mockPrisma.contactOffer.updateMany.mockResolvedValue({ count: 0 });
+
+    await processOfferTap(tapJob({ mid: "mid_second" }));
+
+    expect(sends()).toBe(0);
+    expect(mockPrisma.postbackDelivery.create).not.toHaveBeenCalled();
+    expect(mockQueueAdd).toHaveBeenCalledTimes(1);
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      ...next("confirm", { step: 0 }, { jobId: "offer_co1_confirm_0" })
+    );
+  });
+
   // The first attempt recorded the interest, then Redis refused the job: the
   // retry still has to send the confirmations and the card.
-  it("finishes a first tap whose job failed before it queued the confirmations", async () => {
+  it.each([
+    { label: "while nothing was sent", row: {} },
+    { label: "after the reminder", row: REMINDED },
+  ])("finishes a first tap whose job failed before it queued the confirmations, $label", async ({ row }) => {
+    mockPrisma.contactOffer.findUnique.mockResolvedValue(pitched(row));
     mockQueueAdd.mockRejectedValueOnce(new Error("Redis connection lost"));
     await expect(processOfferTap(tapJob())).rejects.toThrow("Redis connection lost");
 
     mockPrisma.contactOffer.findUnique.mockResolvedValue(
-      pitched({ interestedAt: new Date(NOW), interestedMid: "mid_yes" })
+      pitched({ ...row, interestedAt: new Date(NOW), interestedMid: "mid_yes" })
     );
     mockPrisma.contactOffer.updateMany.mockResolvedValue({ count: 0 });
     await processOfferTap(tapJob({}, { attemptsMade: 1 }));
@@ -1464,6 +1509,31 @@ describe("confirmations and card", () => {
       where: { id: "co1", sentAt: null },
       data: { sentAt: new Date(NOW) },
     });
+    expect(mockPrisma.contactTag.createMany).toHaveBeenCalledWith(tagWrite("Guide gesendet"));
+  });
+
+  // The row counts as sent since the reminder and keeps that time; from the
+  // card on it says how the card went out, so a later tap knows it is out.
+  it.each([
+    { label: "sent by this run", claimed: false, via: "CARD" },
+    { label: "an earlier run claimed", claimed: true, via: null },
+  ])("records a card after the reminder, $label", async ({ claimed, via }) => {
+    mockPrisma.contactOffer.findFirst.mockResolvedValue(interested(REMINDED));
+    if (claimed) mockPrisma.postbackDelivery.create.mockRejectedValue({ code: "P2002" });
+    mockPrisma.contactOffer.updateMany.mockResolvedValueOnce({ count: 0 });
+
+    await processOffer(offerJob({ phase: "card", contactOfferId: "co1" }));
+
+    expect(mockSendDirectMessageWithCard).toHaveBeenCalledTimes(claimed ? 0 : 1);
+    expect(mockPrisma.contactOffer.updateMany.mock.calls).toEqual([
+      [
+        {
+          where: { id: "co1", sentAt: null },
+          data: { sentAt: new Date(NOW), ...(via ? { sentVia: via } : {}) },
+        },
+      ],
+      [{ where: { id: "co1", sentVia: "REMINDER" }, data: { sentVia: via } }],
+    ]);
     expect(mockPrisma.contactTag.createMany).toHaveBeenCalledWith(tagWrite("Guide gesendet"));
   });
 

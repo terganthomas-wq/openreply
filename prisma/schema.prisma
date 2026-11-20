@@ -470,9 +470,11 @@ model ContactOffer {
   interestedAt   DateTime?
   /// mid of the tap that set interestedAt, to recognise a redelivered first tap.
   interestedMid  String?
-  /// Card (or its fallback) or the reminder was delivered.
+  /// Card (or its fallback) or the reminder was delivered. A card after the
+  /// reminder keeps this time.
   sentAt         DateTime?
-  /// CARD | BUTTON | TEXT | REMINDER
+  /// CARD | BUTTON | TEXT, null for a card in a form not known. REMINDER while only the
+  /// reminder went out; the card replaces it, so later taps know the card is out.
   sentVia        String?
   reminderSentAt DateTime?
   clickedAt      DateTime?

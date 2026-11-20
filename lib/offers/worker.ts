@@ -118,6 +118,21 @@ type Attempts = Pick<Job, "attemptsMade" | "opts">;
 // A reminder that could only go out within a minute is not worth a job.
 const MIN_REMINDER_DELAY_MS = 60_000;
 
+// The reminder carries the offer's link, so it counts as sent (sentAt, the
+// funnel's "Sent"), but it is not the card: until the card goes out as well,
+// sentVia says so.
+const SENT_BY_REMINDER = "REMINDER";
+
+// Rows whose card has not gone out yet, whether or not the reminder has.
+const CARD_NOT_OUT = {
+  OR: [{ sentAt: null }, { sentVia: SENT_BY_REMINDER }],
+} satisfies Prisma.ContactOfferWhereInput;
+
+/** Whether the card (or its fallback) went out, not only the reminder. */
+function cardIsOut(co: Pick<LoadedContactOffer, "sentAt" | "sentVia">): boolean {
+  return co.sentAt !== null && co.sentVia !== SENT_BY_REMINDER;
+}
+
 /** Run one offer job (OFFER_JOB_NAME). */
 export async function processOffer(job: Job<ProcessOfferJob>): Promise<void> {
   if (job.data.phase === "start") return startOffer(job);
@@ -454,7 +469,8 @@ export async function processOfferTap(
   // anything; a redelivered webhook; a second tap. Job ids and message
   // claims keep that from sending anything twice. Tag and reminder removal
   // are idempotent, so a retried tap finishes what its first attempt began.
-  if (first.count === 1 || !co.sentAt) {
+  // A reminder that went out first changes none of this: it is not the card.
+  if (first.count === 1 || !cardIsOut(co)) {
     await addContactTags(co.workspaceId, co.contactId, [
       co.offer.tagInterested,
     ]);
@@ -463,7 +479,7 @@ export async function processOfferTap(
       await queueConfirmations(co);
     } else {
       await prisma.contactOffer.updateMany({
-        where: { id: co.id, sentAt: null },
+        where: { id: co.id, ...CARD_NOT_OUT },
         data: { stoppedAt: null, stopReason: null },
       });
       await enqueueOfferJob(nextJob(co, { phase: "confirm", step: 0 }), {
@@ -558,13 +574,22 @@ async function deliverCard(
   // How the card went out is known only when this run sent it. One an
   // earlier run claimed, or one with an unknown outcome, counts as sent all
   // the same.
-  await prisma.contactOffer.updateMany({
+  const firstSend = await prisma.contactOffer.updateMany({
     where: { id: co.id, sentAt: null },
     data: {
       sentAt: new Date(),
       ...(delivered.via ? { sentVia: delivered.via } : {}),
     },
   });
+  // After the reminder the row counts as sent already, and keeps that time.
+  // It records the card now (null: in a form not known), so later taps know
+  // the card is out and get it once more.
+  if (firstSend.count === 0) {
+    await prisma.contactOffer.updateMany({
+      where: { id: co.id, sentVia: SENT_BY_REMINDER },
+      data: { sentVia: delivered.via },
+    });
+  }
   await addContactTags(co.workspaceId, co.contactId, [offer.tagSent]);
 }
 
@@ -634,7 +659,7 @@ async function sendReminder(
   });
   await prisma.contactOffer.updateMany({
     where: { id: co.id, sentAt: null },
-    data: { sentAt: now, sentVia: "REMINDER" },
+    data: { sentAt: now, sentVia: SENT_BY_REMINDER },
   });
   await addContactTags(co.workspaceId, co.contactId, [offer.tagSent]);
 }
