@@ -84,8 +84,16 @@ export interface ProcessMessageJob {
 
 // One step of a lead-magnet offer (lib/offers/worker.ts). "start" picks the
 // offer after a delivered link and creates its ContactOffer row; every later
-// phase sends one message for that row and queues the next one.
-export type OfferPhase = "start" | "offer" | "confirm" | "card" | "reminder";
+// phase sends one message for that row and queues the next one. "signup" is
+// the chat confirmation after the landing page reported the sign-up
+// (POST /api/offers/signup, which the web app queues).
+export type OfferPhase =
+  | "start"
+  | "offer"
+  | "confirm"
+  | "card"
+  | "reminder"
+  | "signup";
 
 export interface ProcessOfferJob {
   workspaceId: string;

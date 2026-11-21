@@ -16,8 +16,9 @@ reconnect everyone starts fresh and can get every offer again.
 
 A tag records a step and the time it was first set; a repeat keeps that time.
 Campaigns add their delivery tag (**After the link** in the campaign editor)
-when their link reaches someone, and every offer adds its four tags as people
-go through it: offered, interested, sent, clicked. Tag names are yours and
+when their link reaches someone, and every offer adds its tags as people go
+through it: offered, interested, sent, clicked, and signed up once its
+landing page reports the sign-up (`docs/offers.md`). Tag names are yours and
 are matched exactly. The campaign editor suggests the tags that exist, so one
 name is not spelled two ways.
 
@@ -32,9 +33,10 @@ filtered by that stage's tag.
 A contact's page shows their account and id, when they were first and last
 seen and when they last tapped a button or sent a DM (Instagram's 24-hour
 messaging window counts from there), their tags with dates, and for every
-offer how far they got. Below, one history, newest first: their comments,
-button taps and DMs with the DM log's status, every offer stage, every tag
-and their clicks on campaign links. It shows the latest 100 DM log entries and
+offer how far they got, with the sign-up their landing page reported and its
+confirmation in the chat where there are some. Below, one history, newest
+first: their comments, button taps and DMs with the DM log's status, every
+offer stage, every tag and their clicks on campaign links. It shows the latest 100 DM log entries and
 the latest 50 clicks. Entries of a deleted campaign say so.
 
 ## Deleting a contact (data deletion requests)
@@ -42,7 +44,9 @@ the latest 50 clicks. Entries of a deleted campaign say so.
 Owners and admins can delete a contact on its page, for example when the
 person asks for their data to be deleted. In one transaction:
 
-- the contact goes, and with it their tags and offer history;
+- the contact goes, and with it their tags and offer history, sign-ups
+  included. The personal codes their offer links carried to a landing page
+  (`ig=`) go with the offer rows: a later report of such a code answers 404;
 - their clicks on campaign links are deleted;
 - their DM log entries stay, anonymised: no Instagram id, no name and no
   comment or DM text. The campaigns' counts keep them, and a comment that

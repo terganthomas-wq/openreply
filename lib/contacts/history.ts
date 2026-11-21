@@ -1,7 +1,8 @@
 /**
  * One contact's history as a single timeline (R10): their comments, button
- * taps and DMs as the DM log has them, every stage of the offers they got,
- * the tags they got and their clicks on campaign links, newest first.
+ * taps and DMs as the DM log has them, every stage of the offers they got
+ * (a sign-up their landing page reported included), the tags they got and
+ * their clicks on campaign links, newest first.
  *
  * Pure and client-safe: the Contacts API builds it from database rows, and
  * timestamps may be Dates or ISO strings. Contacts outlive campaigns (R16):
@@ -40,6 +41,10 @@ export interface HistoryOffer {
   sentVia: string | null;
   reminderSentAt: Time | null;
   clickedAt: Time | null;
+  /** The landing page reported the sign-up. */
+  signedUpAt: Time | null;
+  /** The confirmation of the sign-up went out in the chat. */
+  signupMessageSentAt: Time | null;
   stoppedAt: Time | null;
   stopReason: string | null;
   offer: { name: string; archivedAt: Time | null };
@@ -70,6 +75,8 @@ export type OfferStage =
   | "sent"
   | "reminded"
   | "clicked"
+  | "signedUp"
+  | "signupConfirmed"
   | "stopped";
 
 /** Where an entry came from. A deleted campaign has neither id nor name. */
@@ -106,8 +113,9 @@ export type ContactTimelineEvent =
 
 /**
  * The order of things that happen in the same instant, as the flow runs
- * them: the comment or DM, the tap, the link click, the offer's stages, and
- * the tag that records a step. Newest first, the later one comes first.
+ * them: the comment or DM, the tap, the link click, the offer's stages (the
+ * sign-up on the landing page after the click, its confirmation after it),
+ * and the tag that records a step. Newest first, the later one comes first.
  */
 const FLOW_RANK: Record<MessageKind | OfferStage | "click" | "tag", number> = {
   comment: 0,
@@ -120,8 +128,10 @@ const FLOW_RANK: Record<MessageKind | OfferStage | "click" | "tag", number> = {
   sent: 6,
   reminded: 7,
   clicked: 8,
-  stopped: 9,
-  tag: 10,
+  signedUp: 9,
+  signupConfirmed: 10,
+  stopped: 11,
+  tag: 12,
 };
 
 /** What kind of DmLog row this is, read from its synthetic comment id. */
@@ -229,6 +239,8 @@ export function buildContactTimeline({
     stage("sent", offerSentAt(row), { sentVia: row.sentVia });
     stage("reminded", row.reminderSentAt);
     stage("clicked", row.clickedAt);
+    stage("signedUp", row.signedUpAt);
+    stage("signupConfirmed", row.signupMessageSentAt);
     stage("stopped", row.stoppedAt, { stopReason: row.stopReason });
   }
 

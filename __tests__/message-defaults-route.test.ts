@@ -60,6 +60,16 @@ const saved: MessageDefaults = {
   offer: { ...german.offer, cardButtonLabel: "Holen" },
 };
 
+// `saved` as stored before the sign-up message and its tag template existed.
+function savedBeforeSignups(): unknown {
+  const stored = structuredClone(saved) as unknown as {
+    offer: { signupMessage?: string; tagTemplates: { signedUp?: string } };
+  };
+  delete stored.offer.signupMessage;
+  delete stored.offer.tagTemplates.signedUp;
+  return stored;
+}
+
 function signIn(role: "OWNER" | "ADMIN" | "MEMBER", messageDefaults: unknown = null) {
   mockContext.mockResolvedValue({
     userId: "user_1",
@@ -219,6 +229,33 @@ describe("GET", () => {
 
     expect((await (await GET()).json()).data.defaults).toEqual(seededEarlier);
     expectNoWrites();
+  });
+
+  // Saved before the sign-up message and its tag template existed: still
+  // read, with both from the reader's language, so a German workspace's new
+  // offers get the German confirmation.
+  it("reads defaults saved before the sign-up feedback, with its texts in the reader's language", async () => {
+    signIn("OWNER", savedBeforeSignups());
+
+    expect((await (await GET()).json()).data.defaults).toEqual(saved);
+    expect(mockI18n).toHaveBeenCalled();
+    expectNoWrites();
+
+    mockI18n.mockResolvedValue({ locale: "en" });
+    const english = (await (await GET()).json()).data.defaults;
+    expect(english.offer.signupMessage).toBe("");
+    expect(english.offer.tagTemplates.signedUp).toBe("{name} signed up");
+    expect(english.campaign).toEqual(saved.campaign);
+  });
+
+  it("stores such defaults complete with the next save", async () => {
+    signIn("ADMIN", savedBeforeSignups());
+
+    const response = await put({ campaign: { dmMessage: "Hier" } });
+
+    expect(response.status).toBe(200);
+    expect(savedData().offer).toEqual(saved.offer);
+    expect(savedData().offer.signupMessage).toBe(german.offer.signupMessage);
   });
 
   it("returns what a concurrent save wrote when the seed found the column taken", async () => {

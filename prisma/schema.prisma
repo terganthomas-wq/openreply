@@ -446,10 +446,21 @@ model Offer {
   reminderEnabled           Boolean   @default(true)
   reminderDelayHours        Int       @default(23)
   reminderMessage           String?
+  /// Sign-up feedback from the landing page: the card's and the reminder's link
+  /// arrive there with ig=<ContactOffer.signupToken>, and the page reports the
+  /// sign-up back (POST /api/offers/signup). Off: the link stays as typed.
+  signupTrackingEnabled     Boolean   @default(false)
+  /// Sent in the chat after a reported sign-up, while the window is open.
+  /// Null: no message, only the tag.
+  signupMessage             String?
   tagOffered                String
   tagInterested             String
   tagSent                   String
   tagClicked                String
+  /// Added when the landing page reports the sign-up. The editor and the API
+  /// always set it; the empty default only covers rows the previous app writes
+  /// while a deployment runs (an empty tag is never written to a contact).
+  tagSignedUp               String    @default("")
   createdAt                 DateTime  @default(now())
   updatedAt                 DateTime  @updatedAt
 
@@ -493,6 +504,14 @@ model ContactOffer {
   stoppedAt      DateTime?
   /// WINDOW_CLOSED | REJECTED | RATE_LIMITED | PLAN_LIMIT | OFFER_ARCHIVED | ACCOUNT_UNAVAILABLE
   stopReason     String?
+  /// The personal code the landing page gets as ig= (lib/offers/signup-token.ts):
+  /// random, 144 bits, URL-safe. Created on the first click while the offer
+  /// reports sign-ups; it goes with the row, and so with the contact.
+  signupToken         String?   @unique
+  /// The landing page reported the sign-up (and the tag was added).
+  signedUpAt          DateTime?
+  /// The chat confirmation of the sign-up went out (or may have).
+  signupMessageSentAt DateTime?
 
   workspace  Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   contact    Contact     @relation(fields: [contactId], references: [id], onDelete: Cascade)

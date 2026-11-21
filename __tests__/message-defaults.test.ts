@@ -4,6 +4,7 @@ import {
   builtInMessageDefaults,
   EMPTY_MESSAGE_DEFAULTS,
   isMessageDefaultsSection,
+  lacksLaterDefaults,
   mergeMessageDefaults,
   messageDefaultsSchema,
   messageDefaultsUpdateSchema,
@@ -145,11 +146,15 @@ describe("the built-in German defaults", () => {
       reminderDelayHours: 23,
       reminderMessage:
         "Hey, nur kurz zur Info: Der Guide ist nicht ewig kostenlos, aber du kannst ihn dir hier noch holen 👇",
+      // The chat confirmation after a reported sign-up, naming no product.
+      signupMessage:
+        "Danke fürs Eintragen! Ich habe dir gerade alles per E-Mail geschickt 📩",
       tagTemplates: {
         offered: "{name} angeboten",
         interested: "{name} Interesse",
         sent: "[LM] {name} gesendet",
         clicked: "{name} geklickt",
+        signedUp: "{name} eingetragen",
       },
     });
   });
@@ -181,11 +186,13 @@ describe("EMPTY_MESSAGE_DEFAULTS", () => {
     // New campaigns get the filter from the campaign API anyway.
     expect(campaign.ignoreQuestionComments).toBe(true);
     expect(offer.reminderDelayHours).toBe(23);
+    expect(offer.signupMessage).toBe("");
     expect(offer.tagTemplates).toEqual({
       offered: "{name} offered",
       interested: "{name} interested",
       sent: "{name} sent",
       clicked: "{name} clicked",
+      signedUp: "{name} signed up",
     });
   });
 });
@@ -275,6 +282,88 @@ describe("parseMessageDefaults", () => {
     expect(parseMessageDefaults({})).toBeNull();
     expect(parseMessageDefaults({ ...german, version: 2 })).toBeNull();
     expect(parseMessageDefaults({ ...german, campaign: { ...german.campaign, linkButtonLabel: LABEL_21_UNITS } })).toBeNull();
+  });
+});
+
+// Workspaces saved their defaults before the sign-up message and its tag
+// template existed. Those defaults must keep reading, or every editor would
+// fall back to the built-in set and hide what the workspace saved.
+describe("defaults saved before the sign-up feedback", () => {
+  function savedBefore(): unknown {
+    const saved = structuredClone(german) as unknown as {
+      campaign: { dmMessage: string };
+      offer: { cardButtonLabel: string; signupMessage?: string; tagTemplates: { signedUp?: string } };
+    };
+    delete saved.offer.signupMessage;
+    delete saved.offer.tagTemplates.signedUp;
+    saved.campaign.dmMessage = "Hier ist dein Link 👇";
+    saved.offer.cardButtonLabel = "Holen";
+    return saved;
+  }
+
+  it("still read, with the sign-up fields from the fill", () => {
+    const parsed = parseMessageDefaults(savedBefore(), german);
+
+    expect(parsed).not.toBeNull();
+    // What the workspace saved stays.
+    expect(parsed!.campaign.dmMessage).toBe("Hier ist dein Link 👇");
+    expect(parsed!.offer.cardButtonLabel).toBe("Holen");
+    // What it could not have saved comes from the fill: the German set here.
+    expect(parsed!.offer.signupMessage).toBe(german.offer.signupMessage);
+    expect(parsed!.offer.tagTemplates).toEqual({ ...german.offer.tagTemplates });
+    // Complete now: the strict schema takes the result.
+    expect(messageDefaultsSchema.safeParse(parsed).success).toBe(true);
+  });
+
+  it("fill from the empty defaults when no set is given", () => {
+    const parsed = parseMessageDefaults(savedBefore());
+
+    expect(parsed!.offer.signupMessage).toBe("");
+    expect(parsed!.offer.tagTemplates.signedUp).toBe("{name} signed up");
+  });
+
+  it("keep what they hold of the new fields", () => {
+    const own = {
+      ...german,
+      offer: {
+        ...german.offer,
+        signupMessage: "",
+        tagTemplates: { ...german.offer.tagTemplates, signedUp: "[LM] {name} Newsletter" },
+      },
+    };
+
+    expect(parseMessageDefaults(own, EMPTY_MESSAGE_DEFAULTS)).toEqual(own);
+  });
+
+  it("are told apart from complete ones", () => {
+    expect(lacksLaterDefaults(savedBefore())).toBe(true);
+    expect(lacksLaterDefaults(german)).toBe(false);
+    expect(lacksLaterDefaults(EMPTY_MESSAGE_DEFAULTS)).toBe(false);
+    // Nothing saved at all needs no fill.
+    expect(lacksLaterDefaults(null)).toBe(false);
+    expect(lacksLaterDefaults({ version: 1 })).toBe(false);
+  });
+
+  it("are still checked as strictly as before otherwise", () => {
+    const broken = savedBefore() as { offer: { offerDelaysSeconds: number[] } };
+    broken.offer.offerDelaysSeconds = [1];
+    expect(parseMessageDefaults(broken, german)).toBeNull();
+    // An empty sign-up tag template is no template.
+    const emptyTemplate = {
+      ...german,
+      offer: { ...german.offer, tagTemplates: { ...german.offer.tagTemplates, signedUp: " " } },
+    };
+    expect(parseMessageDefaults(emptyTemplate)).toBeNull();
+  });
+
+  it("hold the sign-up message to the 1000 characters of a message sent alone", () => {
+    const withMessage = (signupMessage: string) => ({
+      ...german,
+      offer: { ...german.offer, signupMessage },
+    });
+    expect(messageDefaultsSchema.safeParse(withMessage("a".repeat(1000))).success).toBe(true);
+    expect(messageDefaultsSchema.safeParse(withMessage("a".repeat(1001))).success).toBe(false);
+    expect(messageDefaultsSchema.parse(withMessage("  Danke!  ")).offer.signupMessage).toBe("Danke!");
   });
 });
 

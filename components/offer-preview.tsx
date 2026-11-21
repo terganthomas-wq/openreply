@@ -8,8 +8,9 @@
  * An offer's DM thread on the campaign preview's phone: the offer messages
  * with the pauses before them and the button, then the two ways it goes on:
  * a tap on it with the confirmations and the card, and, as its own branch,
- * the reminder that goes out instead when nobody taps. The thread scrolls
- * inside the phone, which is shorter than a whole offer.
+ * the reminder that goes out instead when nobody taps. An offer whose
+ * landing page reports sign-ups shows the confirmation after the card. The
+ * thread scrolls inside the phone, which is shorter than a whole offer.
  */
 
 import {
@@ -41,6 +42,10 @@ interface OfferPreviewProps {
   reminderEnabled: boolean;
   reminderDelayHours: number;
   reminderMessage: string;
+  /** The landing page reports sign-ups; the confirmation follows the card. */
+  signupTrackingEnabled: boolean;
+  /** Empty: no message after a sign-up, only the tag. */
+  signupMessage: string;
 }
 
 // As the worker sends it: {username} becomes the person's name, {link} goes
@@ -185,6 +190,19 @@ export default function OfferPreview(props: OfferPreviewProps) {
               <ButtonRow label={cardButton} />
             </div>
           </div>
+
+          {/* After the sign-up on the landing page, which the reminder's
+              link can lead to as well. Only with a text: without one the
+              person only gets the tag. */}
+          {props.signupTrackingEnabled && props.signupMessage.trim() && (
+            <>
+              <Note>{t("After the sign-up on your landing page")}</Note>
+              <BotBubble
+                avatarUrl={avatarUrl}
+                text={render(props.signupMessage)}
+              />
+            </>
+          )}
 
           {props.reminderEnabled && (
             <>

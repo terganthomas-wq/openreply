@@ -79,6 +79,7 @@ describe("issueMessage", () => {
         tagInterested: "i",
         tagSent: "s",
         tagClicked: "c",
+        tagSignedUp: "e",
       })
     );
     const defaults = firstIssue(

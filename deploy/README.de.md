@@ -127,6 +127,157 @@ starten?“ pro Kampagne fest, wann das Lead-Magnet-Angebot kommt:
 - Über die API und MCP heißt das Feld `offerDelayHours`, mit `0` oder `22`
   (siehe `docs/integrations.md`).
 
+## Eintragungen von der Landingpage zurückmelden
+
+Trägt sich jemand nach einem Klick auf die Karte eines Angebots auf deiner
+Landingpage ein (etwa für den Newsletter mit Double-Opt-in), kann die
+Landingpage das an dieses Tool zurückmelden. Die Person bekommt dann den Tag
+„<Angebot> eingetragen“ und, solange Instagram es erlaubt, deine Bestätigung im
+Chat, zum Beispiel „Danke fürs Eintragen! Ich habe dir gerade alles per E-Mail
+geschickt 📩“. Im Funnel auf der Seite *Angebote* zählt die Stufe
+„Eingetragen“ mit, im Verlauf des Kontakts steht die Eintragung.
+
+So richtest du es ein:
+
+1. Im Angebots-Editor unter *Eintragung zurückmelden* den Schalter
+   einschalten. Ab dann hängt das Tool beim Klick auf den Link der Karte oder
+   der Erinnerung einen persönlichen Code an die Adresse deiner Landingpage:
+   `https://deine-seite.de/guide?utm_source=instagram&ig=AbCd…` (24 Zeichen,
+   nur Buchstaben, Ziffern, `-` und `_`). Die übrige Adresse bleibt, wie sie
+   ist; ein `ig`, das schon drinsteht, wird ersetzt. Der Code entsteht beim
+   ersten Klick der Person und bleibt danach gleich. Ohne den Schalter geht
+   der Link genau so raus wie eingetragen.
+2. Unter *API & MCP* einen Schlüssel mit dem Zugriff „Eintragungen melden“
+   anlegen, am besten für 90 Tage. Er kann nur Eintragungen melden, keine
+   Kampagnen lesen oder anlegen. Schlüssel laufen spätestens nach 90 Tagen
+   ab: rechtzeitig einen neuen anlegen und auf der Landingpage austauschen.
+   Mit einem abgelaufenen Schlüssel kommt `401`, die Seite selbst merkt davon
+   nichts.
+3. Die Landingpage übernimmt `ig` aus ihrer Adresse in ein verstecktes
+   Formularfeld, speichert den Wert zusammen mit der noch unbestätigten
+   Eintragung und meldet ihn erst, wenn die Eintragung bestätigt ist (beim
+   Double-Opt-in nach dem Klick in der Bestätigungsmail). Gemeldet wird vom
+   Server aus, nie per JavaScript im Browser: Dort wäre der Schlüssel
+   öffentlich, und Anfragen aus einer fremden Seite lehnt das Tool ab.
+
+Die Meldung ist genau diese Anfrage:
+
+```bash
+curl -X POST https://<domain>/api/offers/signup \
+  --max-time 3 \
+  -H "Authorization: Bearer <schlüssel>" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<wert von ig>"}'
+```
+
+Antworten:
+
+- `200 {"data":{"alreadyRecorded":false}}`: Eintragung gespeichert, Tag
+  gesetzt, die Bestätigung im Chat ist unterwegs (wenn das Angebot eine hat).
+- `200 {"data":{"alreadyRecorded":true}}`: Dieser Code wurde schon gemeldet,
+  es passiert nichts mehr. Mehrfach melden schadet also nicht.
+- `404 {"error":"Unknown token"}`: Code unbekannt, etwa aus einem anderen
+  Workspace, bei einem Angebot mit ausgeschalteter Rückmeldung oder von einem
+  gelöschten Kontakt.
+- `400`: Body nicht genau `{"token": "…"}` mit einem gültigen Code. `401`:
+  Schlüssel fehlt, ist falsch, widerrufen oder abgelaufen. `403`: Schlüssel
+  ohne „Eintragungen melden“ oder Anfrage aus einem Browser auf einer anderen
+  Seite. `415`: ohne `Content-Type: application/json`. `429`: mehr als 120
+  Meldungen pro Minute mit einem Schlüssel. `503`: Ratenbegrenzung (Redis)
+  nicht erreichbar.
+
+Die Antwort kommt sofort; die Nachricht im Chat schickt der Worker kurz
+danach. Sie geht nur raus, solange Instagrams 24-Stunden-Fenster offen ist,
+gerechnet ab dem letzten Tippen oder der letzten DM der Person. Wer sich
+später einträgt (etwa weil die Bestätigungsmail erst am nächsten Tag
+angeklickt wird), bekommt nur den Tag. Die Nachricht geht höchstens einmal
+raus und zählt zu den DMs des Monats. Warum eine nicht rausging, steht unter
+*Diagnose* („Sign-up confirmation not sent: …“). Lässt du das Textfeld im
+Editor leer, gibt es nur den Tag.
+
+PHP, Schritt für Schritt. Der Schlüssel steht in einer Datei außerhalb des
+Web-Roots, nie im Code der Seite und nie im Git:
+
+```php
+<?php
+// /home/kunde/openreply-config.php (außerhalb des Web-Roots)
+return [
+    'url' => 'https://<domain>/api/offers/signup',
+    'key' => 'orp_…', // Schlüssel mit „Eintragungen melden“
+];
+```
+
+```php
+<?php
+// Formular der Landingpage: den Code aus der Adresse übernehmen.
+$ig = (isset($_GET['ig']) && preg_match('/^[A-Za-z0-9_-]{1,64}$/', $_GET['ig'])) ? $_GET['ig'] : '';
+?>
+<form method="post" action="/eintragen.php">
+  <input type="email" name="email" required>
+  <input type="hidden" name="ig" value="<?= htmlspecialchars($ig, ENT_QUOTES) ?>">
+  <button type="submit">Eintragen</button>
+</form>
+```
+
+In `eintragen.php` speicherst du `$_POST['ig']` (geprüft wie oben) zusammen
+mit der E-Mail-Adresse und dem Bestätigungs-Code der noch offenen Eintragung.
+Nach dem Klick in der Bestätigungsmail rufst du diese Funktion mit dem
+gespeicherten Wert auf und kannst ihn danach löschen:
+
+```php
+<?php
+const OPENREPLY_CONFIG = '/home/kunde/openreply-config.php';
+
+// Meldet eine bestätigte Eintragung. Wartet höchstens 3 Sekunden und
+// ignoriert jeden Fehler: Die Seite darf daran nie scheitern.
+function openreply_eintragung_melden(string $ig): void
+{
+    try {
+        if (!preg_match('/^[A-Za-z0-9_-]{1,64}$/', $ig) || !function_exists('curl_init')
+            || !is_readable(OPENREPLY_CONFIG)) {
+            return;
+        }
+        $config = require OPENREPLY_CONFIG;
+        if (!is_array($config) || empty($config['url']) || empty($config['key'])) {
+            return;
+        }
+        $ch = curl_init($config['url']);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => [
+                'Authorization: Bearer ' . $config['key'],
+                'Content-Type: application/json',
+            ],
+            CURLOPT_POSTFIELDS => json_encode(['token' => $ig]),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 3,
+            CURLOPT_TIMEOUT => 3,
+        ]);
+        curl_exec($ch); // Antwort bewusst nicht ausgewertet
+    } catch (\Throwable $e) {
+        // ignorieren
+    }
+}
+```
+
+Datenschutz: In die Datenschutzerklärung der Landingpage gehört, dass die
+Eintragung mit dem Instagram-Kontakt verknüpft wird. Der Link aus der
+Instagram-Nachricht trägt einen persönlichen Code, und die Seite meldet nach
+der Bestätigung an dieses Tool, dass sich die Person eingetragen hat (nur den
+Code, keine E-Mail-Adresse). Löschst du einen Kontakt (*Kontakte* → *Kontakt
+löschen*), verschwindet sein Code mit ihm; eine spätere Meldung bekommt
+`404`. Die Adresse mit `ig=` landet auch in den Logs und der Webanalyse der
+Landingpage; wer das nicht will, entfernt den Parameter dort nach dem
+Übernehmen.
+
+Bestehende Angebote haben die Rückmeldung aus. Ihr Tag für die Eintragung
+heißt nach dem Update „<Name> eingetragen“ (bei einem Angebot, dessen Tag
+„angeboten“ auf Englisch „<Name> offered“ heißt: „<Name> signed up“) und
+lässt sich im Editor unter *Tags* ändern. Bestätigungen im Chat schickt erst
+der aktualisierte Worker (siehe *Updates*); ein älterer verwirft sie, Tag und
+Funnel zählen trotzdem. Deshalb die Rückmeldung erst einschalten, wenn auch
+der Worker aktualisiert ist.
+
 ## Worker-Server einrichten
 
 ```bash

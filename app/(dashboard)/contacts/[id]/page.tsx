@@ -32,6 +32,8 @@ interface ContactOfferRow {
   sentVia: string | null;
   reminderSentAt: string | null;
   clickedAt: string | null;
+  signedUpAt: string | null;
+  signupMessageSentAt: string | null;
   stoppedAt: string | null;
   stopReason: string | null;
   offer: { name: string; archivedAt: string | null };
@@ -227,6 +229,10 @@ function ContactDetail({ contactId }: { contactId: string }) {
             return t("Reminder sent: {offer}", { offer: event.offer });
           case "clicked":
             return t("Clicked the offer link: {offer}", { offer: event.offer });
+          case "signedUp":
+            return t("Signed up on the landing page: {offer}", { offer: event.offer });
+          case "signupConfirmed":
+            return t("Sign-up confirmed in the chat: {offer}", { offer: event.offer });
           case "stopped":
             return t("Offer stopped early: {offer}", { offer: event.offer });
         }
@@ -339,6 +345,17 @@ function ContactDetail({ contactId }: { contactId: string }) {
                 { label: t("Reminder"), at: row.reminderSentAt },
                 { label: t("Clicked"), at: row.clickedAt },
               ];
+              // Only offers whose landing page reported the sign-up have
+              // these, so they show only once there is one.
+              if (row.signedUpAt) {
+                stages.push({ label: t("Signed up"), at: row.signedUpAt });
+              }
+              if (row.signupMessageSentAt) {
+                stages.push({
+                  label: t("Sign-up confirmed in the chat"),
+                  at: row.signupMessageSentAt,
+                });
+              }
               if (row.stoppedAt) {
                 stages.push({
                   label: t("Stopped early"),

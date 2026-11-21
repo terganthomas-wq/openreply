@@ -7,9 +7,10 @@
  *
  * Creates and edits a lead-magnet offer (R3): the offer messages with the
  * pause before each, the button on the last one, the confirmations after a
- * tap, the card, the reminder for people who do not tap and the four funnel
- * tags, next to a live preview of the DM thread. A new offer starts from the
- * workspace's default texts for offers.
+ * tap, the card, the reminder for people who do not tap, the feedback from
+ * the landing page after a sign-up and the funnel tags, next to a live
+ * preview of the DM thread. A new offer starts from the workspace's default
+ * texts for offers.
  *
  * The card image is uploaded where a Vercel Blob store is connected (GET
  * /api/offers says so): picking a file sends it to /api/offers/image at
@@ -29,6 +30,7 @@ import {
   EMPTY_MESSAGE_DEFAULTS,
   offerDefaultsSchema,
   parseMessageDefaults,
+  type OfferDefaults,
 } from "@/lib/campaigns/message-defaults";
 import { useI18n } from "@/lib/i18n/provider";
 import {
@@ -69,22 +71,56 @@ import {
   offerInputSchema,
 } from "@/lib/offers/schema";
 import { OFFER_LATE_START_HOURS } from "@/lib/offers/schedule";
+import { SIGNUP_CALLBACK_PATH } from "@/lib/offers/signup-link";
 import { BUTTON_TEXT_MAX, CARD_TEXT_MAX } from "@/lib/validation/text";
 
 const MESSAGE_DEFAULTS_URL = "/api/workspace/message-defaults";
 const OFFERS_URL = "/api/offers";
 const OFFER_IMAGE_URL = "/api/offers/image";
 
-// Whether card images can be uploaded here, as GET /api/offers says. Without
-// an answer the editor shows the image-URL field, which always works.
-function fetchImageUploadEnabled(): Promise<boolean> {
+// What GET /api/offers says about this installation besides the offers.
+interface OfferSettings {
+  // Whether card images can be uploaded here. Without an answer the editor
+  // shows the image-URL field, which always works.
+  imageUploadEnabled: boolean;
+  // Where a landing page reports sign-ups, under the app's public address.
+  signupUrl: string;
+}
+
+function offerSettings(payload: unknown): OfferSettings {
+  const data = payload as {
+    success?: unknown;
+    imageUploadEnabled?: unknown;
+    signupUrl?: unknown;
+  } | null;
+  return {
+    imageUploadEnabled:
+      data?.success === true && data.imageUploadEnabled === true,
+    signupUrl: typeof data?.signupUrl === "string" ? data.signupUrl : "",
+  };
+}
+
+function fetchOfferSettings(): Promise<OfferSettings> {
   return fetch(OFFERS_URL, { cache: "no-store" })
     .then((r) => r.json())
-    .then(
-      (payload) =>
-        payload?.success === true && payload.imageUploadEnabled === true
-    )
-    .catch(() => false);
+    .then(offerSettings)
+    .catch(() => offerSettings(null));
+}
+
+// The workspace's default texts for offers, or null without them.
+function fetchOfferDefaults(): Promise<{
+  defaults: OfferDefaults | null;
+  canManage: boolean;
+}> {
+  return fetch(MESSAGE_DEFAULTS_URL, { cache: "no-store" })
+    .then((r) => r.json())
+    .then((payload) => (payload.success ? payload.data : null))
+    // Without them the form opens empty.
+    .catch(() => null)
+    .then((data) => ({
+      defaults: parseMessageDefaults(data?.defaults)?.offer ?? null,
+      canManage: data?.canManage === true,
+    }));
 }
 
 // A new message waits this long after the one before.
@@ -175,6 +211,12 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
 
+  // Sign-up feedback: where the landing page reports, and the workspace's
+  // default confirmation, which fills an empty text when the switch goes on.
+  const [signupUrl, setSignupUrl] = useState("");
+  const [signupUrlCopied, setSignupUrlCopied] = useState(false);
+  const [defaultSignupMessage, setDefaultSignupMessage] = useState("");
+
   useEffect(() => {
     let active = true;
     fetch("/api/instagram/accounts")
@@ -193,27 +235,28 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
 
   // A new offer opens with the workspace's default texts for offers; an
   // edit with the stored offer. Either way the offers API says whether card
-  // images can be uploaded.
+  // images can be uploaded and where a landing page reports sign-ups.
   useEffect(() => {
     let active = true;
     if (mode === "new") {
-      Promise.all([
-        fetch(MESSAGE_DEFAULTS_URL, { cache: "no-store" })
-          .then((r) => r.json())
-          .then((payload) => (payload.success ? payload.data : null))
-          // Without them the form opens empty.
-          .catch(() => null),
-        fetchImageUploadEnabled(),
-      ]).then(([data, uploadEnabled]) => {
-        if (!active) return;
-        const defaults = parseMessageDefaults(data?.defaults)?.offer ?? null;
-        setForm(newOfferEditorState(defaults));
-        setTemplates((defaults ?? EMPTY_MESSAGE_DEFAULTS.offer).tagTemplates);
-        setCanManageDefaults(data?.canManage === true);
-        setImageUpload(uploadEnabled);
-        setLoading(false);
-      });
+      Promise.all([fetchOfferDefaults(), fetchOfferSettings()]).then(
+        ([{ defaults, canManage }, settings]) => {
+          if (!active) return;
+          setForm(newOfferEditorState(defaults));
+          setTemplates((defaults ?? EMPTY_MESSAGE_DEFAULTS.offer).tagTemplates);
+          setDefaultSignupMessage(defaults?.signupMessage ?? "");
+          setCanManageDefaults(canManage);
+          setImageUpload(settings.imageUploadEnabled);
+          setSignupUrl(settings.signupUrl);
+          setLoading(false);
+        }
+      );
     } else {
+      // The defaults only for the sign-up confirmation an empty text gets
+      // when the switch goes on; the offer opens without them.
+      void fetchOfferDefaults().then(({ defaults }) => {
+        if (active) setDefaultSignupMessage(defaults?.signupMessage ?? "");
+      });
       fetch(OFFERS_URL, { cache: "no-store" })
         .then((r) => r.json())
         .then((payload) => {
@@ -224,7 +267,9 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
           if (!offer) return setNotFound(true);
           setForm(editorStateFromOffer(offer));
           setIsActive(offer.isActive);
-          setImageUpload(payload.imageUploadEnabled === true);
+          const settings = offerSettings(payload);
+          setImageUpload(settings.imageUploadEnabled);
+          setSignupUrl(settings.signupUrl);
         })
         .catch(() => {
           if (active) setNotFound(true);
@@ -287,6 +332,46 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
     setFollowingTags((keys) => keys.filter((other) => other !== key));
     setForm((current) => ({ ...current, tags: { ...current.tags, [key]: value } }));
     clearErrors(TAG_FIELD[key]);
+  }
+
+  // Opens the tags and puts the cursor into one of them.
+  function editTag(key: TagKey) {
+    setTagsOpen(true);
+    window.requestAnimationFrame(() => {
+      const input = document.getElementById(fieldId(`tag-${key}`));
+      input?.scrollIntoView({ behavior: "smooth", block: "center" });
+      input?.focus({ preventScroll: true });
+    });
+  }
+
+  // Switched on with no text yet, the confirmation starts from the
+  // workspace's default, to keep, change or clear.
+  function toggleSignupTracking() {
+    setForm((current) => {
+      const on = !current.signupTrackingEnabled;
+      return {
+        ...current,
+        signupTrackingEnabled: on,
+        signupMessage:
+          on && !current.signupMessage.trim()
+            ? defaultSignupMessage
+            : current.signupMessage,
+      };
+    });
+    clearErrors("signupTrackingEnabled", "signupMessage");
+  }
+
+  async function copySignupUrl() {
+    try {
+      await navigator.clipboard.writeText(signupUrl);
+      setSignupUrlCopied(true);
+      window.setTimeout(() => setSignupUrlCopied(false), 2000);
+    } catch {
+      // No clipboard (no https, no permission): the address is selected for
+      // copying by hand.
+      const input = document.getElementById(fieldId("signupUrl"));
+      if (input instanceof HTMLInputElement) input.select();
+    }
   }
 
   function messageFields(list: MessageListKey): OfferField[] {
@@ -357,6 +442,9 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
       case "reminderDelayHours":
       case "reminderMessage":
         return t("Reminder");
+      case "signupTrackingEnabled":
+      case "signupMessage":
+        return t("Report the sign-up back");
       default:
         return t("Tags");
     }
@@ -379,7 +467,7 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
       case "reminderMessage":
         return t("Write the reminder, or turn it off.");
       default:
-        return t("Fill in all four tags.");
+        return t("Fill in all five tags.");
     }
   }
 
@@ -667,6 +755,7 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
     interested: t("Interested"),
     sent: t("Sent"),
     clicked: t("Clicked"),
+    signedUp: t("Signed up"),
   };
   const tagsError = TAG_KEYS.map((key) => errors[TAG_FIELD[key]]).find(Boolean);
 
@@ -1096,6 +1185,141 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
             </div>
           </Section>
 
+          {/* Sign-up feedback: the links carry the person's code (ig=…) to
+              the landing page, which reports the sign-up back. Off, the
+              links go out as typed. */}
+          <Section title={t("Report the sign-up back")}>
+            <p className="text-xs text-muted">
+              {t("For a landing page with a sign-up form, for example for your newsletter. The link on the card and in the reminder then gets a personal code (ig=…). Your landing page sends it back as soon as the person has signed up. They then get the tag and, if Instagram still allows it, your message in the chat.")}
+            </p>
+            <div className="rounded-lg border border-border p-3">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-sm text-foreground">
+                  {t("Report sign-ups from the landing page")}
+                </span>
+                <Toggle
+                  on={form.signupTrackingEnabled}
+                  onToggle={toggleSignupTracking}
+                  label={t("Report sign-ups from the landing page")}
+                />
+              </div>
+              {form.signupTrackingEnabled && (
+                <div className="mt-3 space-y-4">
+                  {/* Where the landing page reports, and with which key. */}
+                  <div className="space-y-1">
+                    <label
+                      htmlFor={fieldId("signupUrl")}
+                      className="block text-xs text-muted"
+                    >
+                      {t("Address for your landing page")}
+                    </label>
+                    <div className="flex min-w-0 gap-2">
+                      <input
+                        id={fieldId("signupUrl")}
+                        readOnly
+                        value={signupUrl}
+                        onFocus={(e) => e.currentTarget.select()}
+                        spellCheck={false}
+                        className={inputClass(false, "min-w-0 flex-1 font-mono")}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void copySignupUrl()}
+                        disabled={!signupUrl}
+                        className="shrink-0 rounded-lg border border-border px-3 py-2 text-sm font-medium text-muted hover:text-foreground disabled:opacity-50"
+                      >
+                        {signupUrlCopied ? t("Copied!") : t("Copy")}
+                      </button>
+                    </div>
+                    <p className="text-xs text-muted">
+                      {t("Your landing page also needs a key with the access “{access}”.", {
+                        access: t("Report sign-ups"),
+                      })}{" "}
+                      {/* A new tab: the offer here is not saved yet. */}
+                      <Link
+                        href="/integrations"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="font-medium text-accent hover:underline"
+                      >
+                        {t("Create the key under API & MCP")}
+                      </Link>
+                    </p>
+                    <p className="text-xs text-muted">
+                      {t("A key runs out after 90 days at the latest. Create a new one in time and replace it on your landing page.")}
+                    </p>
+                  </div>
+
+                  <details className="rounded-lg border border-border px-3 py-2">
+                    <summary className="cursor-pointer text-xs font-medium text-foreground">
+                      {t("Details for whoever builds your landing page")}
+                    </summary>
+                    <div className="mt-2 space-y-2 text-xs text-muted">
+                      <p>
+                        {t("Copy the value of ig from the address of the landing page into a hidden form field and store it with the sign-up. Once the sign-up is confirmed (with double opt-in: after the click in the confirmation email), your server sends it:")}
+                      </p>
+                      {/* The request itself: code, not translated. */}
+                      <pre className="overflow-x-auto whitespace-pre rounded bg-background p-2 font-mono text-[11px] leading-relaxed text-foreground">
+                        {`POST ${signupUrl || SIGNUP_CALLBACK_PATH}\nAuthorization: Bearer <key>\nContent-Type: application/json\n\n{"token": "<ig>"}`}
+                      </pre>
+                      <p>
+                        {t("Wait at most 3 seconds for the answer and ignore errors, so the page never breaks. The key stays on the server, never in the page itself.")}
+                      </p>
+                    </div>
+                  </details>
+
+                  {/* The confirmation in the chat */}
+                  <div className="space-y-1">
+                    <label
+                      htmlFor={fieldId("signupMessage")}
+                      className="block text-xs text-muted"
+                    >
+                      {t("Message in the chat after the sign-up")}{" "}
+                      <span className="font-normal">{t("(optional)")}</span>
+                    </label>
+                    <textarea
+                      id={fieldId("signupMessage")}
+                      value={form.signupMessage}
+                      onChange={(e) =>
+                        update("signupMessage", e.target.value, "signupMessage")
+                      }
+                      placeholder={t("Write a message")}
+                      rows={3}
+                      maxLength={OFFER_MESSAGE_MAX}
+                      aria-invalid={Boolean(errors.signupMessage) || undefined}
+                      className={inputClass(Boolean(errors.signupMessage), "resize-none")}
+                    />
+                    <FieldError message={errors.signupMessage} />
+                    <p className="text-xs text-muted">
+                      {t("Leave it empty to only tag the person.")}{" "}
+                      {"{username}"} {t("personalizes.")}
+                    </p>
+                    <p className="text-xs text-muted">
+                      {t("Instagram allows the message only up to 24 hours after the person's last tap or DM. Whoever signs up later only gets the tag.")}
+                    </p>
+                  </div>
+
+                  {/* The tag; it is edited with the other tags. */}
+                  <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-xs text-muted">
+                    {/* Tag names are the user's own words: never translated. */}
+                    <span className="min-w-0 break-words">
+                      {t("Tag after the sign-up: {tag}", {
+                        tag: form.tags.signedUp.trim() || "—",
+                      })}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => editTag("signedUp")}
+                      className="font-medium text-accent hover:underline"
+                    >
+                      {t("Change the tag")}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </Section>
+
           <div className="rounded-lg border border-border">
             <button
               type="button"
@@ -1147,7 +1371,7 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
             <Section title={t("Default texts")}>
               <div className="space-y-3 rounded-lg border border-border p-3">
                 <p className="text-xs text-muted">
-                  {t("Saves the offer messages with their pauses, the button, the confirmations, the card's button and the reminder. Name, card, link and tags are set per offer.")}
+                  {t("Saves the offer messages with their pauses, the button, the confirmations, the card's button, the reminder and the message after the sign-up. Name, card, link and tags are set per offer.")}
                 </p>
                 <button
                   type="button"
@@ -1193,6 +1417,8 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
               reminderEnabled={form.reminderEnabled}
               reminderDelayHours={form.reminderDelayHours}
               reminderMessage={form.reminderMessage}
+              signupTrackingEnabled={form.signupTrackingEnabled}
+              signupMessage={form.signupMessage}
             />
           </div>
         </div>

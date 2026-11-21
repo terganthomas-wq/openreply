@@ -14,11 +14,17 @@ revocation or workspace deletion. Review keys when team members leave.
   its aggregate stats.
 - `campaigns:write`: create campaigns. Nothing else: no key can change, switch
   on or off, or delete an existing campaign, and no key sends messages itself.
+- `signups:write`: report a sign-up from an offer's landing page
+  (`POST /api/offers/signup`, below). Nothing else: such a key opens no MCP
+  tool and no campaign route.
 
-The page creates **read-only** keys (`campaigns:read`) or **read-and-write** keys
-(`campaigns:read` and `campaigns:write`). The key API also accepts
-`campaigns:write` alone; such a key gets the campaigns it creates back but can
-read nothing else. Keys made before write access existed stay read-only.
+The page creates **read-only** keys (`campaigns:read`), **read-and-write** keys
+(`campaigns:read` and `campaigns:write`) and **report sign-ups** keys
+(`signups:write`). The key API also accepts `campaigns:write` alone; such a key
+gets the campaigns it creates back but can read nothing else. `signups:write`
+is only accepted on its own: the key lives on the landing page's server and
+never carries a campaign scope. Keys made before write access existed stay
+read-only.
 
 Contacts and their tags are not part of this API: they are personal data.
 Responses never contain recipient logs.
@@ -151,11 +157,45 @@ curl -X POST https://YOUR-DOMAIN/api/v1/campaigns \
   campaigns:write` before the body is read; `413` above 64 KiB; `415` without
   `Content-Type: application/json`.
 
+### Reporting a sign-up
+
+`POST /api/offers/signup` is for an offer whose landing page reports
+sign-ups (**Report the sign-up back** in the offer editor, see
+`docs/offers.md`). The landing page's server sends the `ig` value the offer's
+link brought along, once the sign-up is confirmed:
+
+```sh
+curl -X POST https://YOUR-DOMAIN/api/offers/signup \
+  --max-time 3 \
+  -H "Authorization: Bearer $SIGNUP_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<ig value>"}'
+```
+
+- The key needs `signups:write` (403 otherwise) and only finds codes of its
+  own workspace. The same limits apply as above: 120 requests per key and
+  minute, 503 without Redis, a foreign Origin is refused, so the key never
+  belongs in a page's script.
+- The body is exactly `{"token": "<24 base64url characters>"}`; anything
+  else is a 400 (415 without the JSON content type, 413 above 1 KiB).
+- The first report answers `200 {"data": {"alreadyRecorded": false}}`: the
+  sign-up time and the offer's "signed up" tag are recorded, and the chat
+  confirmation is queued if the offer has one. Every later report of the same
+  code answers `200 {"data": {"alreadyRecorded": true}}` and changes nothing.
+- An unknown code answers `404 {"error": "Unknown token"}`: another
+  workspace's, one of an offer that no longer reports sign-ups, or one of a
+  deleted contact.
+- The answer never waits for Instagram. Neither the code nor the key is
+  logged.
+
+`deploy/README.de.md` has a PHP example for the landing page.
+
 Admin key management uses session authentication at `/api/integrations/keys`:
 GET lists metadata (never hashes/tokens), POST creates a key with `scopes` of
-one or both scopes above, DELETE with `?id=` revokes it. A supplied Origin must
-match `NEXTAUTH_URL` (or the request origin). JSON request bodies are bounded to
-64 KiB including streamed/chunked requests.
+one or both campaign scopes above, or `signups:write` alone, DELETE with
+`?id=` revokes it. A supplied Origin must match `NEXTAUTH_URL` (or the request
+origin). JSON request bodies are bounded to 64 KiB including streamed/chunked
+requests.
 
 ## Verification
 

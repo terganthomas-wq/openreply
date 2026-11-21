@@ -20,6 +20,12 @@
  * the workspace's monthly DMs and re-checks the messaging window. A retried or
  * repeated job therefore picks the sequence up where it stopped and never
  * sends a message twice.
+ *
+ * An offer that reports sign-ups gets one message more: once its landing
+ * page reported the sign-up (lib/offers/signup.ts), the confirmation in the
+ * chat, while Instagram still allows it. It follows the same policy, but
+ * whatever keeps it from going out never marks the offer stopped: the person
+ * got the link long before.
  */
 
 import { createHash } from "node:crypto";
@@ -111,8 +117,15 @@ type StopReason =
   | "ACCOUNT_UNAVAILABLE";
 
 // A message as its claim names it. "retap" is the card sent once more for a
-// later tap on the button.
-type SendPhase = "offer" | "confirm" | "card" | "retap" | "reminder";
+// later tap on the button, "signup" the confirmation of a reported sign-up.
+type SendPhase = "offer" | "confirm" | "card" | "retap" | "reminder" | "signup";
+
+// What the send policy does when a message cannot go out: by default the
+// offer stops (stopOffer); the sign-up confirmation only reports it.
+type OnStop = (
+  reason: StopReason,
+  details?: Record<string, Prisma.InputJsonValue | null>
+) => Promise<void>;
 
 // What the send policy needs of the job that sends: a rate limit is retried
 // while attempts are left.
@@ -151,6 +164,8 @@ export async function processOffer(job: Job<ProcessOfferJob>): Promise<void> {
       return sendCardStep(job, co);
     case "reminder":
       return sendReminder(job, co);
+    case "signup":
+      return sendSignupConfirmation(job, co);
     default:
       console.warn("[Offers] Ignoring an unknown phase", job.data.phase, job.id);
   }
@@ -704,6 +719,85 @@ async function sendReminder(
 }
 
 /**
+ * The confirmation in the chat after the landing page reported the sign-up
+ * (queued by recordSignup, lib/offers/signup.ts). Its text is the offer's
+ * signupMessage as it is now: emptied since, nothing goes out, the tag was
+ * all. It goes out once, only while Instagram's window is open, and under
+ * the policy of every offer message (claim, monthly DMs, retries). What
+ * keeps it from going out is reported, never a stop of the offer: the person
+ * got the link and signed up.
+ */
+async function sendSignupConfirmation(
+  job: Job<ProcessOfferJob>,
+  co: LoadedContactOffer
+): Promise<void> {
+  const text = co.offer.signupMessage?.trim();
+  if (!co.signedUpAt || !text) return;
+  if (co.signupMessageSentAt) {
+    await logWorkerEvent({
+      workspaceId: co.workspaceId,
+      level: "INFO",
+      message: "Sign-up confirmation not sent: it went out before",
+      payload: eventPayload(co, { phase: "signup" }),
+    });
+    return;
+  }
+  // A deleted offer sends nothing more, as for its other messages.
+  if (co.offer.archivedAt) return reportSignupSkipped(co, "OFFER_ARCHIVED");
+  if (!withinWindow(co.contact.lastInteractionAt)) {
+    return reportSignupSkipped(co, "WINDOW_CLOSED");
+  }
+
+  const outcome = await sendOfferMessage(
+    job,
+    co,
+    "signup",
+    0,
+    (context) =>
+      sendDirectMessage({
+        ...sendTarget(co),
+        context,
+        message: render(co, text),
+      }),
+    (reason, details) => reportSignupSkipped(co, reason, details)
+  );
+  if (outcome === "stopped") return;
+
+  // Sent, claimed by an earlier run or with an unknown outcome: it may be in
+  // the inbox, so it never goes out again.
+  await prisma.contactOffer.updateMany({
+    where: { id: co.id, signupMessageSentAt: null },
+    data: { signupMessageSentAt: new Date() },
+  });
+}
+
+// How the sign-up confirmation reports what kept it from going out. A closed
+// window, a deleted offer and an account without a working connection are
+// expected; a refusal, a rate limit and the monthly limit need a look.
+const SIGNUP_SKIP_LEVEL: Record<StopReason, OperationalEventLevel> = {
+  WINDOW_CLOSED: "INFO",
+  OFFER_ARCHIVED: "INFO",
+  ACCOUNT_UNAVAILABLE: "INFO",
+  REJECTED: "WARNING",
+  RATE_LIMITED: "WARNING",
+  PLAN_LIMIT: "WARNING",
+};
+
+/** Say in Diagnostics why the sign-up confirmation did not go out. */
+function reportSignupSkipped(
+  co: LoadedContactOffer,
+  reason: StopReason,
+  details: Record<string, Prisma.InputJsonValue | null> = {}
+): Promise<void> {
+  return logWorkerEvent({
+    workspaceId: co.workspaceId,
+    level: SIGNUP_SKIP_LEVEL[reason],
+    message: `Sign-up confirmation not sent: ${STOPS[reason].why}`,
+    payload: eventPayload(co, { phase: "signup", reason, ...details }),
+  });
+}
+
+/**
  * Send one offer message under the policy all of them share:
  *
  * - It counts toward the workspace's monthly DMs (R18); without a slot the
@@ -719,18 +813,20 @@ async function sendReminder(
  *   left taken is reported on its own (refusedWithClaimKept).
  *
  * Only rate limits and database errors leave the job failed, so an expected
- * refusal never raises a worker alert.
+ * refusal never raises a worker alert. Where the policy says the offer stops,
+ * `onStop` runs; by default it stops the offer (stopOffer).
  */
 async function sendOfferMessage(
   job: Attempts,
   co: LoadedContactOffer,
   phase: SendPhase,
   step: number | string,
-  send: (context: InstagramContext) => Promise<unknown>
+  send: (context: InstagramContext) => Promise<unknown>,
+  onStop: OnStop = (reason, details) => stopOffer(co, reason, details)
 ): Promise<"sent" | "claimed" | "stopped"> {
   const account = co.contact.instagramAccount;
   if (!hasInstagramCredentials(account)) {
-    await stopAccountUnavailable(co);
+    await onStop("ACCOUNT_UNAVAILABLE");
     return "stopped";
   }
   let context: InstagramContext;
@@ -741,13 +837,13 @@ async function sendOfferMessage(
       `offer:${co.id}:${phase}:${step}`
     );
   } catch (error) {
-    await stopAccountUnavailable(co, formatError(error));
+    await onStop("ACCOUNT_UNAVAILABLE", { error: formatError(error) });
     return "stopped";
   }
 
   const usage = await reserveWorkspaceDMSend(co.workspaceId);
   if (!usage.allowed) {
-    await stopOffer(co, "PLAN_LIMIT", { phase, step, limit: usage.limit });
+    await onStop("PLAN_LIMIT", { phase, step, limit: usage.limit });
     return "stopped";
   }
   const release = () =>
@@ -779,7 +875,15 @@ async function sendOfferMessage(
     return "sent";
   } catch (error) {
     if (error instanceof ClaimReleaseError) {
-      return refusedWithClaimKept(co, phase, step, operationId, error, release);
+      return refusedWithClaimKept(
+        co,
+        phase,
+        step,
+        operationId,
+        error,
+        release,
+        onStop
+      );
     }
     if (isDeliveryUnconfirmed(error)) {
       await logWorkerEvent({
@@ -801,7 +905,7 @@ async function sendOfferMessage(
     ) {
       throw error;
     }
-    await stopRefused(co, phase, step, error);
+    await stopRefused(onStop, phase, step, error);
     return "stopped";
   }
 }
@@ -822,7 +926,8 @@ async function refusedWithClaimKept(
   step: number | string,
   operationId: string,
   error: ClaimReleaseError,
-  release: () => Promise<unknown>
+  release: () => Promise<unknown>,
+  onStop: OnStop
 ): Promise<"stopped"> {
   console.error(
     "[Offers] Claim of a refused message not released:",
@@ -841,7 +946,7 @@ async function refusedWithClaimKept(
   });
   try {
     await release();
-    await stopRefused(co, phase, step, error.refusal);
+    await stopRefused(onStop, phase, step, error.refusal);
   } catch (writeError) {
     throw new UnrecoverableError(
       `Offer message refused, its claim kept and the refusal not recorded: ${formatError(writeError)}`
@@ -850,23 +955,23 @@ async function refusedWithClaimKept(
   return "stopped";
 }
 
-/** Stop the offer for a confirmed rejection of one of its messages. */
+/** Stop (onStop) for a confirmed rejection of one of the offer's messages. */
 function stopRefused(
-  co: LoadedContactOffer,
+  onStop: OnStop,
   phase: SendPhase,
   step: number | string,
   error: unknown
 ): Promise<void> {
   if (error instanceof RateLimitError) {
-    return stopOffer(co, "RATE_LIMITED", { phase, step, error: formatError(error) });
+    return onStop("RATE_LIMITED", { phase, step, error: formatError(error) });
   }
   if (
     error instanceof MetaApiError &&
     /outside of allowed window/i.test(error.message)
   ) {
-    return stopOffer(co, "WINDOW_CLOSED", { phase, step });
+    return onStop("WINDOW_CLOSED", { phase, step });
   }
-  return stopOffer(co, "REJECTED", { phase, step, error: formatError(error) });
+  return onStop("REJECTED", { phase, step, error: formatError(error) });
 }
 
 // How each stop is reported in Diagnostics: a closed window and a deleted
@@ -923,13 +1028,6 @@ function stopArchived(co: LoadedContactOffer): Promise<void> {
 
 function stopWindowClosed(co: LoadedContactOffer): Promise<void> {
   return stopOffer(co, "WINDOW_CLOSED");
-}
-
-function stopAccountUnavailable(
-  co: LoadedContactOffer,
-  error?: string
-): Promise<void> {
-  return stopOffer(co, "ACCOUNT_UNAVAILABLE", error ? { error } : {});
 }
 
 function eventPayload(

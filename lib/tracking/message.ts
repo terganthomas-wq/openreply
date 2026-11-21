@@ -1,3 +1,5 @@
+import { SIGNUP_CALLBACK_PATH } from "@/lib/offers/signup-link";
+
 export interface MessageTrackedLink {
   slug: string;
   destinationUrl: string;
@@ -100,6 +102,15 @@ export function buildOfferUrl(
 ) {
   const url = `${resolveBaseUrl(baseUrl)}/o/${slug}`;
   return recipientToken ? `${url}?r=${recipientToken}` : url;
+}
+
+/**
+ * Where an offer's landing page reports a sign-up (POST, server to server).
+ * On the server it is NEXTAUTH_URL's, the address the offer links go out
+ * with, whatever address the dashboard was opened at.
+ */
+export function buildSignupCallbackUrl(baseUrl?: string) {
+  return `${resolveBaseUrl(baseUrl)}${SIGNUP_CALLBACK_PATH}`;
 }
 
 export function renderMessageWithTracking({

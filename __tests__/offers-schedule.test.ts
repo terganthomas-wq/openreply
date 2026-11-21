@@ -250,6 +250,8 @@ describe("offerJobId", () => {
       offerJobId.step("co1", "confirm", 2),
       offerJobId.card("co1"),
       offerJobId.reminder("co1"),
+      // The confirmation of a reported sign-up: one per row.
+      offerJobId.signup("co1"),
     ];
 
     expect(ids).toEqual([
@@ -258,6 +260,7 @@ describe("offerJobId", () => {
       "offer_co1_confirm_2",
       "offer_co1_card",
       "offer_co1_reminder",
+      "offer_co1_signup",
     ]);
     for (const id of ids) expect(id).not.toContain(":");
   });

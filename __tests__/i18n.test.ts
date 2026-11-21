@@ -155,4 +155,55 @@ describe("interface translations", () => {
     expect(t("{hours} hours later", { hours: 22 })).toBe("22 Stunden später");
     expect(createI18n("en").t("{hours} hours later", { hours: 22 })).toBe("22 hours later");
   });
+
+  // G2: the offer editor's sign-up feedback, the funnel stage, the contact
+  // history and the sign-up key on the API & MCP page.
+  it("names the sign-up feedback in every language", () => {
+    const keys = [
+      "Report the sign-up back",
+      "Report sign-ups from the landing page",
+      "For a landing page with a sign-up form, for example for your newsletter. The link on the card and in the reminder then gets a personal code (ig=…). Your landing page sends it back as soon as the person has signed up. They then get the tag and, if Instagram still allows it, your message in the chat.",
+      "Address for your landing page",
+      "Your landing page also needs a key with the access “{access}”.",
+      "Create the key under API & MCP",
+      "A key runs out after 90 days at the latest. Create a new one in time and replace it on your landing page.",
+      "Details for whoever builds your landing page",
+      "Copy the value of ig from the address of the landing page into a hidden form field and store it with the sign-up. Once the sign-up is confirmed (with double opt-in: after the click in the confirmation email), your server sends it:",
+      "Wait at most 3 seconds for the answer and ignore errors, so the page never breaks. The key stays on the server, never in the page itself.",
+      "Message in the chat after the sign-up",
+      "Leave it empty to only tag the person.",
+      "Instagram allows the message only up to 24 hours after the person's last tap or DM. Whoever signs up later only gets the tag.",
+      "Tag after the sign-up: {tag}",
+      "Change the tag",
+      "After the sign-up on your landing page",
+      "Signed up",
+      "Fill in all five tags.",
+      "Saves the offer messages with their pauses, the button, the confirmations, the card's button, the reminder and the message after the sign-up. Name, card, link and tags are set per offer.",
+      "Signed up on the landing page: {offer}",
+      "Sign-up confirmed in the chat: {offer}",
+      "Sign-up confirmed in the chat",
+      "Report sign-ups",
+      "Sign-ups",
+      "Create a key for {days} days that only reports sign-ups? Your landing page uses it. It cannot read or create campaigns.",
+      "A key that only reports sign-ups is for your landing page: it tells this tool who signed up after clicking an offer's link (offers with “Report the sign-up back”). It can do nothing else.",
+    ] as const;
+    for (const catalog of [zhTW, ptBR, ru, de]) {
+      for (const key of keys) expect(catalog[key], key).toBeTruthy();
+      // The four tags of before are five now.
+      expect(catalog, "old tag count").not.toHaveProperty(["Fill in all four tags."]);
+    }
+    const { t } = createI18n("de");
+    expect(t("Report the sign-up back")).toBe("Eintragung zurückmelden");
+    expect(t("Report sign-ups")).toBe("Eintragungen melden");
+    expect(t("Signed up")).toBe("Eingetragen");
+    expect(t("Your landing page also needs a key with the access “{access}”.", { access: t("Report sign-ups") })).toBe(
+      "Deine Landingpage braucht dafür einen Schlüssel mit dem Zugriff „Eintragungen melden“."
+    );
+    expect(t("Tag after the sign-up: {tag}", { tag: "Guide eingetragen" })).toBe(
+      "Tag nach der Eintragung: Guide eingetragen"
+    );
+    expect(createI18n("en").t("Signed up on the landing page: {offer}", { offer: "Guide" })).toBe(
+      "Signed up on the landing page: Guide"
+    );
+  });
 });

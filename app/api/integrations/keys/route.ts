@@ -3,6 +3,7 @@ import { prisma } from "@/lib/db/client";
 import { canManageWorkspace, getCurrentWorkspaceContext } from "@/lib/workspace-access";
 import { hashServiceToken, newServiceToken, SERVICE_SCOPES } from "@/lib/integrations/auth";
 import { apiError, ApiError, checkOrigin, readJson } from "@/lib/integrations/http";
+import { CAMPAIGN_SCOPES, isAllowedScopeSet } from "@/lib/integrations/scopes";
 
 const safeFields = { id: true, name: true, scopes: true, createdAt: true, expiresAt: true, revokedAt: true, lastUsedAt: true } as const;
 export async function GET() {
@@ -18,8 +19,11 @@ export async function POST(request: Request) {
     checkOrigin(request);
     const context = await getCurrentWorkspaceContext();
     if (!context || !canManageWorkspace(context.role)) throw new ApiError("Admin role required", 403);
-    // Read, write or both; the page offers read-only and read-and-write keys.
-    const input = z.object({ name: z.string().trim().min(1).max(100), scopes: z.array(z.enum(SERVICE_SCOPES)).min(1).max(SERVICE_SCOPES.length),
+    // Read, write or both, or reporting sign-ups alone; the page offers
+    // read-only, read-and-write and sign-up keys. At most both campaign
+    // scopes, and the sign-up scope never with another one.
+    const input = z.object({ name: z.string().trim().min(1).max(100),
+      scopes: z.array(z.enum(SERVICE_SCOPES)).min(1).max(CAMPAIGN_SCOPES.length).refine(isAllowedScopeSet),
       days: z.number().int().min(1).max(90).default(30) }).strict().safeParse(await readJson(request));
     if (!input.success) throw new ApiError("Invalid key configuration");
     const token = newServiceToken();

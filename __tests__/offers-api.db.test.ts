@@ -83,6 +83,7 @@ function offerBody(name: string) {
     tagInterested: `${name} Interesse`,
     tagSent: `${name} gesendet`,
     tagClicked: `${name} geklickt`,
+    tagSignedUp: `${name} eingetragen`,
   };
 }
 
@@ -227,8 +228,8 @@ describe.skipIf(!databaseUrl)("offers API on a real Postgres", () => {
     const at = new Date("2026-11-20T10:00:00.000Z");
     await db.contactOffer.createMany({
       data: [
-        // Tapped, got the card, clicked.
-        { workspaceId: WORKSPACE, contactId: "contact_igsid_1", offerId: a.id, interestedAt: at, sentAt: at, clickedAt: at },
+        // Tapped, got the card, clicked, signed up on the landing page.
+        { workspaceId: WORKSPACE, contactId: "contact_igsid_1", offerId: a.id, interestedAt: at, sentAt: at, clickedAt: at, signedUpAt: at },
         // Never tapped; the window closed before the reminder.
         { workspaceId: WORKSPACE, contactId: "contact_igsid_2", offerId: a.id, stoppedAt: at, stopReason: "WINDOW_CLOSED" },
         // Never tapped; got the reminder.
@@ -240,9 +241,9 @@ describe.skipIf(!databaseUrl)("offers API on a real Postgres", () => {
     const offers = await listOffers();
     expect(offers.map((offer) => offer.name)).toEqual(["A", "B", "C"]);
     expect(offers.map((offer) => offer.funnel)).toEqual([
-      { offered: 3, interested: 1, sent: 2, clicked: 1, stopped: 1 },
-      { offered: 0, interested: 0, sent: 0, clicked: 0, stopped: 0 },
-      { offered: 1, interested: 0, sent: 0, clicked: 0, stopped: 0 },
+      { offered: 3, interested: 1, sent: 2, clicked: 1, signedUp: 1, stopped: 1 },
+      { offered: 0, interested: 0, sent: 0, clicked: 0, signedUp: 0, stopped: 0 },
+      { offered: 1, interested: 0, sent: 0, clicked: 0, signedUp: 0, stopped: 0 },
     ]);
   });
 

@@ -80,10 +80,13 @@ function storedOffer(overrides: Partial<OfferRecord> = {}): OfferRecord {
     reminderMessage: "Nur kurz zur Info 👇",
     tagOffered: "Guide angeboten",
     tagInterested: "Guide Interesse",
+    signupTrackingEnabled: true,
+    signupMessage: "Danke! Schau in dein Postfach 📩",
     tagSent: "[LM] Guide gesendet",
     tagClicked: "Guide geklickt",
+    tagSignedUp: "Guide eingetragen",
     trackedUrl: "https://app.example.com/o/slug_1",
-    funnel: { offered: 10, interested: 4, sent: 6, clicked: 2, stopped: 1 },
+    funnel: { offered: 10, interested: 4, sent: 6, clicked: 2, signedUp: 1, stopped: 1 },
     ...overrides,
   };
 }
@@ -109,10 +112,14 @@ describe("offerPayload", () => {
       reminderEnabled: true,
       reminderDelayHours: 23,
       reminderMessage: GERMAN.reminderMessage,
+      // Off until the landing page takes part, the default text ready.
+      signupTrackingEnabled: false,
+      signupMessage: GERMAN.signupMessage,
       tagOffered: "Prompting Guide angeboten",
       tagInterested: "Prompting Guide Interesse",
       tagSent: "[LM] Prompting Guide gesendet",
       tagClicked: "Prompting Guide geklickt",
+      tagSignedUp: "Prompting Guide eingetragen",
     });
   });
 
@@ -187,10 +194,13 @@ describe("offerPayload", () => {
       reminderEnabled: false,
       reminderDelayHours: 12,
       reminderMessage: offer.reminderMessage,
+      signupTrackingEnabled: true,
+      signupMessage: offer.signupMessage,
       tagOffered: offer.tagOffered,
       tagInterested: offer.tagInterested,
       tagSent: offer.tagSent,
       tagClicked: offer.tagClicked,
+      tagSignedUp: offer.tagSignedUp,
     });
     expect(offerInputSchema.safeParse(payload).success).toBe(true);
   });
@@ -222,6 +232,7 @@ describe("tag names", () => {
       interested: "Prompting Guide Interesse",
       sent: "[LM] Prompting Guide gesendet",
       clicked: "Prompting Guide geklickt",
+      signedUp: "Prompting Guide eingetragen",
     });
     expect(
       tagNamesFromTemplates(EMPTY_MESSAGE_DEFAULTS.offer.tagTemplates, " Guide ")
@@ -230,6 +241,7 @@ describe("tag names", () => {
       interested: "Guide interested",
       sent: "Guide sent",
       clicked: "Guide clicked",
+      signedUp: "Guide signed up",
     });
   });
 
@@ -241,12 +253,13 @@ describe("tag names", () => {
       interested: "Interesse",
       sent: "[LM] gesendet",
       clicked: "geklickt",
+      signedUp: "eingetragen",
     });
 
     const typedOver = { ...state.tags, sent: "Guide raus" };
     const renamed = followTagTemplates(
       typedOver,
-      ["offered", "interested", "clicked"],
+      ["offered", "interested", "clicked", "signedUp"],
       templates,
       "Guide"
     );
@@ -255,6 +268,7 @@ describe("tag names", () => {
       interested: "Guide Interesse",
       sent: "Guide raus",
       clicked: "Guide geklickt",
+      signedUp: "Guide eingetragen",
     });
     // A stored offer's tags follow nothing.
     expect(followTagTemplates(typedOver, [], templates, "Other")).toEqual(typedOver);
@@ -369,6 +383,20 @@ describe("form checks", () => {
     expect(
       firstMissingField({ ...complete, tags: { ...complete.tags, clicked: " " } })
     ).toBe("tagClicked");
+    // The tag for a sign-up is needed like the other four, the switch on or off.
+    for (const signupTrackingEnabled of [true, false]) {
+      expect(
+        firstMissingField({
+          ...complete,
+          signupTrackingEnabled,
+          tags: { ...complete.tags, signedUp: "" },
+        })
+      ).toBe("tagSignedUp");
+    }
+    // The confirmation may stay empty: the tag alone.
+    expect(
+      firstMissingField({ ...complete, signupTrackingEnabled: true, signupMessage: " " })
+    ).toBeNull();
   });
 
   it("reads the API's field errors and finds the first one in form order", () => {
@@ -486,6 +514,75 @@ describe("the editor's own check in the interface language", () => {
   });
 });
 
+// An offer whose landing page reports sign-ups: the switch, the text and the
+// tag travel with the offer, and only the text is one of the defaults.
+describe("sign-up feedback in the form", () => {
+  it("starts off in a new offer, with the workspace's confirmation ready", () => {
+    const state = newOfferEditorState(GERMAN);
+    expect(state.signupTrackingEnabled).toBe(false);
+    expect(state.signupMessage).toBe(
+      "Danke fürs Eintragen! Ich habe dir gerade alles per E-Mail geschickt 📩"
+    );
+    expect(newOfferEditorState(null).signupMessage).toBe("");
+  });
+
+  it("saves the switch, the text trimmed (empty as none) and the tag", () => {
+    const payload = offerPayload({
+      ...typedGermanOffer(),
+      signupTrackingEnabled: true,
+      signupMessage: "  Danke! Schau in dein Postfach 📩  ",
+    });
+    expect(payload).toMatchObject({
+      signupTrackingEnabled: true,
+      signupMessage: "Danke! Schau in dein Postfach 📩",
+      tagSignedUp: "Prompting Guide eingetragen",
+    });
+    expect(offerInputSchema.safeParse(payload).success).toBe(true);
+
+    const tagOnly = offerPayload({
+      ...typedGermanOffer(),
+      signupTrackingEnabled: true,
+      signupMessage: "   ",
+    });
+    expect(tagOnly.signupMessage).toBeNull();
+    expect(offerInputSchema.parse(tagOnly).signupMessage).toBeNull();
+  });
+
+  it("keeps the text while the switch is off, so it comes back", () => {
+    const payload = offerPayload({ ...typedGermanOffer(), signupTrackingEnabled: false });
+    expect(payload.signupTrackingEnabled).toBe(false);
+    expect(payload.signupMessage).toBe(GERMAN.signupMessage);
+  });
+
+  it("is off for a whole offer that leaves it out, like every field it leaves out", () => {
+    // A body from an editor that does not know the two fields yet.
+    const older: Partial<ReturnType<typeof offerPayload>> = offerPayload(typedGermanOffer());
+    delete older.signupTrackingEnabled;
+    delete older.signupMessage;
+    const parsed = offerInputSchema.parse(older);
+    expect(parsed.signupTrackingEnabled).toBe(false);
+    expect(parsed.signupMessage).toBeNull();
+  });
+
+  it("holds the text to 1000 characters and needs the tag", () => {
+    const base = offerPayload({ ...typedGermanOffer(), signupTrackingEnabled: true });
+    expect(offerInputSchema.safeParse({ ...base, signupMessage: "a".repeat(1000) }).success).toBe(true);
+    const long = offerInputSchema.safeParse({ ...base, signupMessage: "a".repeat(1001) });
+    expect(long.success).toBe(false);
+    expect(long.error!.issues[0].path).toEqual(["signupMessage"]);
+    const noTag = offerInputSchema.safeParse({ ...base, tagSignedUp: "  " });
+    expect(noTag.success).toBe(false);
+    expect(noTag.error!.issues[0].path).toEqual(["tagSignedUp"]);
+  });
+
+  it("reads a stored offer back into the form", () => {
+    const state = editorStateFromOffer(storedOffer({ signupMessage: null }));
+    expect(state.signupTrackingEnabled).toBe(true);
+    expect(state.signupMessage).toBe("");
+    expect(state.tags.signedUp).toBe("Guide eingetragen");
+  });
+});
+
 describe("offerDefaultsUpdate", () => {
   it("saves the shared texts only, as the defaults route accepts them", () => {
     const update = offerDefaultsUpdate({
@@ -508,6 +605,7 @@ describe("offerDefaultsUpdate", () => {
       "reminderDelayHours",
       "reminderEnabled",
       "reminderMessage",
+      "signupMessage",
     ]);
     expect(update.offer?.offerMessages).toEqual(["Neu: mein Guide"]);
     expect(update.offer?.offerDelaysSeconds).toEqual([4]);

@@ -29,7 +29,7 @@ import {
   offerPatchSchema,
 } from "@/lib/offers/schema";
 import { isUniqueViolation } from "@/lib/queue/send-helpers";
-import { buildOfferUrl } from "@/lib/tracking/message";
+import { buildOfferUrl, buildSignupCallbackUrl } from "@/lib/tracking/message";
 import { generateTrackedLinkSlug } from "@/lib/tracking/server";
 import {
   canManageWorkspace,
@@ -40,12 +40,16 @@ import {
 // at once, so never cache this at the route or CDN layer.
 export const dynamic = "force-dynamic";
 
-/** How far people got with an offer (R10), counted on its ContactOffer rows. */
+/**
+ * How far people got with an offer (R10), counted on its ContactOffer rows.
+ * signedUp: sign-ups its landing page reported.
+ */
 type OfferFunnel = {
   offered: number;
   interested: number;
   sent: number;
   clicked: number;
+  signedUp: number;
   stopped: number;
 };
 
@@ -54,6 +58,7 @@ const EMPTY_FUNNEL: OfferFunnel = {
   interested: 0,
   sent: 0,
   clicked: 0,
+  signedUp: 0,
   stopped: 0,
 };
 
@@ -136,6 +141,7 @@ export async function GET(request: NextRequest) {
         interestedAt: true,
         sentAt: true,
         clickedAt: true,
+        signedUpAt: true,
         stoppedAt: true,
       },
     }),
@@ -149,6 +155,7 @@ export async function GET(request: NextRequest) {
         interested: _count.interestedAt,
         sent: _count.sentAt,
         clicked: _count.clickedAt,
+        signedUp: _count.signedUpAt,
         stopped: _count.stoppedAt,
       },
     ])
@@ -164,6 +171,8 @@ export async function GET(request: NextRequest) {
       // Whether the editor can upload card images (a Vercel Blob store is
       // connected); without it the editor shows the image-URL field.
       imageUploadEnabled: isOfferImageUploadEnabled(),
+      // Where a landing page reports sign-ups, for the editor to show.
+      signupUrl: buildSignupCallbackUrl(),
     },
     { headers: { "Cache-Control": "no-store" } }
   );

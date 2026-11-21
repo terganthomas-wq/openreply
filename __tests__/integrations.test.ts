@@ -462,6 +462,52 @@ describe("creating campaigns (campaigns:write)", () => {
   });
 });
 
+// A key for an offer's landing page: it reports sign-ups (POST
+// /api/offers/signup) and can do nothing else, so it never comes with a
+// campaign scope and finds no campaign tool or route open.
+describe("sign-up keys (signups:write)", () => {
+  const signups = { ...key, scopes: ["signups:write"] };
+  const signupsContext = { ...context, scopes: ["signups:write"] };
+
+  it("are a kind of their own, which the page names", () => {
+    expect(keyAccess(["signups:write"])).toBe("signups");
+    expect(keyAccess(["signups:write", "campaigns:read"])).toBeNull();
+  });
+
+  it("are created with that scope alone, for up to 90 days", async () => {
+    const response = await createKey(request({ name: "Landingpage", scopes: ["signups:write"], days: 90 }));
+    expect(response.status).toBe(201);
+    expect(state.keys.create.mock.calls[0][0].data.scopes).toEqual(["signups:write"]);
+    // Named twice it is stored once, as every scope is.
+    expect((await createKey(request({ name: "Landingpage", scopes: ["signups:write", "signups:write"] }))).status).toBe(201);
+    expect(state.keys.create.mock.calls[1][0].data.scopes).toEqual(["signups:write"]);
+  });
+
+  it.each([
+    [["signups:write", "campaigns:read"]],
+    [["campaigns:write", "signups:write"]],
+    [["campaigns:read", "campaigns:write", "signups:write"]],
+  ])("are never created together with a campaign scope: %j", async scopes => {
+    expect((await createKey(request({ name: "Landingpage", scopes }))).status).toBe(400);
+    expect(state.keys.create).not.toHaveBeenCalled();
+  });
+
+  it("open no campaign tool and no campaign route", async () => {
+    state.keys.findUnique.mockResolvedValue(signups);
+    expect(listTools(signupsContext)).toEqual([]);
+    const listed = await (await mcp(request({ jsonrpc: "2.0", id: 1, method: "tools/list" }))).json();
+    expect(listed.result.tools).toEqual([]);
+    const called = await (await mcp(request({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "list_campaigns", arguments: {} } }))).json();
+    expect(called.result).toEqual({ isError: true, content: [{ type: "text", text: "Missing scope: campaigns:read" }] });
+    await expect(callTool(signupsContext, "create_campaign", { name: "x" })).rejects.toMatchObject({ status: 403 });
+    expect((await rest(new Request("https://example.test/api/v1/campaigns", { headers }))).status).toBe(403);
+    const created = await restCreate(new Request("https://example.test/api/v1/campaigns", { method: "POST", headers, body: JSON.stringify({ name: "x" }) }));
+    expect(created.status).toBe(403);
+    expect(state.campaigns.findMany).not.toHaveBeenCalled();
+    expect(state.campaigns.create).not.toHaveBeenCalled();
+  });
+});
+
 describe("request boundaries", () => {
   it("enforces Origin while permitting non-browser clients", () => {
     expect(() => checkOrigin(request({}))).not.toThrow();

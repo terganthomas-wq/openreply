@@ -60,6 +60,16 @@ const optionalCutText = (max: number) =>
     .nullable()
     .default(null);
 
+// An optional text sent on its own; empty or left out means none.
+const optionalText = (max: number) =>
+  z
+    .string()
+    .trim()
+    .max(max)
+    .transform((value) => value || null)
+    .nullable()
+    .default(null);
+
 // Seconds before each message of a list, one entry per message.
 const delays = z
   .array(z.number().int().min(0).max(OFFER_DELAY_MAX_SECONDS))
@@ -117,11 +127,19 @@ export const offerFieldsSchema = z.object({
     .default(REMINDER_DELAY_MAX_HOURS),
   // Goes out with the card's button, so it must fit a button message.
   reminderMessage: optionalCutText(BUTTON_TEXT_MAX),
+  // Sign-up feedback: the links carry the person's code to the landing page,
+  // which reports the sign-up back (lib/offers/signup.ts). Left out, an edit
+  // switches it off, like every other field it leaves out.
+  signupTrackingEnabled: z.boolean().default(false),
+  // The chat confirmation after a reported sign-up, sent on its own; none
+  // means the tag alone.
+  signupMessage: optionalText(OFFER_MESSAGE_MAX),
   // The funnel tags (R2). Free text: two offers may share one.
   tagOffered: line(OFFER_TAG_MAX),
   tagInterested: line(OFFER_TAG_MAX),
   tagSent: line(OFFER_TAG_MAX),
   tagClicked: line(OFFER_TAG_MAX),
+  tagSignedUp: line(OFFER_TAG_MAX),
 });
 
 /** A whole offer, as the editor saves it (POST, and PATCH with every field). */

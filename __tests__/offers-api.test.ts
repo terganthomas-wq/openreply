@@ -97,6 +97,7 @@ const validOffer = {
   tagInterested: "Guide Interesse",
   tagSent: "[LM] Guide gesendet",
   tagClicked: "Guide geklickt",
+  tagSignedUp: "Guide eingetragen",
 };
 
 function storedOffer(overrides: Record<string, unknown> = {}) {
@@ -275,12 +276,12 @@ describe("GET /api/offers", () => {
     mockPrisma.contactOffer.groupBy.mockResolvedValue([
       {
         offerId: "offer_1",
-        _count: { _all: 10, interestedAt: 4, sentAt: 6, clickedAt: 3, stoppedAt: 1 },
+        _count: { _all: 10, interestedAt: 4, sentAt: 6, clickedAt: 3, signedUpAt: 2, stoppedAt: 1 },
       },
       // An archived offer's rows: in the counts, not in the list.
       {
         offerId: "offer_archived",
-        _count: { _all: 2, interestedAt: 2, sentAt: 2, clickedAt: 2, stoppedAt: 0 },
+        _count: { _all: 2, interestedAt: 2, sentAt: 2, clickedAt: 2, signedUpAt: 1, stoppedAt: 0 },
       },
     ]);
 
@@ -301,6 +302,7 @@ describe("GET /api/offers", () => {
         interestedAt: true,
         sentAt: true,
         clickedAt: true,
+        signedUpAt: true,
         stoppedAt: true,
       },
     });
@@ -317,6 +319,7 @@ describe("GET /api/offers", () => {
       interested: 4,
       sent: 6,
       clicked: 3,
+      signedUp: 2,
       stopped: 1,
     });
     // Nobody got the second offer yet.
@@ -325,6 +328,7 @@ describe("GET /api/offers", () => {
       interested: 0,
       sent: 0,
       clicked: 0,
+      signedUp: 0,
       stopped: 0,
     });
   });

@@ -39,6 +39,8 @@ function offerRow(overrides: Partial<HistoryOffer> = {}): HistoryOffer {
     sentVia: null,
     reminderSentAt: null,
     clickedAt: null,
+    signedUpAt: null,
+    signupMessageSentAt: null,
     stoppedAt: null,
     stopReason: null,
     offer: { name: "Guide", archivedAt: null },
@@ -186,6 +188,44 @@ describe("a contact's timeline", () => {
     ]);
     expect(events[0]).toMatchObject({ stopReason: "WINDOW_CLOSED", sentVia: null, offerArchived: true });
     expect(events[1]).toMatchObject({ sentVia: "BUTTON", stopReason: null });
+  });
+
+  // The landing page reported the sign-up after the click, and the chat
+  // confirmation followed; both are their own entries, after the click.
+  it("shows the sign-up the landing page reported and its confirmation in the chat", () => {
+    const events = timeline({
+      offers: [
+        offerRow({
+          pitchSentAt: at(11),
+          interestedAt: at(20),
+          sentAt: at(27),
+          sentVia: "CARD",
+          clickedAt: at(30),
+          signedUpAt: at(45),
+          signupMessageSentAt: at(46),
+        }),
+      ],
+      tags: [{ id: "tag_signed_up", tag: "Guide eingetragen", createdAt: at(45) }],
+    });
+
+    expect(keys(events)).toEqual([
+      "offer:co_1:signupConfirmed",
+      "tag:tag_signed_up",
+      "offer:co_1:signedUp",
+      "offer:co_1:clicked",
+      "offer:co_1:sent",
+      "offer:co_1:interested",
+      "offer:co_1:pitched",
+      "offer:co_1:offered",
+    ]);
+    expect(events[2]).toMatchObject({ kind: "offer", stage: "signedUp", offer: "Guide", campaign: "Reel 12" });
+  });
+
+  it("shows no sign-up for an offer whose landing page reported none", () => {
+    const events = timeline({ offers: [offerRow({ clickedAt: at(30) })] });
+
+    expect(events.some((event) => event.kind === "offer" && event.stage === "signedUp")).toBe(false);
+    expect(events.some((event) => event.kind === "offer" && event.stage === "signupConfirmed")).toBe(false);
   });
 
   it("lets the reminder stand for the delivery it made", () => {

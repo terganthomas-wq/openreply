@@ -3,17 +3,20 @@
 import { useEffect, useState } from "react";
 import { useI18n } from "@/lib/i18n/provider";
 import { ACCESS_SCOPES, keyAccess, type KeyAccess } from "@/lib/integrations/scopes";
+import { SIGNUP_CALLBACK_PATH } from "@/lib/offers/signup-link";
 
 type Key = { id: string; name: string; scopes: string[]; expiresAt: string; revokedAt: string | null };
-// The two kinds of key the form creates.
+// The three kinds of key the form creates.
 type Access = Exclude<KeyAccess, "createOnly">;
 
 // The form's words for each kind, also in the key list, which names a key by
-// its scopes. A key with campaigns:write alone comes only from the API.
+// its scopes. A key with campaigns:write alone comes only from the API. The
+// offer editor names the sign-up key's access the same way.
 const ACCESS_LABELS = {
   read: "Read only",
   write: "Read and write",
   createOnly: "Write only",
+  signups: "Report sign-ups",
 } as const satisfies Record<KeyAccess, string>;
 
 export default function IntegrationsPage() {
@@ -38,7 +41,9 @@ export default function IntegrationsPage() {
   async function create() {
     const question = access === "write"
       ? t("Create a read-and-write workspace key for {days} days? Anyone with this key can read your campaigns and create new ones.", { days })
-      : t("Create a read-only workspace key for {days} days? Anyone with this key can read your campaigns.", { days });
+      : access === "signups"
+        ? t("Create a key for {days} days that only reports sign-ups? Your landing page uses it. It cannot read or create campaigns.", { days })
+        : t("Create a read-only workspace key for {days} days? Anyone with this key can read your campaigns.", { days });
     if (!window.confirm(question)) return;
     setBusy(true); setToken(""); setNotice("");
     try {
@@ -69,12 +74,14 @@ export default function IntegrationsPage() {
   return <div className="mx-auto max-w-4xl space-y-6 p-6">
     <h1 className="text-2xl font-semibold">{t("API & MCP")}</h1>
     <p className="text-muted">{t("Workspace-scoped keys. A read-only key lists and reads campaigns. A read-and-write key can also create campaigns; they start paused unless the request switches them on. No key can change or delete existing campaigns. Only admins and owners can manage keys.")}</p>
+    <p className="text-muted">{t("A key that only reports sign-ups is for your landing page: it tells this tool who signed up after clicking an offer's link (offers with “Report the sign-up back”). It can do nothing else.")}</p>
     {notice && <p role="status">{notice}</p>}
     <section className="space-y-3 rounded border border-border p-4">
       <label className="block">{t("Key name")}<input maxLength={100} disabled={busy} className="w-full rounded border border-border p-2" value={name} onChange={e => setName(e.target.value)} /></label>
-      <label className="block">{t("Access")}<select disabled={busy} value={access} onChange={e => setAccess(e.target.value as Access)} className="ml-3 rounded border border-border p-2">
+      <label className="block">{t("Access")}<select disabled={busy} value={access} onChange={e => setAccess(e.target.value as Access)} className="ml-3 max-w-full rounded border border-border p-2">
         <option value="read">{t(ACCESS_LABELS.read)}</option>
         <option value="write">{t(ACCESS_LABELS.write)}</option>
+        <option value="signups">{t(ACCESS_LABELS.signups)}</option>
       </select></label>
       <label className="block">{t("Key lifetime")}<select disabled={busy} value={days} onChange={e => setDays(Number(e.target.value))} className="ml-3 rounded border border-border p-2">
         {[30, 60, 90].map(value => <option key={value} value={value}>{t("{days} days", { days: value })}</option>)}
@@ -99,7 +106,7 @@ export default function IntegrationsPage() {
     })}</section>
     <section className="space-y-2 text-sm">
       <h2 className="font-semibold">{t("Connection")}</h2>
-      <p>MCP: <code>/api/mcp</code> · REST: <code>/api/v1/campaigns</code></p>
+      <p>MCP: <code>/api/mcp</code> · REST: <code>/api/v1/campaigns</code> · {t("Sign-ups")}: <code className="break-all">{SIGNUP_CALLBACK_PATH}</code></p>
       <p>{t("Streamable HTTP with an Authorization: Bearer header. This server does not provide OAuth; use a client that supports custom headers.")}</p>
       <p>{t("Campaign lists are limited to 100. Use get_campaign for complete settings and destination links; clicks are raw requests, not unique recipients.")}</p>
       <p>{t("Read-and-write keys create campaigns by POST to the REST address or with the MCP tool create_campaign. Every field you leave out gets your default texts, as a new campaign in the editor does.")}</p>

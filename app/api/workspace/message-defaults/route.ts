@@ -18,6 +18,7 @@ import {
   builtInMessageDefaults,
   EMPTY_MESSAGE_DEFAULTS,
   isMessageDefaultsSection,
+  lacksLaterDefaults,
   mergeMessageDefaults,
   messageDefaultsSchema,
   messageDefaultsUpdateSchema,
@@ -99,13 +100,27 @@ async function builtInForRequest() {
   return builtInMessageDefaults(locale);
 }
 
+/**
+ * The saved defaults, or null when there are none this version can read.
+ * Defaults saved before a field existed get it from the built-in set of the
+ * reader's language, else the empty defaults; only then is the language
+ * asked for. Saving or resetting a section then stores them complete.
+ */
+async function readSaved(value: unknown): Promise<MessageDefaults | null> {
+  if (!lacksLaterDefaults(value)) return parseMessageDefaults(value);
+  return parseMessageDefaults(
+    value,
+    (await builtInForRequest()) ?? EMPTY_MESSAGE_DEFAULTS
+  );
+}
+
 export async function GET() {
   const context = await getCurrentWorkspaceContext();
   if (!context) return fail(401, "Unauthorized");
   const canManage = canManageWorkspace(context.role);
 
   // Saved defaults that this version cannot read count as none.
-  const stored = parseMessageDefaults(context.workspace.messageDefaults);
+  const stored = await readSaved(context.workspace.messageDefaults);
   if (stored) return respond(stored, canManage);
 
   const seed = await builtInForRequest();
@@ -129,7 +144,7 @@ export async function GET() {
     select: { messageDefaults: true },
   });
   return respond(
-    parseMessageDefaults(current?.messageDefaults) ?? seed,
+    parseMessageDefaults(current?.messageDefaults, seed) ?? seed,
     canManage
   );
 }
@@ -151,7 +166,7 @@ export async function PUT(request: NextRequest) {
   if (!parsed.success) return invalidInput(parsed.error);
 
   const base =
-    parseMessageDefaults(context.workspace.messageDefaults) ??
+    (await readSaved(context.workspace.messageDefaults)) ??
     (await builtInForRequest()) ??
     EMPTY_MESSAGE_DEFAULTS;
   const merged = messageDefaultsSchema.safeParse(
@@ -189,7 +204,10 @@ export async function DELETE(request: NextRequest) {
   const builtIn = await builtInForRequest();
   const kept = section
     ? resetMessageDefaultsSection(
-        parseMessageDefaults(context.workspace.messageDefaults),
+        parseMessageDefaults(
+          context.workspace.messageDefaults,
+          builtIn ?? EMPTY_MESSAGE_DEFAULTS
+        ),
         section,
         builtIn
       )

@@ -31,15 +31,18 @@ next offer they have not had. A repeat of the same trigger (a webhook
 Instagram sends twice, a retried job) starts nothing.
 
 Tags record how far each person got, per offer: offered, interested (tapped
-the button), sent (got the card or the reminder) and clicked (opened the
-link). New offers take their tag names from the workspace's tag templates
-and the offer's name, for example "Guide angeboten" and "[LM] Guide
-gesendet"; you can change them under **Tags** in the editor. The funnel on
-the Offers page counts the same stages, each as a share of everyone offered:
-a reminder counts as sent without any interest, so the stages are not
-nested, and sent and clicked can be higher than interested (the page then
-says why under the tiles). "Stopped early" counts offers that ended before
-the person got the link, for example because the messaging window closed.
+the button), sent (got the card or the reminder), clicked (opened the link)
+and signed up (the landing page reported the sign-up, see
+[Sign-up feedback](#sign-up-feedback-from-the-landing-page)). New offers take
+their tag names from the workspace's tag templates and the offer's name, for
+example "Guide angeboten" and "[LM] Guide gesendet"; you can change them
+under **Tags** in the editor. The funnel on the Offers page counts the same
+stages, each as a share of everyone offered ("Signed up" while the offer
+reports sign-ups, or once there are some): a reminder counts as sent without
+any interest, so the stages are not nested, and sent and clicked can be
+higher than interested (the page then says why under the tiles). "Stopped
+early" counts offers that ended before the person got the link, for example
+because the messaging window closed.
 
 ## Which offer a campaign uses
 
@@ -126,6 +129,47 @@ message"). The link behind the card's button may be any web page, Google
 Drive and Docs share links included. Clicks go through a tracked link
 (`/o/<slug>`) that forwards to it and records the click.
 
+## Sign-up feedback from the landing page
+
+**Report the sign-up back** in the offer editor is for a landing page with a
+sign-up form, such as a newsletter with double opt-in. With it on, a click
+on the card's or the reminder's link reaches the landing page with the
+person's own code added: `?ig=<code>` (24 base64url characters, 144 random
+bits, `ContactOffer.signupToken`). The code is created on the person's first
+click and stays the same; the rest of the address stays as typed, its query
+and fragment included, and an `ig` it carried is replaced. With the switch
+off, or for a link whose `?r=` belongs to nobody who got the offer, the
+destination goes out exactly as typed; a failed lookup never costs the
+person the link.
+
+The landing page keeps the code with the pending sign-up and, once the
+sign-up is confirmed, reports it from its server: `POST /api/offers/signup`
+with `{"token": "<ig value>"}` and a service key that has `signups:write`
+(**Report sign-ups** on the API & MCP page; such a key can do nothing else).
+The request, the answers and a PHP example are in `deploy/README.de.md`. The
+first report records the sign-up (`signedUpAt` and the offer's "signed up"
+tag, in one transaction) and queues the chat confirmation; every later report
+of the same code answers `{"data": {"alreadyRecorded": true}}` and changes
+nothing. A code of another workspace, of an offer whose switch is off or of
+a deleted contact answers 404. The answer never waits for Instagram.
+
+The confirmation is the offer's **Message in the chat after the sign-up**,
+with `{username}` like the other texts; empty means the tag alone. New offers
+start with the workspace's default (in German "Danke fürs Eintragen! Ich habe
+dir gerade alles per E-Mail geschickt 📩"), and switching the feedback on for
+an offer without a text fills that default in. It goes out once, only while
+Instagram's 24-hour window is open (from the person's last tap or DM), and
+counts toward the monthly DMs. Whatever keeps it from going out (a closed
+window, an unavailable account, a deleted offer, a refusal, the monthly
+limit) is reported in Diagnostics as "Sign-up confirmation not sent: …" and
+never marks the offer stopped. The contact's history shows the sign-up and
+the confirmation.
+
+Offers that existed before have the feedback off; their "signed up" tag is
+"<name> eingetragen" ("<name> signed up" for an offer whose "offered" tag
+ends in "offered"). Deleting a contact deletes its offer rows and with them
+its codes.
+
 ## Pause or delete
 
 - **Pause** (the switch on the Offers page): no new person gets the offer, the
@@ -144,8 +188,11 @@ Drive and Docs share links included. Clicks go through a tracked link
 A new offer starts with the workspace's default texts for offers (in German,
 the built-in set). Owners and admins can save the texts of a new offer as the
 defaults with **Save these texts as defaults for new offers**: the offer
-messages with their pauses, both buttons' labels, the confirmations and the
-reminder. Name, card, link and tags are set per offer.
+messages with their pauses, both buttons' labels, the confirmations, the
+reminder and the message after a sign-up. Name, card, link, tags and whether
+the landing page reports sign-ups are set per offer. Defaults saved before
+the sign-up message existed get it, and the "signed up" tag template, from
+the built-in set of the reader's language until they are saved again.
 
 ## Limits
 

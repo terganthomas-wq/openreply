@@ -8,6 +8,7 @@ const { mockPrisma, afterCallbacks } = vi.hoisted(() => ({
     },
     contactOffer: {
       findMany: vi.fn(),
+      findFirst: vi.fn(),
       updateMany: vi.fn(),
     },
     contactTag: {
@@ -49,7 +50,10 @@ const offerRow = {
   workspaceId: "workspace_123",
   destinationUrl: DESTINATION,
   tagClicked: "Guide geklickt",
+  signupTrackingEnabled: false,
 };
+// A person's sign-up code: 24 base64url characters.
+const CODE = "SgNuPcOdE_0123456789-xyz";
 
 function open(
   query = `?r=${TOKEN}`,
@@ -75,6 +79,10 @@ beforeEach(() => {
   mockPrisma.contactOffer.findMany.mockResolvedValue([
     { id: "contact_offer_1", contactId: "contact_1" },
   ]);
+  mockPrisma.contactOffer.findFirst.mockResolvedValue({
+    id: "contact_offer_1",
+    signupToken: CODE,
+  });
   mockPrisma.contactOffer.updateMany.mockResolvedValue({ count: 1 });
   mockPrisma.contactTag.createMany.mockResolvedValue({ count: 1 });
   // An interactive transaction, run on the same mocks.
@@ -111,6 +119,7 @@ describe("offer redirect /o/<slug>", () => {
         workspaceId: true,
         destinationUrl: true,
         tagClicked: true,
+        signupTrackingEnabled: true,
       },
     });
   });
@@ -290,5 +299,131 @@ describe("offer redirect /o/<slug>", () => {
       "[Offer redirect] Click not recorded:",
       expect.any(Error)
     );
+  });
+});
+
+// The landing page learns who signed up from a personal code (ig=) the
+// redirect adds, but only for an offer that reports sign-ups.
+describe("offer redirect with sign-up feedback", () => {
+  const tracked = { ...offerRow, signupTrackingEnabled: true };
+
+  beforeEach(() => {
+    mockPrisma.offer.findUnique.mockResolvedValue(tracked);
+  });
+
+  it("adds the person's code to the destination as ig, looked up before the redirect", async () => {
+    const response = await open();
+
+    expect(response.status).toBe(302);
+    expect(response.headers.get("location")).toBe(`${DESTINATION}&ig=${CODE}`);
+    // This offer and the link's recipient, in the offer's workspace.
+    expect(mockPrisma.contactOffer.findFirst).toHaveBeenCalledWith({
+      where: {
+        workspaceId: "workspace_123",
+        offerId: "offer_1",
+        contact: { recipientHash: TOKEN },
+      },
+      orderBy: [{ offeredAt: "desc" }, { id: "desc" }],
+      select: { id: true, signupToken: true },
+    });
+    // The click is still recorded after the response, as before.
+    expect(afterCallbacks).toHaveLength(1);
+    expect(mockPrisma.contactOffer.findMany).not.toHaveBeenCalled();
+    await runAfterCallbacks();
+    expect(mockPrisma.contactOffer.findMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("creates the code on the person's first click and keeps it in the row", async () => {
+    mockPrisma.contactOffer.findFirst.mockResolvedValue({
+      id: "contact_offer_1",
+      signupToken: null,
+    });
+
+    const response = await open();
+
+    const location = new URL(response.headers.get("location")!);
+    const code = location.searchParams.get("ig");
+    expect(code).toMatch(/^[A-Za-z0-9_-]{24}$/);
+    expect(location.searchParams.get("usp")).toBe("sharing");
+    expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledWith({
+      where: { id: "contact_offer_1", workspaceId: "workspace_123", signupToken: null },
+      data: { signupToken: code },
+    });
+  });
+
+  it("keeps the destination's own query and fragment and replaces an ig it carried", async () => {
+    mockPrisma.offer.findUnique.mockResolvedValue({
+      ...tracked,
+      destinationUrl: "https://landing.example/guide?utm_source=instagram&ig=old&q=a%20b#formular",
+    });
+
+    const response = await open();
+
+    expect(response.headers.get("location")).toBe(
+      `https://landing.example/guide?utm_source=instagram&q=a%20b&ig=${CODE}#formular`
+    );
+  });
+
+  it("sends the destination as typed when the link's recipient did not get the offer", async () => {
+    mockPrisma.contactOffer.findFirst.mockResolvedValue(null);
+
+    const response = await open();
+
+    expect(response.headers.get("location")).toBe(DESTINATION);
+    expect(mockPrisma.contactOffer.updateMany).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["without ?r=", ""],
+    ["with a malformed ?r=", "?r=not-a-token"],
+  ])("sends the destination as typed for a link %s, without a lookup", async (_case, query) => {
+    const response = await open(query);
+
+    expect(response.headers.get("location")).toBe(DESTINATION);
+    expect(mockPrisma.contactOffer.findFirst).not.toHaveBeenCalled();
+  });
+
+  it("never fails the redirect: a failed lookup sends the destination as typed, and the log names no code", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    mockPrisma.contactOffer.findFirst.mockRejectedValue(
+      Object.assign(new Error(`query failed for ${TOKEN} ${CODE}`), { code: "P1001" })
+    );
+
+    const response = await open();
+
+    expect(response.status).toBe(302);
+    expect(response.headers.get("location")).toBe(DESTINATION);
+    expect(consoleError).toHaveBeenCalledWith(
+      "[Offer redirect] Sign-up code not added:",
+      "Error P1001"
+    );
+    expect(JSON.stringify(consoleError.mock.calls)).not.toContain(CODE);
+    expect(JSON.stringify(consoleError.mock.calls)).not.toContain(TOKEN);
+  });
+
+  it("sends the destination as typed when writing the new code fails", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    mockPrisma.contactOffer.findFirst.mockResolvedValue({
+      id: "contact_offer_1",
+      signupToken: null,
+    });
+    mockPrisma.contactOffer.updateMany.mockRejectedValue(new Error("database asleep"));
+
+    const response = await open();
+
+    expect(response.headers.get("location")).toBe(DESTINATION);
+  });
+});
+
+describe("offer redirect without sign-up feedback", () => {
+  it("adds nothing and looks no code up, whatever the link carries", async () => {
+    for (const destinationUrl of [DESTINATION, "https://landing.example/guide?ig=typed#formular"]) {
+      mockPrisma.offer.findUnique.mockResolvedValue({ ...offerRow, destinationUrl });
+
+      const response = await open();
+
+      expect(response.headers.get("location")).toBe(destinationUrl);
+    }
+    expect(mockPrisma.contactOffer.findFirst).not.toHaveBeenCalled();
   });
 });

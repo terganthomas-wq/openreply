@@ -287,6 +287,11 @@ export default function OffersPage() {
             { label: t("Interested"), count: funnel.interested, tag: offer.tagInterested, share: percentOfOffered(funnel.interested, funnel.offered) },
             { label: t("Sent"), count: funnel.sent, tag: offer.tagSent, share: percentOfOffered(funnel.sent, funnel.offered) },
             { label: t("Clicked"), count: funnel.clicked, tag: offer.tagClicked, share: percentOfOffered(funnel.clicked, funnel.offered) },
+            // Sign-ups the landing page reported: shown while it reports
+            // them, and afterwards for as long as there are some.
+            ...(offer.signupTrackingEnabled || funnel.signedUp > 0
+              ? [{ label: t("Signed up"), count: funnel.signedUp, tag: offer.tagSignedUp, share: percentOfOffered(funnel.signedUp, funnel.offered) }]
+              : []),
           ];
           return (
             <div key={offer.id} className="panel rounded p-4">
@@ -391,8 +396,13 @@ export default function OffersPage() {
 
               {/* Funnel: every stage against everyone offered, since the
                   reminder counts as sent without any interest. Each tile
-                  lists the contacts with that stage's tag. */}
-              <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  lists the contacts with that stage's tag. Five tiles go
+                  three to a row until there is room for all five. */}
+              <div
+                className={`mt-4 grid grid-cols-2 gap-2 ${
+                  stages.length > 4 ? "sm:grid-cols-3 lg:grid-cols-5" : "sm:grid-cols-4"
+                }`}
+              >
                 {stages.map((stage) => (
                   <Link
                     key={stage.label}

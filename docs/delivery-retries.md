@@ -129,6 +129,22 @@ the offer's "clicked" tag in one transaction. Later clicks no longer find a
 clicked row, so a tag written after the time could be lost for good; now a
 failed write leaves neither, and the next click records both.
 
+A sign-up the offer's landing page reports (`POST /api/offers/signup`) sets
+the row's `signedUpAt` and the offer's "signed up" tag the same way, in one
+transaction that only an unset `signedUpAt` lets through, so a repeated or
+simultaneous report records nothing twice. Only that first report queues the
+chat confirmation, under a job id per row (`offer_<row>_signup`). The
+confirmation follows the policy above (window check, monthly DMs, claim per
+row, retries for rate limits), with one difference: whatever keeps it from
+going out is logged ("Sign-up confirmation not sent: …", INFO for a closed
+window, an unavailable account or a deleted offer, WARNING otherwise) and
+never marks the offer stopped, since the person got the link long before.
+Sent, claimed by an earlier run or with an unknown outcome, it records
+`signupMessageSentAt` and never goes out again. If queueing it fails after
+the sign-up was recorded, the sign-up and the tag stay, the confirmation is
+lost (a later report changes nothing) and a WARNING "Sign-up confirmation not
+queued" says so.
+
 Deleting an offer archives it when it was ever offered, so the card links
 already sent keep redirecting, and deletes it otherwise. Whether it was
 offered is read from `Offer.firstOfferedAt`, which the start sets before the

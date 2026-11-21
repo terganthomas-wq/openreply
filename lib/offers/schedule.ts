@@ -193,4 +193,6 @@ export const offerJobId = {
     `offer_${contactOfferId}_${phase}_${step}`,
   card: (contactOfferId: string) => `offer_${contactOfferId}_card`,
   reminder: (contactOfferId: string) => `offer_${contactOfferId}_reminder`,
+  // One per row: the landing page reports a sign-up once.
+  signup: (contactOfferId: string) => `offer_${contactOfferId}_signup`,
 };

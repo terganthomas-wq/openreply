@@ -34,8 +34,17 @@ export interface TimedMessage {
   delaySeconds: number;
 }
 
-/** The four funnel tags of an offer (R2), by stage. */
-export const TAG_KEYS = ["offered", "interested", "sent", "clicked"] as const;
+/**
+ * The funnel tags of an offer (R2), by stage. signedUp is added when the
+ * landing page reports the sign-up.
+ */
+export const TAG_KEYS = [
+  "offered",
+  "interested",
+  "sent",
+  "clicked",
+  "signedUp",
+] as const;
 export type TagKey = (typeof TAG_KEYS)[number];
 export type OfferTags = Record<TagKey, string>;
 export type TagTemplates = OfferDefaults["tagTemplates"];
@@ -54,6 +63,8 @@ export interface OfferEditorState {
   reminderEnabled: boolean;
   reminderDelayHours: number;
   reminderMessage: string;
+  signupTrackingEnabled: boolean;
+  signupMessage: string;
   tags: OfferTags;
 }
 
@@ -63,6 +74,8 @@ export interface OfferFunnel {
   interested: number;
   sent: number;
   clicked: number;
+  /** Sign-ups the landing page reported. */
+  signedUp: number;
   stopped: number;
 }
 
@@ -86,10 +99,13 @@ export interface OfferRecord {
   reminderEnabled: boolean;
   reminderDelayHours: number;
   reminderMessage: string | null;
+  signupTrackingEnabled: boolean;
+  signupMessage: string | null;
   tagOffered: string;
   tagInterested: string;
   tagSent: string;
   tagClicked: string;
+  tagSignedUp: string;
   /** The public /o/<slug> link behind the card's and the reminder's button. */
   trackedUrl: string;
   funnel: OfferFunnel;
@@ -116,10 +132,13 @@ export interface OfferPayload {
   reminderEnabled: boolean;
   reminderDelayHours: number;
   reminderMessage: string | null;
+  signupTrackingEnabled: boolean;
+  signupMessage: string | null;
   tagOffered: string;
   tagInterested: string;
   tagSent: string;
   tagClicked: string;
+  tagSignedUp: string;
 }
 
 export type OfferField = keyof OfferPayload;
@@ -130,6 +149,7 @@ export const TAG_FIELD: Record<TagKey, OfferField> = {
   interested: "tagInterested",
   sent: "tagSent",
   clicked: "tagClicked",
+  signedUp: "tagSignedUp",
 };
 
 /** The form's fields in the order they appear, to show the first error. */
@@ -148,10 +168,13 @@ export const OFFER_FORM_FIELDS: readonly OfferField[] = [
   "reminderEnabled",
   "reminderDelayHours",
   "reminderMessage",
+  "signupTrackingEnabled",
+  "signupMessage",
   "tagOffered",
   "tagInterested",
   "tagSent",
   "tagClicked",
+  "tagSignedUp",
 ];
 
 /** A pause the API takes: whole seconds from 0 to 60. */
@@ -204,7 +227,7 @@ function renderTag(template: string, name: string): string {
   return renderTagTemplate(template, name).replace(/ {2,}/g, " ");
 }
 
-/** The four tag names of an offer called `name`, from the tag templates. */
+/** The tag names of an offer called `name`, from the tag templates. */
 export function tagNamesFromTemplates(
   templates: TagTemplates,
   name: string
@@ -214,6 +237,7 @@ export function tagNamesFromTemplates(
     interested: renderTag(templates.interested, name),
     sent: renderTag(templates.sent, name),
     clicked: renderTag(templates.clicked, name),
+    signedUp: renderTag(templates.signedUp, name),
   };
 }
 
@@ -237,7 +261,9 @@ export function followTagTemplates(
 /**
  * A new offer's form: the workspace's default texts for offers, or empty
  * ones, with the tags rendered from the templates. The name, the card and
- * the link are each offer's own and start empty.
+ * the link are each offer's own and start empty. Reporting sign-ups starts
+ * off, as it needs the landing page to take part, but with the default
+ * confirmation ready.
  */
 export function newOfferEditorState(
   defaults: OfferDefaults | null
@@ -261,6 +287,8 @@ export function newOfferEditorState(
     reminderEnabled: base.reminderEnabled,
     reminderDelayHours: clampReminderHours(base.reminderDelayHours),
     reminderMessage: base.reminderMessage,
+    signupTrackingEnabled: false,
+    signupMessage: base.signupMessage,
     tags: tagNamesFromTemplates(base.tagTemplates, ""),
   };
 }
@@ -285,19 +313,22 @@ export function editorStateFromOffer(offer: OfferRecord): OfferEditorState {
     reminderEnabled: offer.reminderEnabled,
     reminderDelayHours: clampReminderHours(offer.reminderDelayHours),
     reminderMessage: offer.reminderMessage ?? "",
+    signupTrackingEnabled: offer.signupTrackingEnabled,
+    signupMessage: offer.signupMessage ?? "",
     tags: {
       offered: offer.tagOffered,
       interested: offer.tagInterested,
       sent: offer.tagSent,
       clicked: offer.tagClicked,
+      signedUp: offer.tagSignedUp,
     },
   };
 }
 
 /**
  * The body the editor saves. Empty optional texts go as null ("none"); the
- * reminder's text is kept while the reminder is off, so switching it back on
- * brings it back.
+ * reminder's and the sign-up confirmation's texts are kept while they are
+ * off, so switching them back on brings them back.
  */
 export function offerPayload(state: OfferEditorState): OfferPayload {
   const offerMessages = sentMessages(state.offerMessages);
@@ -319,18 +350,22 @@ export function offerPayload(state: OfferEditorState): OfferPayload {
     reminderEnabled: state.reminderEnabled,
     reminderDelayHours: clampReminderHours(state.reminderDelayHours),
     reminderMessage: state.reminderMessage.trim() || null,
+    signupTrackingEnabled: state.signupTrackingEnabled,
+    signupMessage: state.signupMessage.trim() || null,
     tagOffered: state.tags.offered.trim(),
     tagInterested: state.tags.interested.trim(),
     tagSent: state.tags.sent.trim(),
     tagClicked: state.tags.clicked.trim(),
+    tagSignedUp: state.tags.signedUp.trim(),
   };
 }
 
 /**
  * The PUT /api/workspace/message-defaults body behind "Save these texts as
- * defaults for new offers": the texts and switches offers share. The name,
- * the card, the link and the tag names are each offer's own, and the tag
- * templates keep their saved value.
+ * defaults for new offers": the texts and switches offers share, the
+ * sign-up confirmation included. The name, the card, the link, the tag
+ * names and whether the landing page reports sign-ups are each offer's own,
+ * and the tag templates keep their saved value.
  */
 export function offerDefaultsUpdate(
   state: OfferEditorState
@@ -350,6 +385,7 @@ export function offerDefaultsUpdate(
       reminderEnabled: state.reminderEnabled,
       reminderDelayHours: clampReminderHours(state.reminderDelayHours),
       reminderMessage: state.reminderMessage.trim(),
+      signupMessage: state.signupMessage.trim(),
     },
   };
 }

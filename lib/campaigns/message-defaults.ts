@@ -59,6 +59,16 @@ const delays = z
 // An offer's tag name with {name} where the offer's name goes.
 const tagTemplate = z.string().trim().min(1).max(TAG_MAX);
 
+// The funnel tags of a new offer (R2), rendered by renderTagTemplate. signedUp
+// is the tag for a sign-up the landing page reported.
+const tagTemplatesSchema = z.object({
+  offered: tagTemplate,
+  interested: tagTemplate,
+  sent: tagTemplate,
+  clicked: tagTemplate,
+  signedUp: tagTemplate,
+});
+
 /**
  * What a new campaign opens with. Only texts and switches: keywords, post and
  * links belong to each campaign. Combinations the campaign API refuses (an
@@ -100,52 +110,77 @@ const offerDefaultsFields = z.object({
   reminderDelayHours: z.number().int().min(1).max(REMINDER_DELAY_MAX_HOURS),
   // Goes out with the card's button.
   reminderMessage: text(BUTTON_TEXT_MAX),
-  // The four funnel tags of a new offer (R2), rendered by renderTagTemplate.
-  tagTemplates: z.object({
-    offered: tagTemplate,
-    interested: tagTemplate,
-    sent: tagTemplate,
-    clicked: tagTemplate,
-  }),
+  // The chat confirmation after a sign-up the landing page reported, sent on
+  // its own. Empty: the tag alone.
+  signupMessage: z.string().trim().max(MESSAGE_MAX),
+  tagTemplates: tagTemplatesSchema,
 });
 
-/** What a new offer starts from; its name, card and link are its own. */
-export const offerDefaultsSchema = offerDefaultsFields.superRefine(
-  (offer, ctx) => {
-    // The offer editor shows each message with the pause before it.
-    if (offer.offerDelaysSeconds.length !== offer.offerMessages.length) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["offerDelaysSeconds"],
-        message: "Give one delay per offer message",
-      });
-    }
-    if (
-      offer.confirmationDelaysSeconds.length !==
-      offer.confirmationMessages.length
-    ) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["confirmationDelaysSeconds"],
-        message: "Give one delay per confirmation message",
-      });
-    }
-    const last = offer.offerMessages.length - 1;
-    if (last >= 0 && offer.offerMessages[last].length > BUTTON_TEXT_MAX) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["offerMessages", last],
-        message: `The last offer message carries the button: at most ${BUTTON_TEXT_MAX} characters (emoji count as 2)`,
-        params: { maximum: BUTTON_TEXT_MAX, rule: LAST_OFFER_MESSAGE_RULE },
-      });
-    }
+// The rules across an offer's fields, for the defaults as saved and as read.
+function checkOfferDefaults(
+  offer: Pick<
+    z.infer<typeof offerDefaultsFields>,
+    | "offerMessages"
+    | "offerDelaysSeconds"
+    | "confirmationMessages"
+    | "confirmationDelaysSeconds"
+  >,
+  ctx: z.RefinementCtx
+) {
+  // The offer editor shows each message with the pause before it.
+  if (offer.offerDelaysSeconds.length !== offer.offerMessages.length) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["offerDelaysSeconds"],
+      message: "Give one delay per offer message",
+    });
   }
-);
+  if (
+    offer.confirmationDelaysSeconds.length !== offer.confirmationMessages.length
+  ) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["confirmationDelaysSeconds"],
+      message: "Give one delay per confirmation message",
+    });
+  }
+  const last = offer.offerMessages.length - 1;
+  if (last >= 0 && offer.offerMessages[last].length > BUTTON_TEXT_MAX) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["offerMessages", last],
+      message: `The last offer message carries the button: at most ${BUTTON_TEXT_MAX} characters (emoji count as 2)`,
+      params: { maximum: BUTTON_TEXT_MAX, rule: LAST_OFFER_MESSAGE_RULE },
+    });
+  }
+}
+
+/** What a new offer starts from; its name, card and link are its own. */
+export const offerDefaultsSchema =
+  offerDefaultsFields.superRefine(checkOfferDefaults);
 
 export const messageDefaultsSchema = z.object({
   version: z.literal(MESSAGE_DEFAULTS_VERSION),
   campaign: campaignDefaultsSchema,
   offer: offerDefaultsSchema,
+});
+
+/**
+ * Saved defaults as they may be stored: from before the sign-up message and
+ * its tag template existed, they lack both. Everything else is checked as
+ * strictly as before.
+ */
+const savedMessageDefaultsSchema = z.object({
+  version: z.literal(MESSAGE_DEFAULTS_VERSION),
+  campaign: campaignDefaultsSchema,
+  offer: offerDefaultsFields
+    .extend({
+      signupMessage: offerDefaultsFields.shape.signupMessage.optional(),
+      tagTemplates: tagTemplatesSchema.extend({
+        signedUp: tagTemplate.optional(),
+      }),
+    })
+    .superRefine(checkOfferDefaults),
 });
 
 export type MessageDefaults = z.infer<typeof messageDefaultsSchema>;
@@ -183,10 +218,53 @@ export function mergeMessageDefaults(
   };
 }
 
-/** Stored or received defaults, or null when they are missing or invalid. */
-export function parseMessageDefaults(value: unknown): MessageDefaults | null {
-  const parsed = messageDefaultsSchema.safeParse(value);
-  return parsed.success ? parsed.data : null;
+/**
+ * Stored or received defaults, or null when they are missing or invalid.
+ *
+ * Defaults saved before the sign-up message and its tag template existed
+ * still read: what they lack comes from `fill`, which the defaults route
+ * passes as the built-in set of the reader's language (so a German
+ * workspace's new offers get the German confirmation and "{name}
+ * eingetragen"), else the empty defaults. Read once more, filled defaults
+ * are complete and need no fill.
+ */
+export function parseMessageDefaults(
+  value: unknown,
+  fill: MessageDefaults = EMPTY_MESSAGE_DEFAULTS
+): MessageDefaults | null {
+  const parsed = savedMessageDefaultsSchema.safeParse(value);
+  if (!parsed.success) return null;
+  const { offer } = parsed.data;
+  return {
+    ...parsed.data,
+    offer: {
+      ...offer,
+      signupMessage: offer.signupMessage ?? fill.offer.signupMessage,
+      tagTemplates: {
+        ...offer.tagTemplates,
+        signedUp:
+          offer.tagTemplates.signedUp ?? fill.offer.tagTemplates.signedUp,
+      },
+    },
+  };
+}
+
+/**
+ * Whether stored defaults lack a field added since they were saved, so that
+ * reading them needs the fill of parseMessageDefaults. False for anything
+ * that is no saved defaults at all.
+ */
+export function lacksLaterDefaults(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const offer = (value as { offer?: unknown }).offer;
+  if (typeof offer !== "object" || offer === null) return false;
+  const templates = (offer as { tagTemplates?: unknown }).tagTemplates;
+  return (
+    !("signupMessage" in offer) ||
+    typeof templates !== "object" ||
+    templates === null ||
+    !("signedUp" in templates)
+  );
 }
 
 /**
@@ -224,11 +302,13 @@ export const EMPTY_MESSAGE_DEFAULTS: MessageDefaults = {
     reminderEnabled: false,
     reminderDelayHours: REMINDER_DELAY_MAX_HOURS,
     reminderMessage: "",
+    signupMessage: "",
     tagTemplates: {
       offered: "{name} offered",
       interested: "{name} interested",
       sent: "{name} sent",
       clicked: "{name} clicked",
+      signedUp: "{name} signed up",
     },
   },
 };
@@ -240,7 +320,9 @@ export const EMPTY_MESSAGE_DEFAULTS: MessageDefaults = {
  * neutral, as is everything else. The last offer message does not say the
  * guide is free because the person follows: after the second follow request
  * the link goes out without another check (R9b), so that may not be true.
- * Workspaces seeded before keep the texts they have.
+ * Workspaces seeded before keep the texts they have; the sign-up message and
+ * its tag template, which came later, they read from here
+ * (parseMessageDefaults).
  */
 export const BUILT_IN_MESSAGE_DEFAULTS: Partial<
   Record<Locale, MessageDefaults>
@@ -287,11 +369,14 @@ export const BUILT_IN_MESSAGE_DEFAULTS: Partial<
       reminderDelayHours: 23,
       reminderMessage:
         "Hey, nur kurz zur Info: Der Guide ist nicht ewig kostenlos, aber du kannst ihn dir hier noch holen 👇",
+      signupMessage:
+        "Danke fürs Eintragen! Ich habe dir gerade alles per E-Mail geschickt 📩",
       tagTemplates: {
         offered: "{name} angeboten",
         interested: "{name} Interesse",
         sent: "[LM] {name} gesendet",
         clicked: "{name} geklickt",
+        signedUp: "{name} eingetragen",
       },
     },
   },

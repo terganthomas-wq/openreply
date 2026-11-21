@@ -161,6 +161,9 @@ async function contactHistory(id: string) {
         sentVia: true,
         reminderSentAt: true,
         clickedAt: true,
+        // The sign-up and its confirmation; never the code itself.
+        signedUpAt: true,
+        signupMessageSentAt: true,
         stoppedAt: true,
         stopReason: true,
         offer: { select: { name: true, archivedAt: true } },

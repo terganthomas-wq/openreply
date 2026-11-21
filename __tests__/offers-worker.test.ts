@@ -182,6 +182,9 @@ const OFFER = {
   tagInterested: "Guide Interesse",
   tagSent: "Guide gesendet",
   tagClicked: "Guide geklickt",
+  signupTrackingEnabled: false,
+  signupMessage: null as string | null,
+  tagSignedUp: "Guide eingetragen",
   createdAt: new Date(0),
   updatedAt: new Date(0),
 };
@@ -223,6 +226,9 @@ function contactOffer(
     clickedAt: null,
     stoppedAt: null,
     stopReason: null,
+    signupToken: null,
+    signedUpAt: null,
+    signupMessageSentAt: null,
     ...overrides,
     offer: { ...OFFER, ...offer },
     contact: { ...CONTACT, ...contact },
@@ -2203,5 +2209,295 @@ describe("the reminder", () => {
     expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
       event("INFO", "Offer reminder skipped: messaging window closed")
     );
+  });
+});
+
+// After the landing page reported the sign-up (POST /api/offers/signup), one
+// message in the chat confirms it, while Instagram still allows it. The person
+// got the link long before, so nothing here ever marks the offer stopped.
+describe("the sign-up confirmation", () => {
+  // Tapped, got the card a minute ago, clicked and signed up just now.
+  const signedUp = (
+    row: Record<string, unknown> = {},
+    offer: Partial<typeof OFFER> = {},
+    contact: Partial<typeof CONTACT> = {}
+  ) =>
+    contactOffer(
+      {
+        pitchSentAt: new Date(NOW - 10 * MINUTE),
+        interestedAt: new Date(TAP_TIME),
+        sentAt: new Date(NOW - 50_000),
+        sentVia: "CARD",
+        clickedAt: new Date(NOW - 40_000),
+        signupToken: "SgNuPcOdE_0123456789-xyz",
+        signedUpAt: new Date(NOW - 1000),
+        ...row,
+      },
+      {
+        signupTrackingEnabled: true,
+        signupMessage: "Danke fürs Eintragen, {username}! Ich habe dir alles per E-Mail geschickt 📩",
+        ...offer,
+      },
+      contact
+    );
+
+  const confirm = (job: { attemptsMade?: number } = {}) =>
+    processOffer(offerJob({ phase: "signup", contactOfferId: "co1" }, job));
+
+  // A stop is never written for this message.
+  const stopWrites = () =>
+    mockPrisma.contactOffer.updateMany.mock.calls.filter(
+      ([args]) => "stoppedAt" in (args as { data: object }).data
+    );
+
+  beforeEach(() => {
+    mockPrisma.contactOffer.findFirst.mockResolvedValue(signedUp());
+  });
+
+  it("sends the offer's text with the name, under its own claim, and records it", async () => {
+    await confirm();
+
+    expect(mockPrisma.contactOffer.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "co1", workspaceId: "workspace_123" } })
+    );
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    expect(mockSendDirectMessage).toHaveBeenCalledWith(
+      META_AUTH,
+      "ig_456",
+      "commenter_999",
+      "Danke fürs Eintragen, commenter_user! Ich habe dir alles per E-Mail geschickt 📩"
+    );
+    expect(sends()).toBe(1);
+    // Claimed before it is sent, so a retry never sends it twice.
+    expect(mockPrisma.postbackDelivery.create).toHaveBeenCalledWith({
+      data: { id: claimId("signup", 0) },
+    });
+    expect(mockPrisma.postbackDelivery.create.mock.invocationCallOrder[0]).toBeLessThan(
+      mockSendDirectMessage.mock.invocationCallOrder[0]
+    );
+    // Counts toward the workspace's monthly DMs.
+    expect(mockReserveWorkspaceDMSend).toHaveBeenCalledWith("workspace_123");
+    expect(mockReleaseWorkspaceDMReservation).not.toHaveBeenCalled();
+    expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledWith({
+      where: { id: "co1", signupMessageSentAt: null },
+      data: { signupMessageSentAt: new Date(NOW) },
+    });
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+    expect(mockPrisma.operationalEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("sends nothing again for a claim an earlier run took, and records it as sent", async () => {
+    mockPrisma.postbackDelivery.create.mockRejectedValue(
+      Object.assign(new Error("Unique constraint failed"), { code: "P2002" })
+    );
+
+    await confirm();
+
+    expect(sends()).toBe(0);
+    expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledWith("workspace_123", USAGE_PERIOD);
+    expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledWith({
+      where: { id: "co1", signupMessageSentAt: null },
+      data: { signupMessageSentAt: new Date(NOW) },
+    });
+  });
+
+  it("says so and sends nothing when the confirmation went out before", async () => {
+    mockPrisma.contactOffer.findFirst.mockResolvedValue(
+      signedUp({ signupMessageSentAt: new Date(NOW - 500) })
+    );
+
+    await confirm();
+
+    expect(sends()).toBe(0);
+    expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
+    expect(mockPrisma.postbackDelivery.create).not.toHaveBeenCalled();
+    expect(mockPrisma.contactOffer.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+      event("INFO", "Sign-up confirmation not sent: it went out before", { phase: "signup" })
+    );
+  });
+
+  it("skips with an INFO event when the window has closed, and stops nothing", async () => {
+    // The double opt-in mail was confirmed a day after the last tap.
+    mockPrisma.contactOffer.findFirst.mockResolvedValue(
+      signedUp({}, {}, { lastInteractionAt: new Date(NOW - 24 * HOUR) })
+    );
+
+    await confirm();
+
+    expect(sends()).toBe(0);
+    expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
+    expect(mockPrisma.contactOffer.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+      event("INFO", "Sign-up confirmation not sent: messaging window closed", {
+        phase: "signup",
+        reason: "WINDOW_CLOSED",
+      })
+    );
+  });
+
+  it("goes out up to the end of the window, counted from the last tap or DM", async () => {
+    mockPrisma.contactOffer.findFirst.mockResolvedValue(
+      signedUp({}, {}, { lastInteractionAt: new Date(NOW - 23 * HOUR) })
+    );
+
+    await confirm();
+
+    expect(sends()).toBe(1);
+  });
+
+  it("skips with an INFO event when the account is unavailable", async () => {
+    mockPrisma.contactOffer.findFirst.mockResolvedValue(
+      signedUp({}, {}, { instagramAccount: { ...ACCOUNT, accessToken: "" } })
+    );
+
+    await confirm();
+
+    expect(sends()).toBe(0);
+    expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
+    expect(stopWrites()).toEqual([]);
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+      event("INFO", "Sign-up confirmation not sent: the Instagram account is unavailable", {
+        phase: "signup",
+        reason: "ACCOUNT_UNAVAILABLE",
+      })
+    );
+  });
+
+  it("reports a refusal as a WARNING, keeps the offer as it is and leaves it unsent", async () => {
+    mockSendDirectMessage.mockRejectedValue(
+      new MetaApiError(100, undefined, undefined, "Invalid parameter")
+    );
+
+    await confirm();
+
+    expect(stopWrites()).toEqual([]);
+    expect(mockPrisma.contactOffer.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.postbackDelivery.delete).toHaveBeenCalledWith({
+      where: { id: claimId("signup", 0) },
+    });
+    expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+      event("WARNING", "Sign-up confirmation not sent: Instagram refused a message", {
+        phase: "signup",
+        reason: "REJECTED",
+      })
+    );
+  });
+
+  it("reports Instagram's closed window as INFO", async () => {
+    mockSendDirectMessage.mockRejectedValue(
+      new MetaApiError(10, 2534022, undefined, "This message is sent outside of allowed window.")
+    );
+
+    await confirm();
+
+    expect(stopWrites()).toEqual([]);
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+      event("INFO", "Sign-up confirmation not sent: messaging window closed", {
+        reason: "WINDOW_CLOSED",
+      })
+    );
+  });
+
+  it("retries a rate limit while attempts are left and reports it on the last one", async () => {
+    mockSendDirectMessage.mockRejectedValue(new RateLimitError("Too many calls"));
+
+    await expect(confirm({ attemptsMade: 0 })).rejects.toBeInstanceOf(RateLimitError);
+    expect(mockPrisma.operationalEvent.create).not.toHaveBeenCalled();
+
+    await confirm({ attemptsMade: 2 });
+
+    expect(stopWrites()).toEqual([]);
+    expect(mockPrisma.contactOffer.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+      event("WARNING", "Sign-up confirmation not sent: Instagram rate limit reached", {
+        reason: "RATE_LIMITED",
+      })
+    );
+  });
+
+  it("records an unknown outcome as sent, so it never goes out twice", async () => {
+    mockSendDirectMessage.mockRejectedValue(
+      new MetaApiError(1, undefined, undefined, "An unknown error occurred")
+    );
+
+    await confirm();
+
+    expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledWith({
+      where: { id: "co1", signupMessageSentAt: null },
+      data: { signupMessageSentAt: new Date(NOW) },
+    });
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+      event("WARNING", "Offer message delivery unconfirmed", { phase: "signup", step: 0 })
+    );
+  });
+
+  it("reports the monthly limit as a WARNING and sends nothing", async () => {
+    mockReserveWorkspaceDMSend.mockResolvedValue({
+      allowed: false,
+      reserved: false,
+      remaining: 0,
+      limit: 2000,
+      periodStart: USAGE_PERIOD,
+    });
+
+    await confirm();
+
+    expect(sends()).toBe(0);
+    expect(mockPrisma.postbackDelivery.create).not.toHaveBeenCalled();
+    expect(stopWrites()).toEqual([]);
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+      event("WARNING", "Sign-up confirmation not sent: monthly DM limit reached", {
+        reason: "PLAN_LIMIT",
+      })
+    );
+  });
+
+  it("sends nothing for a deleted offer, and says so", async () => {
+    mockPrisma.contactOffer.findFirst.mockResolvedValue(
+      signedUp({}, { archivedAt: new Date(NOW - HOUR), isActive: false })
+    );
+
+    await confirm();
+
+    expect(sends()).toBe(0);
+    expect(mockPrisma.contactOffer.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+      event("INFO", "Sign-up confirmation not sent: offer was deleted", { reason: "OFFER_ARCHIVED" })
+    );
+  });
+
+  it("still goes out while the offer is paused", async () => {
+    mockPrisma.contactOffer.findFirst.mockResolvedValue(signedUp({}, { isActive: false }));
+
+    await confirm();
+
+    expect(sends()).toBe(1);
+  });
+
+  it.each([
+    { label: "without a recorded sign-up", row: { signedUpAt: null }, offer: {} },
+    { label: "once the text was emptied", row: {}, offer: { signupMessage: "   " } },
+    { label: "without a text", row: {}, offer: { signupMessage: null } },
+  ])("sends nothing $label", async ({ row, offer }) => {
+    mockPrisma.contactOffer.findFirst.mockResolvedValue(signedUp(row, offer));
+
+    await confirm();
+
+    expect(sends()).toBe(0);
+    expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
+    expect(mockPrisma.contactOffer.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.operationalEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("does nothing for a row that is gone, as after the contact was deleted", async () => {
+    mockPrisma.contactOffer.findFirst.mockResolvedValue(null);
+
+    await confirm();
+
+    expect(sends()).toBe(0);
+    expect(mockPrisma.contactOffer.updateMany).not.toHaveBeenCalled();
   });
 });
