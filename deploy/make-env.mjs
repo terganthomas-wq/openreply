@@ -190,6 +190,10 @@ write(path.join(dir, "worker.env"), [
   // Neon Free sleeps after 5 idle minutes and allows 100 CU-hours a month.
   // The default 5-minute sweep would keep it awake around the clock.
   ["COMMENT_POLL_INTERVAL_MS", "1800000"],
+  // The account posts about ten times a day: the default 10 newest posts
+  // reach back one day, the comment lookback three. 30 posts cost 30 comment
+  // reads per sweep, shared by all campaigns.
+  ["COMMENT_POLL_MEDIA_LIMIT", "30"],
   ["DB_POOL_MAX", "3"],
   ["CHECKPOINT_DISABLE", "1"],
   // Follow gate: Instagram reports a new follow with a delay, so the worker

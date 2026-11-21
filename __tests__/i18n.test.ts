@@ -228,4 +228,41 @@ describe("interface translations", () => {
       "Signed up on the landing page: Guide"
     );
   });
+
+  // R1: Diagnostics on Meta's request limits, the active pause and the
+  // events about it, in the reader's language (the worker stores English).
+  it("names Meta's request limits in every language", () => {
+    const keys = [
+      "Sending paused: Instagram limit reached",
+      "Instagram refuses messages for a while when too many requests reach it in a short time. What waits goes out on its own once the pause is over.",
+      "@{account}: paused until {time}",
+      "Waiting: {count}",
+      "Instagram limit reached: sending paused until {time}",
+      "Instagram limit reached for @{account}: sending paused until {time}",
+      "Instagram requests are at {percent}% of the limit. At 100% Instagram refuses messages.",
+      "Instagram requests for @{account} are at {percent}% of the limit. At 100% Instagram refuses messages.",
+      "The regular search for missed comments stopped early: Instagram limit reached for @{account}. The next search runs as planned.",
+    ] as const;
+    for (const catalog of [zhTW, ptBR, ru, de]) {
+      for (const key of keys) expect(catalog[key], key).toBeTruthy();
+    }
+    const { t } = createI18n("de");
+    expect(t("Instagram limit reached: sending paused until {time}", { time: "14:05" })).toBe(
+      "Instagram-Limit erreicht: Senden pausiert bis 14:05"
+    );
+    expect(t("Sending paused: Instagram limit reached")).toBe(
+      "Senden pausiert: Instagram-Limit erreicht"
+    );
+    expect(t("@{account}: paused until {time}", { account: "studio", time: "14:05" })).toBe(
+      "@studio: pausiert bis 14:05"
+    );
+    expect(
+      t("Instagram requests for @{account} are at {percent}% of the limit. At 100% Instagram refuses messages.", {
+        account: "studio",
+        percent: 85,
+      })
+    ).toBe(
+      "Die Instagram-Anfragen für @studio liegen bei 85 % des Limits. Bei 100 % lehnt Instagram Nachrichten ab."
+    );
+  });
 });

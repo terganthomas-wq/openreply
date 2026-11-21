@@ -57,7 +57,12 @@ export async function zernioRequest<T>({
   // safe to persist in job errors or return to the browser.
   if (!response.ok) {
     const message = `Zernio request failed (HTTP ${response.status})`;
-    if (response.status === 429) throw new RateLimitError(message);
+    // Zernio's own limit, carried as HTTP 429 rather than the class's default
+    // 368: that code is Meta's block, which pauses an account's sends
+    // (lib/instagram/delivery-errors.ts isMetaThrottle). A Zernio 429 keeps
+    // the handling it always had.
+    if (response.status === 429)
+      throw new RateLimitError(message, undefined, undefined, 429);
     if (response.status === 401) throw new TokenExpiredError(message);
     throw new ZernioApiError(response.status);
   }

@@ -34,6 +34,10 @@ export interface ProcessCommentJob {
   // from. Campaigns are bound to that post, so both ids have to be matched.
   originalMediaId?: string;
   requeueAttempt?: number;
+  // How often this comment was put back for the account's pause after a Meta
+  // request limit (lib/queue/account-pause.ts), capped at MAX_PAUSE_REQUEUES.
+  // Its copies are queued as comment_<account>_<comment>_pause_<n>.
+  pauseRequeue?: number;
   // Which path enqueued this comment. It is not copied to ProcessedComment or
   // used for reconciliation dedup.
   source?: CommentSource;

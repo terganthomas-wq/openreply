@@ -23,16 +23,28 @@
  * Known limitation, handled not fixed: comments removed by Instagram's Hidden
  * Words / spam filter may not be returned by the Graph API at all. Disable that
  * filter on the account to widen results.
+ *
+ * Meta's request limits: a read that Meta refuses with one (a throttle or a
+ * block) ends the whole sweep there, recorded once; the next sweep tries
+ * again. An account whose messaging is paused for a limit
+ * (lib/queue/account-pause.ts) is not swept at all while the pause lasts:
+ * nothing could be sent for its comments, and the first sweep after the pause
+ * finds them.
  */
 
 import { isQuestionComment } from "@/lib/automation/question-filter";
 import { MAX_COMMENT_SEND_ATTEMPTS } from "@/lib/queue/comment-delivery";
-import { hasLegacyUnconfirmedDelivery } from "@/lib/instagram/delivery-errors";
+import {
+  hasLegacyUnconfirmedDelivery,
+  isMetaThrottle,
+} from "@/lib/instagram/delivery-errors";
 import { prisma } from "@/lib/db/client";
+import { SWEEP_LIMIT_EVENT } from "@/lib/ops/event-details";
+import { checkAccountPause, formatPauseTime } from "@/lib/queue/account-pause";
 import { COMMENT_JOB_NAME, getDMQueue } from "@/lib/queue/client";
 import {
+  getAllUserMedia,
   getRecentMediaComments,
-  getUserMedia,
   MetaApiError,
   type InstagramComment,
 } from "@/lib/instagram/provider";
@@ -48,8 +60,32 @@ const LOOKBACK_HOURS = Number(process.env.COMMENT_POLL_LOOKBACK_HOURS ?? 72);
 // Hard cap on how many new comments a single campaign can enqueue per sweep, so
 // a viral post drains gradually instead of bursting into the comment API.
 const MAX_NEW_PER_SWEEP = Number(process.env.COMMENT_POLL_MAX_PER_SWEEP ?? 30);
-// For "any post" campaigns, how many recent posts to scan.
-const RECENT_MEDIA_LIMIT = 10;
+
+export const DEFAULT_COMMENT_POLL_MEDIA_LIMIT = 10;
+const MAX_COMMENT_POLL_MEDIA_LIMIT = 50;
+
+/**
+ * For "any post" campaigns, how many of the newest posts a sweep reads
+ * (COMMENT_POLL_MEDIA_LIMIT): a whole number from 1 to 50, 10 by default.
+ *
+ * Only this count bounds the posts, never their age: an older reel still
+ * gets comments, and the lookback (COMMENT_POLL_LOOKBACK_HOURS) bounds those.
+ * An account that posts ten times a day reaches back only one day with the
+ * default. Each post costs one comment read per sweep and account, shared by
+ * every campaign of the account.
+ */
+export function commentPollMediaLimit(value: string | undefined): number {
+  if (value === undefined || value.trim() === "") {
+    return DEFAULT_COMMENT_POLL_MEDIA_LIMIT;
+  }
+  const limit = Number(value);
+  if (!Number.isFinite(limit)) return DEFAULT_COMMENT_POLL_MEDIA_LIMIT;
+  return Math.min(MAX_COMMENT_POLL_MEDIA_LIMIT, Math.max(1, Math.floor(limit)));
+}
+
+const RECENT_MEDIA_LIMIT = commentPollMediaLimit(
+  process.env.COMMENT_POLL_MEDIA_LIMIT
+);
 
 interface SweepStat {
   campaign: string;
@@ -58,6 +94,9 @@ interface SweepStat {
   alreadyReplied: number;
   enqueued: number;
   errors: string[];
+  // A read Meta refused with a request limit. It ends the sweep and is
+  // recorded on its own (recordSweepStopped), not among the errors.
+  limit?: unknown;
 }
 
 function errMessage(error: unknown): string {
@@ -100,8 +139,23 @@ export async function reconcileComments(): Promise<void> {
   const sinceMs = Date.now() - LOOKBACK_HOURS * 60 * 60 * 1000;
   const tokenCache = new Map<string, InstagramContext | null>();
   const reads: SweepReads = { media: new Map(), comments: new Map() };
+  // Each account's pause, read once per sweep.
+  const pauses = new Map<string, number | null>();
 
   for (const automation of automations) {
+    const account = automation.instagramAccount;
+    let pausedUntil = pauses.get(account.id);
+    if (pausedUntil === undefined) {
+      pausedUntil = await checkAccountPause(account.instagramId);
+      pauses.set(account.id, pausedUntil);
+      if (pausedUntil !== null) {
+        console.log(
+          `[Sweep] @${account.username} is paused for an Instagram request limit until ${formatPauseTime(pausedUntil)}; not swept`
+        );
+      }
+    }
+    if (pausedUntil !== null) continue;
+
     const stat = await sweepCampaign({
       automation: automation,
       sinceMs: sinceMs,
@@ -118,6 +172,12 @@ export async function reconcileComments(): Promise<void> {
       })
     );
     await recordSweep(automation.workspaceId, stat);
+    if (stat.limit !== undefined) {
+      // Every further read would be refused as well, and would only keep
+      // the limit going: the rest of the sweep waits for the next one.
+      await recordSweepStopped(automation, stat.limit);
+      return;
+    }
   }
 }
 
@@ -143,7 +203,9 @@ function recentMediaIds(
 ): Promise<string[]> {
   let media = reads.media.get(accountId);
   if (!media) {
-    media = getUserMedia({ context, limit: RECENT_MEDIA_LIMIT }).then((rows) =>
+    // Page by page until the limit is reached, should Instagram return
+    // fewer posts per page than asked for.
+    media = getAllUserMedia({ context, max: RECENT_MEDIA_LIMIT }).then((rows) =>
       rows.map((m) => m.id)
     );
     reads.media.set(accountId, media);
@@ -235,6 +297,10 @@ async function sweepCampaign({
     try {
       mediaIds.push(...(await recentMediaIds(reads, account.id, accessToken)));
     } catch (error) {
+      if (isMetaThrottle(error)) {
+        stat.limit = error;
+        return stat;
+      }
       stat.errors.push(`Media list: ${errMessage(error)}`);
     }
   }
@@ -253,6 +319,11 @@ async function sweepCampaign({
         sinceMs
       );
     } catch (error) {
+      // The remaining posts would be refused as well.
+      if (isMetaThrottle(error)) {
+        stat.limit = error;
+        return stat;
+      }
       stat.errors.push(`Comments ${mediaId}: ${errMessage(error)}`);
       continue;
     }
@@ -411,7 +482,48 @@ async function recordSweep(
         source: "SYSTEM",
         level: stat.errors.length > 0 ? "WARNING" : "INFO",
         message: `Comment sweep "${stat.campaign}" [${stat.keywords}]: ${stat.enqueued} enqueued, ${stat.matched} matched, ${stat.alreadyReplied} already replied`,
-        payload: { ...stat },
+        // Not the request limit that may have ended the sweep: that one is
+        // recorded on its own (recordSweepStopped).
+        payload: {
+          campaign: stat.campaign,
+          keywords: stat.keywords,
+          matched: stat.matched,
+          alreadyReplied: stat.alreadyReplied,
+          enqueued: stat.enqueued,
+          errors: stat.errors,
+        },
+      },
+    })
+    .catch(() => {});
+}
+
+/**
+ * One event for a sweep that a request limit ended: which campaign's read
+ * Meta refused and how. The next sweep runs as scheduled.
+ */
+async function recordSweepStopped(
+  automation: {
+    name: string;
+    workspaceId: string;
+    instagramAccount: { instagramId: string; username: string };
+  },
+  limit: unknown
+): Promise<void> {
+  const account = automation.instagramAccount;
+  await prisma.operationalEvent
+    .create({
+      data: {
+        workspaceId: automation.workspaceId,
+        source: "SYSTEM",
+        level: "WARNING",
+        message: `Comment sweep stopped early: Instagram request limit while reading for "${automation.name}" (@${account.username}); the next sweep tries again`,
+        payload: {
+          kind: SWEEP_LIMIT_EVENT,
+          campaign: automation.name,
+          account: account.username,
+          instagramAccountId: account.instagramId,
+          error: errMessage(limit),
+        },
       },
     })
     .catch(() => {});

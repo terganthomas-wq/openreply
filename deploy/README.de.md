@@ -53,10 +53,80 @@ neu verbinden.
 - Die öffentliche Antwort („Schau in deine DMs“) kommt nach der DM und nur,
   wenn die DM rausging.
 - Für Tests eine Kampagne mit einem Stichwort nutzen, das niemand zufällig
-  schreibt (z. B. FOLGETEST). Bei „jeder Beitrag“ durchsucht der Worker die
-  letzten 10 Beiträge und die Kommentare der letzten 72 Stunden.
+  schreibt (z. B. FOLGETEST). Bei „jeder Beitrag“ durchsucht der Worker alle
+  30 Minuten die neuesten Beiträge und darin die Kommentare der letzten 72
+  Stunden. Wie viele Beiträge, steht in `COMMENT_POLL_MEDIA_LIMIT`
+  (1 bis 50, ohne Angabe 10; `deploy/make-env.mjs` schreibt 30 in
+  worker.env). Bei etwa zehn Beiträgen am Tag reichen 10 Beiträge nur einen
+  Tag zurück: Ein 35 Stunden alter Kommentar unter dem elftneuesten Reel
+  wurde so nie gefunden. Das Alter eines Beitrags zählt dabei nicht, auch ein
+  altes Reel bekommt neue Kommentare. Jeder Beitrag kostet pro Durchlauf eine
+  Leseanfrage bei Meta, egal wie viele Kampagnen es gibt. Auf einem schon
+  laufenden Server kommt der Wert erst an, wenn du `worker.env` neu
+  erzeugst (`node deploy/make-env.mjs <ordner>`) und hochlädst
+  (`bash deploy/oracle/upload-env.sh <server-ip> <ordner>/worker.env`).
 - Die Warte-Nachricht beim Follow-Gate steht in `FOLLOW_RECHECK_ACK_MESSAGE`
   (worker.env, über `deploy/make-env.mjs`).
+
+### Meta-Limits: Wenn Instagram „zu viele Anfragen“ meldet
+
+Meta begrenzt, wie viele Anfragen eine App in einem gleitenden Zeitfenster
+stellen darf. Am 21.11.2026 kam nach etwa 25 privaten Antworten in 9 Minuten
+(dazu rund 50 aufwendige Abrufe von Unterhaltungen und die Testläufe vom
+Morgen) auf jede Anfrage der App nur noch „(#4) Application request limit
+reached“, auch auf `GET /me`. Lesen von Beiträgen, Kommentaren und
+Unterhaltungen ging weiter. Die Sperre hielt ungefähr eine Stunde: Neue
+Versuche nach 5 und 15 Minuten scheiterten, 20 Minuten später gingen zwei
+Nachrichten durch und die nächsten drei wieder nicht, etwa 50 Minuten nach
+dem letzten aufwendigen Abruf ging alles wieder.
+
+Was das Tool daraus macht:
+
+- Als Limit zählen Metas Fehler 4, 17, 32, 613, 80002 und 80006 (zu viele
+  Anfragen) und 368 (vorübergehend gesperrt). Bei einem Limit wurde nichts
+  verschickt, die Nachricht kann also später raus. Vorher galten 32, 613,
+  80002 und 80006 als „vielleicht zugestellt“ und wurden nie wiederholt.
+- Lehnt Meta die DM zu einem Kommentar (private Antwort, Eröffnungs-DM,
+  Folgen-Bitte, Link) oder die Prüfung, ob die Person folgt, mit einem Limit
+  ab, pausiert das Tool das Senden für dieses Instagram-Konto: 20 Minuten,
+  bei 368 eine Stunde (einstellbar mit `META_THROTTLE_PAUSE_MINUTES` und
+  `META_BLOCK_PAUSE_MINUTES`, 1 bis 240 Minuten, in worker.env). Eine
+  laufende Pause wird höchstens verlängert, nie verkürzt.
+- Während der Pause fragt das Tool für die DMs zu Kommentaren nicht bei Meta
+  an. Der Kommentar wartet im DM-Protokoll als „Ausstehend“ und kommt nach
+  der Pause von selbst wieder dran, verteilt über die Minute danach, damit
+  nicht alles auf einmal rausgeht. Der abgelehnte Versuch zählt nicht zu den
+  drei Versuchen, die ein Kommentar hat. Erst nach 12 Pausen hintereinander
+  (bei 20 Minuten etwa 4 Stunden) gibt das Tool auf, dann steht der
+  Kommentar wie bisher auf „Fehlgeschlagen“, mit dem Grund. Doppelt geht
+  dabei nichts raus: Vor dem Senden belegt jeder Versuch den Kommentar in
+  der Datenbank, und nur einer kommt durch.
+- Die öffentliche Antwort unter dem Kommentar kommt wie bisher erst nach der
+  DM, also auch erst nach der Pause.
+- Die regelmäßige Suche nach verpassten Kommentaren lässt ein pausiertes
+  Konto aus, bis die Pause vorbei ist. Meldet Meta beim Lesen selbst ein
+  Limit, bricht der Durchlauf an dieser Stelle ab (ein Eintrag in
+  *Diagnose*), der nächste läuft wie geplant.
+- *Diagnose* zeigt oben „Senden pausiert: Instagram-Limit erreicht“ mit dem
+  Konto, der Uhrzeit, bis wann, und wie viele Nachrichten warten
+  („Wartend“). In der Zeitleiste steht einmal pro Pause „Instagram-Limit für
+  @konto erreicht: Senden pausiert bis …“, mit der Uhrzeit in deiner
+  Zeitzone. Als Grund speichert der Worker beim wartenden Kommentar
+  „Instagram request limit; next try at … UTC“ (der Worker rechnet in UTC).
+- Schon vorher warnt die *Diagnose*: Meta meldet bei jeder Antwort, wie viel
+  des Limits verbraucht ist. Ab 80 % schreibt der Worker höchstens alle 10
+  Minuten pro Konto einen Eintrag mit den Prozentwerten.
+- Das eigene Stundenlimit für private Antworten (750 pro Stunde und Konto)
+  gilt weiter wie bisher.
+- Button-Klicks, Antworten auf DMs, Folgenachrichten und Angebote kennen die
+  Pause noch nicht: Bei einem Limit gelten für sie noch die bisherigen
+  Wiederholungen nach 5 und 15 Minuten.
+- Über Zernio verbundene Konten bleiben, wie sie sind: Zernios eigenes Limit
+  (HTTP 429) löst keine Pause aus.
+
+Damit es gar nicht so weit kommt: Bei Tests nicht Dutzende Kommentare in
+wenigen Minuten schreiben, und große Abrufe (etwa viele Unterhaltungen auf
+einmal) nicht direkt vor einem Test.
 
 ## Zugangsdaten
 

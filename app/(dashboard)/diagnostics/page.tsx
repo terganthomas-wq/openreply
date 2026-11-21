@@ -1,6 +1,8 @@
 "use client";
 
+import type { I18n } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
+import type { EventDetail } from "@/lib/ops/event-details";
 import { useEffect, useState } from "react";
 import StatusBadge from "@/components/status-badge";
 
@@ -50,11 +52,64 @@ interface DiagnosticsData {
     message: string;
     createdAt: string;
     resolvedAt: string | null;
+    detail: EventDetail | null;
+  }>;
+  accountPauses: Array<{
+    username: string;
+    resumeAt: string;
+    waiting: number | null;
   }>;
 }
 
 function formatDate(value: string, locale: string) {
   return new Date(value).toLocaleString(locale);
+}
+
+// A time in the reader's own time zone; the worker stores UTC.
+function formatTime(value: string, locale: string) {
+  return new Date(value).toLocaleTimeString(locale, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+// The events about Meta's request limits, in the reader's language; every
+// other event shows the message it was stored with.
+function eventMessage(
+  event: DiagnosticsData["operationalEvents"][number],
+  { t, locale }: Pick<I18n, "t" | "locale">
+): string {
+  const detail = event.detail;
+  switch (detail?.kind) {
+    case "meta-pause": {
+      const time = formatTime(detail.resumeAt, locale);
+      return detail.account
+        ? t(
+            "Instagram limit reached for @{account}: sending paused until {time}",
+            { account: detail.account, time }
+          )
+        : t("Instagram limit reached: sending paused until {time}", { time });
+    }
+    case "meta-usage":
+      return detail.account
+        ? t(
+            "Instagram requests for @{account} are at {percent}% of the limit. At 100% Instagram refuses messages.",
+            { percent: detail.percent, account: detail.account }
+          )
+        : t(
+            "Instagram requests are at {percent}% of the limit. At 100% Instagram refuses messages.",
+            { percent: detail.percent }
+          );
+    case "sweep-limit":
+      return detail.account
+        ? t(
+            "The regular search for missed comments stopped early: Instagram limit reached for @{account}. The next search runs as planned.",
+            { account: detail.account }
+          )
+        : event.message;
+    default:
+      return event.message;
+  }
 }
 
 function EmptyState({ label }: { label: string }) {
@@ -139,6 +194,37 @@ export default function DiagnosticsPage() {
           {t("Refresh")}
         </button>
       </div>
+
+      {data?.accountPauses.length ? (
+        <section className="rounded border border-warning/30 bg-warning/10 p-4 sm:p-6">
+          <h2 className="text-base font-semibold text-foreground">
+            {t("Sending paused: Instagram limit reached")}
+          </h2>
+          <p className="mt-2 text-sm text-foreground">
+            {t(
+              "Instagram refuses messages for a while when too many requests reach it in a short time. What waits goes out on its own once the pause is over."
+            )}
+          </p>
+          <ul className="mt-3 space-y-1 text-sm text-foreground">
+            {data.accountPauses.map((pause) => (
+              <li key={pause.username} className="break-words">
+                <span className="font-semibold">
+                  {t("@{account}: paused until {time}", {
+                    account: pause.username,
+                    time: formatTime(pause.resumeAt, locale),
+                  })}
+                </span>
+                {pause.waiting ? (
+                  <span className="text-muted">
+                    {" · "}
+                    {t("Waiting: {count}", { count: pause.waiting })}
+                  </span>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
 
       <div className="grid grid-cols-2 gap-3 sm:gap-4 md:grid-cols-3">
         <div className="panel rounded p-4 sm:p-5">
@@ -275,7 +361,9 @@ export default function DiagnosticsPage() {
             {data.operationalEvents.map((event) => (
               <div key={event.id} className="grid gap-2 border-b border-border pb-3 last:border-0 sm:grid-cols-[140px_1fr_auto]">
                 <p className="text-xs font-semibold text-muted">{event.source}</p>
-                <p className="text-sm text-foreground">{event.message}</p>
+                <p className="min-w-0 break-words text-sm text-foreground">
+                  {eventMessage(event, { t, locale })}
+                </p>
                 <p className="text-xs text-muted">{formatDate(event.createdAt, locale)}</p>
               </div>
             ))}

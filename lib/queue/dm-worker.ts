@@ -3,8 +3,22 @@ import {
   hasLegacyUnconfirmedDelivery,
   isConfirmedSendRejection,
   isDeliveryUnconfirmed,
+  isMetaThrottle,
 } from "@/lib/instagram/delivery-errors";
-import { claimCommentDelivery, MAX_COMMENT_SEND_ATTEMPTS } from "./comment-delivery";
+import {
+  claimCommentDelivery,
+  MAX_COMMENT_SEND_ATTEMPTS,
+  releaseCommentClaim,
+} from "./comment-delivery";
+import {
+  AccountPausedError,
+  checkAccountPause,
+  formatPauseTime,
+  MAX_PAUSE_REQUEUES,
+  pauseAccountForLimit,
+  pausedRunAt,
+  requeueForPause,
+} from "./account-pause";
 import { afterLinkDelivered } from "./after-delivery";
 import {
   claimPostbackDelivery,
@@ -238,6 +252,100 @@ function connectionScope(data: DmQueueJob) {
 // carries the time of the tap it repeats; a tap is its own job's timestamp.
 function tapTime(job: Job<ProcessPostbackJob>): number {
   return job.data.tappedAt ?? job.timestamp ?? Date.now();
+}
+
+/**
+ * Put a comment back for the end of its account's pause instead of calling
+ * Meta (lib/queue/account-pause.ts): its DM leg waits as PENDING with the
+ * time of the next try, and a delayed copy of the job runs then, as
+ * comment_<account>_<comment>_pause_<n>. The copy goes through every
+ * campaign of the comment again, the one bound to the post first.
+ *
+ * With `releaseClaim`, this job claimed the DM leg for a send that Meta
+ * refused with a request limit. The claim is given back before the copy is
+ * queued (a copy that ran first would find it and take the DM for sent), and
+ * the refused try does not count as one of the comment's send attempts.
+ *
+ * After MAX_PAUSE_REQUEUES copies the comment is not put back ("capped"):
+ * the caller fails it as any refused send.
+ */
+async function holdCommentForPause({
+  job,
+  automationId,
+  resumeAt,
+  releaseClaim,
+}: {
+  job: Job<ProcessCommentJob>;
+  automationId: string;
+  resumeAt: number;
+  releaseClaim: boolean;
+}): Promise<"held" | "capped"> {
+  const { instagramAccountId, commentId } = job.data;
+  const held = (job.data.pauseRequeue ?? 0) + 1;
+  if (held > MAX_PAUSE_REQUEUES) return "capped";
+
+  const jobId = `comment_${instagramAccountId}_${commentId}_pause_${held}`;
+  const reason = `Instagram request limit; next try at ${formatPauseTime(
+    pausedRunAt(resumeAt, jobId)
+  )}`;
+  console.log(`[DM Worker] Comment ${commentId}: ${reason} (wait ${held})`);
+  if (releaseClaim) {
+    await releaseCommentClaim(automationId, commentId, reason);
+  } else {
+    await prisma.dmLog.updateMany({
+      where: {
+        automationId,
+        commentId,
+        status: { not: "SENT" },
+        dmDeliveryUnconfirmed: false,
+      },
+      data: { status: "PENDING", errorMessage: reason },
+    });
+  }
+  await requeueForPause({
+    name: COMMENT_JOB_NAME,
+    data: { ...job.data, pauseRequeue: held },
+    jobId,
+    instagramAccountId,
+    resumeAt,
+  });
+  return "held";
+}
+
+function pauseGaveUpMessage(resumeAt: number): string {
+  return `Instagram request limit: the account was still paused after ${MAX_PAUSE_REQUEUES} waits (until ${formatPauseTime(resumeAt)}), so the DM was not sent`;
+}
+
+/**
+ * The comment's account is paused, and nothing was claimed or sent for it
+ * yet: the comment waits for the end of the pause, or, after
+ * MAX_PAUSE_REQUEUES waits, fails like a refused send (FAILED, and the job
+ * is thrown back to BullMQ, whose retries send nothing while the pause
+ * lasts). Its send attempts stay as they are either way.
+ */
+async function waitForAccountPause(
+  job: Job<ProcessCommentJob>,
+  automationId: string,
+  resumeAt: number
+): Promise<void> {
+  const hold = await holdCommentForPause({
+    job,
+    automationId,
+    resumeAt,
+    releaseClaim: false,
+  });
+  if (hold === "held") return;
+  const message = pauseGaveUpMessage(resumeAt);
+  await prisma.dmLog.updateMany({
+    where: {
+      automationId,
+      commentId: job.data.commentId,
+      status: { not: "SENT" },
+      dmDeliveryUnconfirmed: false,
+    },
+    data: { status: "FAILED", errorMessage: message },
+  });
+  throw new AccountPausedError(message, resumeAt);
 }
 
 async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
@@ -548,6 +656,15 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       continue;
     }
 
+    // Meta refuses this account's calls for a request limit (the account is
+    // paused): nothing is called and nothing reserved. The comment waits for
+    // the end of the pause; the follow check and the send happen then.
+    const pausedUntil = await checkAccountPause(instagramAccountId);
+    if (pausedUntil !== null) {
+      await waitForAccountPause(job, automation.id, pausedUntil);
+      return;
+    }
+
     const usage = await reserveWorkspaceDMSend(automation.workspaceId);
     if (!usage.allowed) {
       await prisma.dmLog.update({
@@ -657,10 +774,28 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     // else gets the "follow me first" prompt (re-verified on tap).
     let sendFollowPrompt = false;
     if (automation.requireFollow && !useOpeningDm) {
-      const alreadyFollows = await getUserFollowStatus({
-        context: accessToken,
-        recipientId: commenterId,
-      });
+      let alreadyFollows: boolean | null;
+      try {
+        // A request limit is thrown rather than read as unknown, which would
+        // send the follow prompt to someone who may well follow.
+        alreadyFollows = await getUserFollowStatus({
+          context: accessToken,
+          recipientId: commenterId,
+          throwOnLimit: true,
+        });
+      } catch (error) {
+        if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
+        await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
+        if (!isMetaThrottle(error)) throw error;
+        const pause = await pauseAccountForLimit({
+          instagramAccountId,
+          workspaceId: automation.workspaceId,
+          account: automation.instagramAccount.username,
+          error,
+        });
+        await waitForAccountPause(job, automation.id, pause.resumeAt);
+        return;
+      }
       sendFollowPrompt =
         accessToken.provider === "ZERNIO"
           ? alreadyFollows === false
@@ -809,12 +944,34 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
         await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
       }
+      let errorMessage = formatError(sendError);
+      // A request limit proves nothing was sent, and the account's next calls
+      // would be refused as well. The account pauses, the claim goes back
+      // with its attempt, and the comment waits for the end of the pause.
+      // This job then ends without an error: BullMQ's own retries (5 and 15
+      // minutes) would only run into the limit again.
+      if (!delivered && isMetaThrottle(sendError)) {
+        const pause = await pauseAccountForLimit({
+          instagramAccountId,
+          workspaceId: automation.workspaceId,
+          account: automation.instagramAccount.username,
+          error: sendError,
+        });
+        const hold = await holdCommentForPause({
+          job,
+          automationId: automation.id,
+          resumeAt: pause.resumeAt,
+          releaseClaim: true,
+        });
+        if (hold === "held") return;
+        errorMessage = `${pauseGaveUpMessage(pause.resumeAt)}. ${errorMessage}`;
+      }
       await prisma.dmLog.update({
         where: { automationId_commentId: { automationId: automation.id, commentId } },
         data: {
           status: delivered ? "SENT" : "FAILED",
           ...(delivered ? { dmSentAt: new Date() } : {}),
-          errorMessage: formatError(sendError),
+          errorMessage,
           dmDeliveryUnconfirmed: isDeliveryUnconfirmed(sendError),
         },
       });

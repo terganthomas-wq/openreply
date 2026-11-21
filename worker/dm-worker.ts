@@ -1,9 +1,13 @@
 import { createDMWorker } from "@/lib/queue/dm-worker";
+import { startMetaUsageReports } from "@/lib/ops/meta-usage";
 import { recordWorkerHeartbeat } from "@/lib/ops/worker-health";
 import { reconcileComments } from "@/lib/polling/comment-reconciler";
 import { attachPendingNextReels } from "@/lib/automation/attach-next-reel";
 import os from "node:os";
 
+// A WARNING in Diagnostics once a Meta response reports 80 % of a request
+// limit, before Meta starts refusing messages.
+startMetaUsageReports();
 const worker = createDMWorker();
 const startedAt = new Date().toISOString();
 const HEARTBEAT_INTERVAL_MS = 30_000;

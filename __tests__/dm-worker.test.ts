@@ -188,6 +188,7 @@ import { afterLinkDelivered } from "../lib/queue/after-delivery";
 import { createDMWorker } from "../lib/queue/dm-worker";
 import { getRedisConnection } from "@/lib/queue/client";
 import { hashRecipientId } from "@/lib/tracking/server";
+import { FakeRedis } from "./helpers/fake-redis";
 
 const usagePeriodStart = new Date("2026-05-01T00:00:00.000Z");
 
@@ -271,6 +272,8 @@ function createMockPostbackJob(
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // An empty Redis: no account is paused for a Meta request limit.
+  vi.mocked(getRedisConnection).mockReturnValue(new FakeRedis() as never);
   // clearAllMocks keeps implementations: a test that makes the queue fail must
   // not leave the next test with a failing queue.
   mockQueueAdd.mockReset();
@@ -3744,5 +3747,379 @@ describe("DM Worker — offers after a delivered link", () => {
         data: expect.objectContaining({ message: START_EVENT }),
       });
     });
+  });
+});
+
+// R1: a Meta request limit costs the comment time, not its DM. The account
+// pauses (meta:pause:<ig>), the refused try does not count, and a copy of the
+// job waits for the end of the pause; nothing calls Meta in the meantime.
+describe("DM Worker — Meta request limits on the comment path", () => {
+  const MINUTE = 60_000;
+  const NOW = new Date("2026-11-21T13:00:00.000Z").getTime();
+  const PAUSE_KEY = "meta:pause:ig_456";
+  let redis: FakeRedis;
+
+  function limit(code: number) {
+    return Object.assign(
+      new RateLimitError(
+        `(#4) Application request limit reached (/v25.0/ig_456/messages) [code=${code} sub=- type=OAuthException trace=t]`
+      ),
+      { code }
+    );
+  }
+
+  function pauseEvents() {
+    return mockPrisma.operationalEvent.create.mock.calls.filter(
+      ([args]) =>
+        (args as { data: { payload?: { kind?: string } } }).data.payload
+          ?.kind === "meta-pause"
+    );
+  }
+
+  // The claim that every send takes on the comment's DmLog row.
+  function claims() {
+    return mockPrisma.dmLog.updateMany.mock.calls.filter(
+      ([args]) =>
+        (args as { data: Record<string, unknown> }).data
+          .dmDeliveryUnconfirmed === true
+    );
+  }
+
+  function pauseAdds() {
+    return mockQueueAdd.mock.calls.filter(([, , opts]) =>
+      String(opts?.jobId).includes("_pause_")
+    );
+  }
+
+  const webhookJob = (data: Record<string, unknown> = mockJobData) => ({
+    ...createMockJob(data),
+    id: "comment_ig_456_comment_555",
+  });
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    redis = new FakeRedis();
+    vi.mocked(getRedisConnection).mockReturnValue(redis as never);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+  });
+
+  it("puts the comment back for the pause instead of failing it", async () => {
+    mockSendPrivateReply.mockRejectedValueOnce(limit(4));
+
+    // The job ends without an error: BullMQ's own retries after 5 and 15
+    // minutes would only run into the limit again.
+    await expect(getProcessor()(webhookJob())).resolves.toBeUndefined();
+
+    // The claim goes back with its attempt: the refused try does not count.
+    expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith({
+      where: {
+        automationId: "auto_789",
+        commentId: "comment_555",
+        status: { not: "SENT" },
+        dmDeliveryUnconfirmed: true,
+        attempts: { gt: 0 },
+      },
+      data: {
+        dmDeliveryUnconfirmed: false,
+        attempts: { decrement: 1 },
+        status: "PENDING",
+        errorMessage: expect.stringMatching(
+          /^Instagram request limit; next try at 13:2\d UTC$/
+        ),
+      },
+    });
+    expect(mockPrisma.dmLog.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "FAILED" }),
+      })
+    );
+    // The reservations go back, as for any refusal.
+    expect(mockReleaseDMSlot).toHaveBeenCalledWith("ig_456");
+    expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledWith(
+      "workspace_123",
+      usagePeriodStart
+    );
+
+    // The account pauses for 20 minutes, recorded once.
+    await expect(redis.get(PAUSE_KEY)).resolves.toBe(String(NOW + 20 * MINUTE));
+    expect(pauseEvents()).toHaveLength(1);
+    expect(pauseEvents()[0][0].data).toMatchObject({
+      workspaceId: "workspace_123",
+      level: "WARNING",
+      message: "Instagram request limit reached: sending paused until 13:20 UTC",
+    });
+
+    // A copy of the job runs after the pause, within its minute of jitter.
+    expect(pauseAdds()).toEqual([
+      [
+        "process-comment",
+        { ...mockJobData, pauseRequeue: 1 },
+        {
+          jobId: "comment_ig_456_comment_555_pause_1",
+          delay: expect.any(Number),
+          removeOnComplete: true,
+        },
+      ],
+    ]);
+    const { delay } = pauseAdds()[0][2];
+    expect(delay).toBeGreaterThanOrEqual(20 * MINUTE);
+    expect(delay).toBeLessThan(21 * MINUTE);
+  });
+
+  it.each([4, 17, 32, 613, 80002, 80006])(
+    "puts the comment back for code %i, pausing 20 minutes",
+    async (code) => {
+      mockSendPrivateReply.mockRejectedValueOnce(limit(code));
+
+      await getProcessor()(webhookJob());
+
+      await expect(redis.get(PAUSE_KEY)).resolves.toBe(String(NOW + 20 * MINUTE));
+      expect(pauseAdds()).toHaveLength(1);
+    }
+  );
+
+  it("pauses an hour for a block (368), or as configured", async () => {
+    mockSendPrivateReply.mockRejectedValueOnce(limit(368));
+    await getProcessor()(webhookJob());
+    await expect(redis.get(PAUSE_KEY)).resolves.toBe(String(NOW + 60 * MINUTE));
+
+    vi.stubEnv("META_BLOCK_PAUSE_MINUTES", "120");
+    vi.setSystemTime(NOW + 61 * MINUTE);
+    mockSendPrivateReply.mockRejectedValueOnce(limit(368));
+    await getProcessor()(webhookJob());
+    await expect(redis.get(PAUSE_KEY)).resolves.toBe(
+      String(NOW + 61 * MINUTE + 120 * MINUTE)
+    );
+  });
+
+  it("calls nothing at Meta while the account is paused", async () => {
+    await redis.set(PAUSE_KEY, String(NOW + 10 * MINUTE), "PX", 10 * MINUTE);
+    mockPrisma.automation.findMany.mockResolvedValue([
+      { ...mockAutomation, requireFollow: true },
+    ]);
+
+    await expect(getProcessor()(webhookJob())).resolves.toBeUndefined();
+
+    expect(mockGetUserFollowStatus).not.toHaveBeenCalled();
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockSendPrivateReplyWithButton).not.toHaveBeenCalled();
+    // Nothing reserved, nothing claimed: the attempts stay as they were.
+    expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
+    expect(mockReserveDMSlot).not.toHaveBeenCalled();
+    expect(claims()).toHaveLength(0);
+    expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith({
+      where: {
+        automationId: "auto_789",
+        commentId: "comment_555",
+        status: { not: "SENT" },
+        dmDeliveryUnconfirmed: false,
+      },
+      data: {
+        status: "PENDING",
+        errorMessage: expect.stringMatching(/^Instagram request limit; next try at 13:1\d UTC$/),
+      },
+    });
+    expect(pauseAdds()).toHaveLength(1);
+    expect(pauseAdds()[0][2].delay).toBeGreaterThanOrEqual(10 * MINUTE);
+    expect(pauseAdds()[0][2].delay).toBeLessThan(11 * MINUTE);
+    // Whoever started the pause recorded it; this job did not.
+    expect(pauseEvents()).toHaveLength(0);
+  });
+
+  it("records the pause once, not once per comment", async () => {
+    mockSendPrivateReply.mockRejectedValueOnce(limit(4));
+    await getProcessor()(webhookJob());
+    await getProcessor()(
+      { ...createMockJob({ ...mockJobData, commentId: "comment_556" }), id: "comment_ig_456_comment_556" }
+    );
+    await getProcessor()(
+      { ...createMockJob({ ...mockJobData, commentId: "comment_557" }), id: "comment_ig_456_comment_557" }
+    );
+
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+    expect(pauseEvents()).toHaveLength(1);
+    expect(pauseAdds().map(([, , opts]) => opts.jobId)).toEqual([
+      "comment_ig_456_comment_555_pause_1",
+      "comment_ig_456_comment_556_pause_1",
+      "comment_ig_456_comment_557_pause_1",
+    ]);
+    // Spread over the minute after the pause, by job id.
+    const delays = pauseAdds().map(([, , opts]) => opts.delay);
+    expect(new Set(delays).size).toBe(3);
+  });
+
+  it("waits for the pause when the follow check runs into the limit", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      { ...mockAutomation, requireFollow: true },
+    ]);
+    mockGetUserFollowStatus.mockRejectedValueOnce(limit(4));
+
+    await expect(getProcessor()(webhookJob())).resolves.toBeUndefined();
+
+    // Asked to throw the limit instead of reading it as "not following",
+    // which would have sent the follow prompt to someone who may follow.
+    expect(mockGetUserFollowStatus).toHaveBeenCalledWith(
+      META_AUTH,
+      "commenter_999",
+      { throwOnLimit: true }
+    );
+    expect(mockSendPrivateReplyWithButton).not.toHaveBeenCalled();
+    expect(claims()).toHaveLength(0);
+    expect(mockReleaseDMSlot).toHaveBeenCalledWith("ig_456");
+    expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledWith(
+      "workspace_123",
+      usagePeriodStart
+    );
+    await expect(redis.get(PAUSE_KEY)).resolves.toBe(String(NOW + 20 * MINUTE));
+    expect(pauseEvents()).toHaveLength(1);
+    expect(pauseAdds()).toHaveLength(1);
+  });
+
+  it("sends the DM with the copy once the pause is over", async () => {
+    mockSendPrivateReply.mockRejectedValueOnce(limit(4));
+    await getProcessor()(webhookJob());
+    const [, data, opts] = pauseAdds()[0];
+
+    vi.setSystemTime(NOW + opts.delay);
+    mockPrisma.dmLog.findUnique.mockResolvedValue({
+      status: "PENDING",
+      attempts: 0,
+      dmDeliveryUnconfirmed: false,
+    });
+    await getProcessor()({ ...createMockJob(data), id: opts.jobId });
+
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(2);
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "SENT" }),
+      })
+    );
+  });
+
+  it("never sends twice when the copy and another job for the comment race", async () => {
+    let claimed = false;
+    mockPrisma.dmLog.updateMany.mockImplementation(
+      async (args: { data: Record<string, unknown> }) => {
+        if (args.data.dmDeliveryUnconfirmed !== true) return { count: 1 };
+        if (claimed) return { count: 0 };
+        claimed = true;
+        return { count: 1 };
+      }
+    );
+    const process = getProcessor();
+    await Promise.all([
+      process({
+        ...createMockJob({ ...mockJobData, pauseRequeue: 1 }),
+        id: "comment_ig_456_comment_555_pause_1",
+      }),
+      process({ ...createMockJob(), id: "sweep-job" }),
+    ]);
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives up after 12 waits and fails the comment as before", async () => {
+    mockSendPrivateReply.mockRejectedValueOnce(limit(4));
+
+    await expect(
+      getProcessor()(webhookJob({ ...mockJobData, pauseRequeue: 12 }))
+    ).rejects.toMatchObject({ name: "RateLimitError" });
+
+    expect(pauseAdds()).toHaveLength(0);
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith({
+      where: {
+        automationId_commentId: { automationId: "auto_789", commentId: "comment_555" },
+      },
+      data: expect.objectContaining({
+        status: "FAILED",
+        dmDeliveryUnconfirmed: false,
+        errorMessage: expect.stringMatching(
+          /^Instagram request limit: the account was still paused after 12 waits \(until 13:20 UTC\), so the DM was not sent\. \(#4\) Application request limit reached .*\[code=4 /
+        ),
+      }),
+    });
+    // The account still pauses: the next comment waits.
+    await expect(redis.get(PAUSE_KEY)).resolves.toBe(String(NOW + 20 * MINUTE));
+  });
+
+  it("gives up without calling Meta when the 13th try still finds the pause", async () => {
+    await redis.set(PAUSE_KEY, String(NOW + 10 * MINUTE), "PX", 10 * MINUTE);
+
+    await expect(
+      getProcessor()(webhookJob({ ...mockJobData, pauseRequeue: 12 }))
+    ).rejects.toMatchObject({ name: "AccountPausedError" });
+
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(pauseAdds()).toHaveLength(0);
+    expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith({
+      where: {
+        automationId: "auto_789",
+        commentId: "comment_555",
+        status: { not: "SENT" },
+        dmDeliveryUnconfirmed: false,
+      },
+      data: {
+        status: "FAILED",
+        errorMessage:
+          "Instagram request limit: the account was still paused after 12 waits (until 13:10 UTC), so the DM was not sent",
+      },
+    });
+  });
+
+  it("posts no public reply for a DM that waits", async () => {
+    const { sendCommentReply } = await import("@/lib/meta/client");
+    mockPrisma.automation.findMany.mockResolvedValue([
+      { ...mockAutomation, publicReplyEnabled: true, publicReplyMessages: ["Check your DMs"] },
+    ]);
+    mockSendPrivateReply.mockRejectedValueOnce(limit(4));
+
+    await getProcessor()(webhookJob());
+
+    expect(sendCommentReply).not.toHaveBeenCalled();
+  });
+
+  it("still fails other refusals at once, without a pause", async () => {
+    mockSendPrivateReply.mockRejectedValueOnce(
+      new MetaApiError(100, undefined, undefined, "The comment is invalid for a private reply")
+    );
+
+    await expect(getProcessor()(webhookJob())).rejects.toThrow("invalid for a private reply");
+
+    await expect(redis.get(PAUSE_KEY)).resolves.toBeNull();
+    expect(pauseAdds()).toHaveLength(0);
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "FAILED" }),
+      })
+    );
+  });
+
+  it("leaves Zernio's own limit (HTTP 429) as it was", async () => {
+    mockSendPrivateReply.mockRejectedValueOnce(limit(429));
+
+    await expect(getProcessor()(webhookJob())).rejects.toMatchObject({
+      name: "RateLimitError",
+    });
+
+    await expect(redis.get(PAUSE_KEY)).resolves.toBeNull();
+    expect(pauseAdds()).toHaveLength(0);
+  });
+
+  it("sends as before when Redis cannot be read", async () => {
+    vi.mocked(getRedisConnection).mockReturnValue({
+      get: async () => {
+        throw new Error("Connection is closed.");
+      },
+    } as never);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await getProcessor()(webhookJob());
+
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+    consoleError.mockRestore();
   });
 });

@@ -56,6 +56,77 @@ sends its link once.
 No campaign is paused by this policy. New comments continue through the normal
 flow. No schema migration is required.
 
+## Meta's request limits
+
+Meta refuses calls with a request limit when the app, the token, the page or
+the messaging API made too many calls in its rolling window: codes 4, 17, 32,
+613, 80002 and 80006 (throttles) and 368 (a temporary block). The Meta client
+turns every one of them into a `RateLimitError` that keeps Meta's code
+(`lib/meta/limits.ts`, `isMetaThrottle` and `throttlePauseMs` in
+`lib/instagram/delivery-errors.ts`). A request limit proves that nothing was
+sent, so it is a confirmed rejection; 32, 613, 80002 and 80006 used to be
+plain Meta errors and therefore "unconfirmed", never retried although nothing
+went out. Zernio's own HTTP 429 stays a `RateLimitError` with code 429 and is
+handled as before.
+
+While a limit lasts, every further call is refused too, and retrying after 5
+and 15 minutes only keeps it going. So an account pauses instead
+(`lib/queue/account-pause.ts`):
+
+- A throttle or block on a messaging call sets `meta:pause:<instagram id>` in
+  Redis to the resume time, expiring with it: 20 minutes for a throttle, 60
+  for a block (`META_THROTTLE_PAUSE_MINUTES`, `META_BLOCK_PAUSE_MINUTES`, 1 to
+  240). A Lua script sets or extends it in one step; a pause is never
+  shortened. The call that starts a pause records one WARNING ("Instagram
+  request limit reached: sending paused until …"), not one per job.
+- Before a messaging call a job asks `checkAccountPause`. While the account
+  is paused it calls nothing and puts a copy of itself back on the queue
+  (`requeueForPause`) for the resume time plus a jitter of 0 to 60 seconds
+  derived from the copy's job id, so a backlog spreads over a minute. Copies
+  are removed once they complete, like offer jobs, so a later pause can reuse
+  the id. When Redis cannot be read the call goes ahead and Meta answers.
+
+On the comment path this covers the private reply in every form (opening DM,
+follow prompt, link) and the follow check at comment time, which now reports
+a limit instead of reading it as "not following":
+
+- A pause found before the send: nothing is reserved, claimed or called. The
+  DM leg stays PENDING with "Instagram request limit; next try at HH:MM UTC"
+  and the copy `comment_<account>_<comment>_pause_<n>` runs after the pause.
+- A send refused for a limit: the hourly slot and the monthly reservation go
+  back as for any refusal, the account pauses, and the DM claim is given back
+  with its attempt (`releaseCommentClaim`: `dmDeliveryUnconfirmed` false, the
+  attempt count from before the claim, PENDING with the reason) before the
+  copy is queued. The job then ends without an error, so BullMQ's own
+  retries do not run into the limit again. The public reply is not posted:
+  it follows the DM, on the pass that sends it.
+- After 12 copies (`MAX_PAUSE_REQUEUES`, about four hours of throttles) the
+  comment fails as any refused send: FAILED with "Instagram request limit: the
+  account was still paused after 12 waits …", and the job is thrown back to
+  BullMQ. A refused send counts that one attempt, as before; a job that only
+  found the pause counts none, and its BullMQ retries send nothing while the
+  pause lasts.
+- Exactly-once is unchanged: every send still takes the DM claim first, and
+  a copy, a BullMQ retry, a redelivered webhook and a sweep job racing for the
+  same comment get it once. The copies only replace BullMQ's retries.
+- The comment sweep skips an account while it is paused, and a read that
+  Meta refuses with a limit ends the whole sweep there, recorded once; the
+  next sweep runs as scheduled.
+
+Button taps, DM keyword replies, follow-ups and offer messages do not check
+the pause yet; for them a rate limit is still retried after 5 and 15 minutes
+as described above and below. The internal hourly limiter for private
+replies (750 per hour and account) works as before.
+
+Every Meta response also says how much of the app's limit and of the
+account's business use case limit the last hour used (`x-app-usage`,
+`x-business-use-case-usage`). From 80 % of any of them the worker records a
+WARNING with the percentages, at most once per 10 minutes per account
+(`lib/ops/meta-usage.ts`). Neither the headers nor the event carry a token.
+Diagnostics shows an active pause per account, until when and how many jobs
+wait for it, and shows the pause and usage events in the reader's language
+and time zone.
+
 ## Lead-magnet offers
 
 A campaign with offers starts one only after its link went out following a

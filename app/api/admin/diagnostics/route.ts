@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { getCurrentWorkspaceId } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
 import { getDMQueue } from "@/lib/queue/client";
+import { readAccountPauses } from "@/lib/queue/account-pause";
+import { eventDetail } from "@/lib/ops/event-details";
 import { getWorkerAlerts, getWorkerHealth } from "@/lib/ops/worker-health";
 
 export const runtime = "nodejs";
@@ -23,6 +25,7 @@ export async function GET() {
     dmFailures,
     tokenRefreshFailures,
     operationalEvents,
+    accounts,
   ] = await Promise.all([
     getDMQueue().getJobCounts("waiting", "active", "delayed", "failed"),
     getWorkerHealth(),
@@ -87,9 +90,17 @@ export async function GET() {
         message: true,
         createdAt: true,
         resolvedAt: true,
+        payload: true,
       },
     }),
+    prisma.instagramAccount.findMany({
+      where: { workspaceId },
+      select: { instagramId: true, username: true },
+    }),
   ]);
+  // Accounts whose sending is paused for a Meta request limit, until when
+  // and how many jobs wait for it (lib/queue/account-pause.ts).
+  const accountPauses = await readAccountPauses(accounts);
 
   return NextResponse.json({
     success: true,
@@ -100,7 +111,13 @@ export async function GET() {
       webhookFailures,
       dmFailures,
       tokenRefreshFailures,
-      operationalEvents,
+      // The payload stays on the server: only what Diagnostics needs to
+      // show an event in the reader's language leaves it.
+      operationalEvents: operationalEvents.map(({ payload, ...event }) => ({
+        ...event,
+        detail: eventDetail(payload),
+      })),
+      accountPauses,
     },
   });
 }

@@ -2,15 +2,23 @@ import * as meta from "@/lib/meta/client";
 import { zernioRequest } from "@/lib/zernio/client";
 import type { InstagramContext, ZernioContext } from "./context";
 
+/**
+ * Whether the person follows the account; null when that cannot be read.
+ * With `throwOnLimit` a Meta request limit is thrown as the RateLimitError it
+ * is, so the caller can wait for it (lib/queue/account-pause.ts) instead of
+ * acting on a status it never got. Zernio has no such signal and stays null.
+ */
 export async function getUserFollowStatus({
   context,
   recipientId,
+  throwOnLimit = false,
 }: {
   context: InstagramContext;
   recipientId: string;
+  throwOnLimit?: boolean;
 }): Promise<boolean | null> {
   if (context.provider === "META")
-    return meta.getUserFollowStatus(context, recipientId);
+    return meta.getUserFollowStatus(context, recipientId, { throwOnLimit });
   try {
     const result = await zernioRequest<{ isFollower: boolean | null }>({
       apiKey: context.apiKey,
