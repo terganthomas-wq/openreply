@@ -1,11 +1,15 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Prisma } from "../app/generated/prisma/client";
 
 const state = vi.hoisted(() => ({
   keys: { findUnique: vi.fn(), update: vi.fn(), create: vi.fn(), findMany: vi.fn(), updateMany: vi.fn() },
-  campaigns: { findFirst: vi.fn(), findMany: vi.fn() },
+  campaigns: { findFirst: vi.fn(), findMany: vi.fn(), create: vi.fn() },
+  workspaces: { findUnique: vi.fn(), updateMany: vi.fn() },
+  accounts: { findFirst: vi.fn() },
+  offers: { count: vi.fn(), findFirst: vi.fn() },
   context: vi.fn(), eval: vi.fn(),
 }));
-vi.mock("@/lib/db/client", () => ({ prisma: { serviceKey: state.keys, automation: state.campaigns } }));
+vi.mock("@/lib/db/client", () => ({ prisma: { serviceKey: state.keys, automation: state.campaigns, workspace: state.workspaces, instagramAccount: state.accounts, offer: state.offers } }));
 vi.mock("@/lib/workspace-access", () => ({ getCurrentWorkspaceContext: state.context, canManageWorkspace: (role: string) => ["OWNER", "ADMIN"].includes(role) }));
 vi.mock("ioredis", () => ({ default: class { status = "ready"; eval = state.eval; listenerCount() { return 1; } } }));
 
@@ -13,9 +17,10 @@ import { authenticateService, hashServiceToken, newServiceToken } from "../lib/i
 import { checkOrigin, readJson } from "../lib/integrations/http";
 import { getCampaign } from "../lib/integrations/campaigns";
 import { callTool, listTools } from "../lib/integrations/mcp";
+import { builtInMessageDefaults, type MessageDefaults } from "../lib/campaigns/message-defaults";
 import { GET as listKeys, POST as createKey, DELETE as revokeKey } from "../app/api/integrations/keys/route";
 import { POST as mcp } from "../app/api/mcp/route";
-import { GET as rest } from "../app/api/v1/campaigns/route";
+import { GET as rest, POST as restCreate } from "../app/api/v1/campaigns/route";
 
 const token = `orp_${"a".repeat(43)}`;
 const key = { id: "key", workspaceId: "workspace", scopes: ["campaigns:read"], expiresAt: new Date("2099-01-01"), revokedAt: null };
@@ -99,6 +104,16 @@ describe("key management", () => {
     expect((await createKey(request({}, { origin: "https://evil.test" }))).status).toBe(403);
     expect(state.keys.create).not.toHaveBeenCalled();
   });
+  it.each([[["campaigns:read", "campaigns:write"]], [["campaigns:write"]]])("creates a key with the scopes %j", async scopes => {
+    const response = await createKey(request({ name: "Reel publisher", scopes }));
+    expect(response.status).toBe(201);
+    expect(state.keys.create.mock.calls[0][0].data.scopes).toEqual(scopes);
+    expect((await response.json()).key.scopes).toEqual(scopes);
+  });
+  it.each([[["campaigns:delete"]], [["campaigns:read", "contacts:read"]], [[]], [["campaigns:read", "campaigns:write", "campaigns:read"]]])("rejects the scopes %j", async scopes => {
+    expect((await createKey(request({ name: "Reel publisher", scopes }))).status).toBe(400);
+    expect(state.keys.create).not.toHaveBeenCalled();
+  });
   it("lists safe workspace metadata and revokes only workspace keys", async () => {
     expect((await listKeys()).status).toBe(200);
     const selected = state.keys.findMany.mock.calls[0][0];
@@ -153,6 +168,201 @@ describe("read-only MCP and REST", () => {
     await expect(getCampaign(context, "foreign")).rejects.toMatchObject({ status: 404 });
     state.campaigns.findFirst.mockResolvedValue({ id: "empty", trackedLinks: [] });
     expect(await getCampaign(context, "empty")).toMatchObject({ trackedDestinationUrl: null, secondaryDestinationUrl: null, trackedLinks: [] });
+  });
+});
+
+describe("creating campaigns (campaigns:write)", () => {
+  const german = builtInMessageDefaults("de") as MessageDefaults;
+  const writer = { ...key, scopes: ["campaigns:read", "campaigns:write"] };
+  const link = "https://drive.google.com/file/d/abc123/view?usp=sharing";
+  // What a reel needs; every other field comes from the workspace's defaults.
+  const reel = { name: "Prompt reel", keywords: ["Prompt", "Promt", "Prom"], postId: "media_1", trackedDestinationUrl: link };
+  const stored = { id: "created", name: "Prompt reel", isActive: false, trackedLinks: [{ destinationUrl: link, label: "Primary campaign link", position: 0 }] };
+  const post = (body: unknown, extra = {}) => new Request("https://example.test/api/v1/campaigns", { method: "POST", headers: { ...headers, ...extra }, body: JSON.stringify(body) });
+  const callCreate = (id: number, args: unknown) => request({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "create_campaign", arguments: args } });
+  const created = (call = 0) => state.campaigns.create.mock.calls[call][0].data;
+  // Slugs are random; everything else of two creates must match.
+  const withoutSlugs = (value: unknown) => JSON.parse(JSON.stringify(value, (field, v) => field === "slug" || field === "reportShareSlug" ? typeof v : v));
+
+  beforeEach(() => {
+    state.keys.findUnique.mockResolvedValue(writer);
+    state.workspaces.findUnique.mockResolvedValue({ id: "workspace", messageDefaults: german });
+    state.workspaces.updateMany.mockResolvedValue({ count: 0 });
+    state.accounts.findFirst.mockResolvedValue({ id: "account_workspace" });
+    state.offers.findFirst.mockResolvedValue({ id: "offer_1" });
+    state.offers.count.mockImplementation(async ({ where }: { where: { id: { in: string[] } } }) => where.id.in.length);
+    state.campaigns.create.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => ({ id: "created", ...data, trackedLinks: [] }));
+    state.campaigns.findFirst.mockResolvedValue(stored);
+  });
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("refuses a read key with 403 before reading its body and hides create_campaign from it", async () => {
+    state.keys.findUnique.mockResolvedValue(key);
+    for (const attempt of [post(reel), post(reel, { "content-type": "text/plain" })]) {
+      const response = await restCreate(attempt);
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({ error: "Missing scope: campaigns:write" });
+    }
+    expect(listTools(context).map(tool => tool.name)).not.toContain("create_campaign");
+    const listed = await (await mcp(request({ jsonrpc: "2.0", id: 1, method: "tools/list" }))).json();
+    expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toEqual(["list_campaigns", "get_campaign", "get_campaign_stats"]);
+    const called = await (await mcp(callCreate(2, reel))).json();
+    expect(called.result).toEqual({ isError: true, content: [{ type: "text", text: "Missing scope: campaigns:write" }] });
+    expect(state.workspaces.findUnique).not.toHaveBeenCalled();
+    expect(state.campaigns.create).not.toHaveBeenCalled();
+  });
+
+  it("creates a paused campaign with the workspace's German defaults from name, keywords, post and link", async () => {
+    const response = await restCreate(post(reel));
+    expect(response.status).toBe(201);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toEqual({ data: { ...stored, trackedDestinationUrl: link, secondaryDestinationUrl: null, secondaryButtonLabel: null } });
+    const defaults = german.campaign;
+    expect(created()).toMatchObject({
+      name: "Prompt reel", keywords: reel.keywords, postId: "media_1", isActive: false,
+      workspaceId: "workspace", instagramAccountId: "account_workspace",
+      openingDmEnabled: true, openingDmMessage: defaults.openingDmMessage, openingDmButtonLabel: defaults.openingDmButtonLabel,
+      requireFollow: true, followPromptMessage: defaults.followPromptMessage, followPromptButtonLabel: defaults.followPromptButtonLabel,
+      followPromptRetryMessage: defaults.followPromptRetryMessage, followPromptRetryButtonLabel: defaults.followPromptRetryButtonLabel,
+      // {link} as the editor adds it: where a text-only fallback puts the link.
+      dmMessage: `${defaults.dmMessage} {link}`, linkButtonLabel: defaults.linkButtonLabel,
+      publicReplyEnabled: true, publicReplyMessages: defaults.publicReplyMessages, publicReplyMessage: defaults.publicReplyMessages[0],
+      ignoreQuestionComments: true, offersEnabled: true, offerIds: [],
+      trackedLinks: { create: [expect.objectContaining({ workspaceId: "workspace", destinationUrl: link, position: 0 })] },
+    });
+    // Defaults, offers and account are this key's workspace's; nothing is seeded over stored defaults.
+    expect(state.workspaces.findUnique).toHaveBeenCalledWith({ where: { id: "workspace" }, select: { messageDefaults: true } });
+    expect(state.offers.findFirst).toHaveBeenCalledWith({ where: { workspaceId: "workspace", isActive: true, archivedAt: null }, select: { id: true } });
+    expect(state.accounts.findFirst).toHaveBeenCalledWith({ where: { workspaceId: "workspace" }, orderBy: { connectedAt: "desc" }, select: { id: true } });
+    expect(state.workspaces.updateMany).not.toHaveBeenCalled();
+    // The answer is get_campaign's projection of the stored campaign.
+    const { select, where } = state.campaigns.findFirst.mock.calls[0][0];
+    expect(where).toEqual({ id: "created", workspaceId: "workspace" });
+    await getCampaign(context, "created");
+    expect(state.campaigns.findFirst.mock.calls[1][0].select).toEqual(select);
+  });
+
+  it("leaves offers off without an active offer and starts a campaign only when isActive is sent", async () => {
+    state.offers.findFirst.mockResolvedValue(null);
+    expect((await restCreate(post(reel))).status).toBe(201);
+    expect(created()).toMatchObject({ offersEnabled: false, isActive: false });
+    expect((await restCreate(post({ ...reel, isActive: true }))).status).toBe(201);
+    expect(created(1).isActive).toBe(true);
+  });
+
+  it("takes every field the body sends over the defaults", async () => {
+    const body = { ...reel, dmMessage: "Hier ist der Prompt 👇", publicReplyEnabled: false, requireFollow: false, openingDmEnabled: false,
+      offersEnabled: false, ignoreQuestionComments: false, deliveryTag: " [LM] Prompt gesendet " };
+    expect((await restCreate(post(body))).status).toBe(201);
+    expect(created()).toMatchObject({
+      dmMessage: `${body.dmMessage} {link}`, publicReplyEnabled: false, publicReplyMessages: [], publicReplyMessage: null,
+      requireFollow: false, followPromptMessage: null, followPromptRetryMessage: null,
+      openingDmEnabled: false, openingDmMessage: null, offersEnabled: false, ignoreQuestionComments: false, deliveryTag: "[LM] Prompt gesendet",
+    });
+  });
+
+  it.each([
+    ["an unknown field", { ...reel, offerId: "offer_1" }, 'Unrecognized key: "offerId"'],
+    ["a misspelt field", { ...reel, keyword: ["Prompt"] }, 'Unrecognized key: "keyword"'],
+    ["no trigger post", { name: "No post", keywords: ["Prompt"] }, "postId: Choose which post(s) trigger the campaign"],
+    ["offers the defaults switch on without the opening DM", { ...reel, openingDmEnabled: false }, "offersEnabled: Offers need the opening DM"],
+    ["a list instead of an object", [reel], "Send the campaign as a JSON object"],
+  ])("returns 400 for %s and stores nothing", async (_case, body, message) => {
+    const response = await restCreate(post(body));
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toContain(message);
+    expect(state.campaigns.create).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["no account is connected", reel, 400, "Connect Instagram before creating campaigns"],
+    ["the account belongs to another workspace", { ...reel, instagramAccountId: "account_other" }, 400, "Connect Instagram before creating campaigns"],
+  ])("returns 400 when %s", async (_case, body, status, error) => {
+    state.accounts.findFirst.mockResolvedValue(null);
+    const response = await restCreate(post(body));
+    expect(response.status).toBe(status);
+    expect(await response.json()).toEqual({ error });
+    expect(state.accounts.findFirst.mock.calls[0][0].where.workspaceId).toBe("workspace");
+    expect(state.campaigns.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses an offer order with another workspace's or an archived offer", async () => {
+    state.offers.count.mockResolvedValue(0);
+    const response = await restCreate(post({ ...reel, offerIds: ["offer_other"] }));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "Unknown offer" });
+    expect(state.offers.count).toHaveBeenCalledWith({ where: { workspaceId: "workspace", id: { in: ["offer_other"] }, archivedAt: null } });
+  });
+
+  it("seeds the installation's built-in defaults into a workspace that has none", async () => {
+    vi.stubEnv("DEFAULT_LOCALE", "de");
+    state.workspaces.findUnique.mockResolvedValue({ id: "workspace", messageDefaults: null });
+    state.workspaces.updateMany.mockResolvedValue({ count: 1 });
+    expect((await restCreate(post(reel))).status).toBe(201);
+    expect(state.workspaces.updateMany).toHaveBeenCalledWith({ where: { id: "workspace", messageDefaults: { equals: Prisma.DbNull } }, data: { messageDefaults: german } });
+    expect(state.workspaces.updateMany.mock.calls[0][0].where.messageDefaults.equals).toBe(Prisma.DbNull);
+    expect(created()).toMatchObject({ dmMessage: `${german.campaign.dmMessage} {link}`, openingDmMessage: german.campaign.openingDmMessage, isActive: false });
+  });
+
+  it.each([
+    ["a link and a text without the token", { dmMessage: "  Hier ist der Prompt  " }, "Hier ist der Prompt {link}"],
+    ["a text that has the token", { dmMessage: "Hier: {LINK} viel Spaß" }, "Hier: {LINK} viel Spaß"],
+    ["no link", { dmMessage: "Schreib mir!", trackedDestinationUrl: "" }, "Schreib mir!"],
+    ["no link field at all", { dmMessage: "Schreib mir!", trackedDestinationUrl: undefined }, "Schreib mir!"],
+  ])("stores the DM text for %s", async (_case, fields, dmMessage) => {
+    expect((await restCreate(post({ ...reel, ...fields }))).status).toBe(201);
+    expect(created().dmMessage).toBe(dmMessage);
+  });
+
+  it("does not turn an empty DM text into the token alone", async () => {
+    const response = await restCreate(post({ ...reel, dmMessage: "" }));
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toContain("dmMessage");
+    expect(state.campaigns.create).not.toHaveBeenCalled();
+  });
+
+  it("needs the texts in the body where the installation's language has no built-in set", async () => {
+    vi.stubEnv("DEFAULT_LOCALE", undefined);
+    state.workspaces.findUnique.mockResolvedValue({ id: "workspace", messageDefaults: null });
+    const missing = await restCreate(post(reel));
+    expect(missing.status).toBe(400);
+    expect((await missing.json()).error).toContain("dmMessage");
+    expect(state.workspaces.updateMany).not.toHaveBeenCalled();
+    expect((await restCreate(post({ ...reel, dmMessage: "Here is your link" }))).status).toBe(201);
+    expect(created()).toMatchObject({ dmMessage: "Here is your link {link}", isActive: false, openingDmEnabled: false, requireFollow: false,
+      publicReplyEnabled: false, ignoreQuestionComments: true, offersEnabled: false });
+  });
+
+  it("creates the same campaign with the MCP tool and answers like REST", async () => {
+    const expected = (await (await restCreate(post(reel))).json()).data;
+    const init = await (await mcp(request({ jsonrpc: "2.0", id: 3, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1" } } }))).json();
+    expect(init.result.instructions).toContain("create_campaign");
+    expect(init.result.instructions).toContain("paused");
+    const listed = await (await mcp(request({ jsonrpc: "2.0", id: 4, method: "tools/list" }))).json();
+    const tool = listed.result.tools.find((entry: { name: string }) => entry.name === "create_campaign");
+    expect(tool.annotations).toEqual({ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false });
+    expect(tool.inputSchema).toMatchObject({ type: "object", required: ["name"], additionalProperties: false });
+    expect(Object.keys(tool.inputSchema.properties)).toEqual(expect.arrayContaining(["name", "keywords", "postId", "trackedDestinationUrl", "isActive", "offersEnabled", "offerIds"]));
+    // The workspace's defaults and the paused start apply, not the schema's own defaults.
+    expect(JSON.stringify(tool.inputSchema)).not.toContain('"default"');
+    const called = await (await mcp(callCreate(5, reel))).json();
+    expect(JSON.parse(called.result.content[0].text)).toEqual(expected);
+    expect(withoutSlugs(created(1))).toEqual(withoutSlugs(created(0)));
+    const misspelt = await (await mcp(callCreate(6, { ...reel, colour: "red" }))).json();
+    expect(misspelt.result.isError).toBe(true);
+    expect(misspelt.result.content[0].text).toContain('Unrecognized key: "colour"');
+    expect(state.campaigns.create).toHaveBeenCalledTimes(2);
+  });
+
+  it("answers a create-only key with its campaign but lets it read nothing else", async () => {
+    state.keys.findUnique.mockResolvedValue({ ...key, scopes: ["campaigns:write"] });
+    const response = await restCreate(post(reel));
+    expect(response.status).toBe(201);
+    expect((await response.json()).data.id).toBe("created");
+    const createOnly = { ...context, scopes: ["campaigns:write"] };
+    expect(listTools(createOnly).map(tool => tool.name)).toEqual(["create_campaign"]);
+    await expect(callTool(createOnly, "get_campaign", { id: "created" })).rejects.toMatchObject({ status: 403 });
+    expect((await rest(new Request("https://example.test/api/v1/campaigns", { headers }))).status).toBe(403);
   });
 });
 

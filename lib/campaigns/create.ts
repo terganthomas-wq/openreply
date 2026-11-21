@@ -1,16 +1,25 @@
 /**
  * Writing a new campaign from a validated create body (lib/campaigns/schema.ts).
  *
- * The dashboard's create route and the import both store campaigns through
- * this, so a campaign holds the same fields, normalised the same way, however
- * it was made. The import used to map its rows by hand and fell behind: the
- * fields added later were neither checked nor given their defaults there.
+ * The dashboard's create route, the import and the service API (POST
+ * /api/v1/campaigns and the MCP tool create_campaign) all store campaigns
+ * through this, so a campaign holds the same fields, normalised the same way,
+ * however it was made. The import used to map its rows by hand and fell
+ * behind: the fields added later were neither checked nor given their
+ * defaults there.
  */
 
-import type { Prisma } from "@/app/generated/prisma/client";
+import { Prisma } from "@/app/generated/prisma/client";
 import { prisma } from "@/lib/db/client";
 import { buildInitialCampaignLinks } from "@/lib/campaigns/links";
+import {
+  builtInMessageDefaults,
+  parseMessageDefaults,
+  type CampaignDefaults,
+  type MessageDefaults,
+} from "@/lib/campaigns/message-defaults";
 import type { CreateAutomationInput } from "@/lib/campaigns/schema";
+import { resolveLocale } from "@/lib/i18n";
 import { generateReportShareSlug } from "@/lib/reports/share";
 
 // A repeated id adds nothing (an offer is never made twice to the same
@@ -115,4 +124,139 @@ export function newCampaignData(
       ? { trackedLinks: { create: linkCreates } }
       : {}),
   };
+}
+
+/** A stored campaign with its links, as the dashboard's create route returns it. */
+export type CreatedCampaign = Prisma.AutomationGetPayload<{
+  include: { trackedLinks: true };
+}>;
+
+/**
+ * Why a campaign was not stored, with the status the routes answer. Each
+ * caller puts it into its own envelope; the texts are the dashboard's.
+ */
+export type CreateCampaignFailure = {
+  ok: false;
+  status: 400 | 404;
+  error: string;
+};
+
+export type CreateCampaignResult =
+  | { ok: true; campaign: CreatedCampaign }
+  | CreateCampaignFailure;
+
+/**
+ * Stores a campaign from a validated create body: the Instagram account it
+ * names, else the workspace's most recently connected one; its custom offer
+ * order checked against the workspace's offers; the row from newCampaignData.
+ * The checks run together and the first failure in this order is answered:
+ * no workspace, no account, an unknown offer.
+ */
+export async function createCampaign(
+  workspaceId: string,
+  data: CreateAutomationInput
+): Promise<CreateCampaignResult> {
+  const requestedAccountId =
+    data.instagramAccountId && data.instagramAccountId !== "all"
+      ? data.instagramAccountId
+      : null;
+
+  const [workspace, instagramAccount, offersKnown] = await Promise.all([
+    prisma.workspace.findUnique({
+      where: { id: workspaceId },
+      select: { id: true },
+    }),
+    // Only the id is needed, never the account's token.
+    requestedAccountId
+      ? prisma.instagramAccount.findFirst({
+          where: { id: requestedAccountId, workspaceId },
+          select: { id: true },
+        })
+      : prisma.instagramAccount.findFirst({
+          where: { workspaceId },
+          orderBy: { connectedAt: "desc" },
+          select: { id: true },
+        }),
+    offersExist(workspaceId, uniqueOfferIds(data.offerIds)),
+  ]);
+
+  if (!workspace) {
+    return { ok: false, status: 404, error: "Workspace not found" };
+  }
+  if (!instagramAccount) {
+    return {
+      ok: false,
+      status: 400,
+      error: "Connect Instagram before creating campaigns",
+    };
+  }
+  if (!offersKnown) return { ok: false, status: 400, error: "Unknown offer" };
+
+  const campaign = await prisma.automation.create({
+    data: newCampaignData(data, {
+      workspaceId,
+      instagramAccountId: instagramAccount.id,
+    }),
+    include: { trackedLinks: true },
+  });
+  return { ok: true, campaign };
+}
+
+/**
+ * The workspace's message defaults as the defaults route reads them
+ * (app/api/workspace/message-defaults): the stored ones when this version
+ * can read them; else the built-in set, written once into a column that is
+ * still NULL so it never replaces defaults someone saved meanwhile; else
+ * none. A service key has no interface language, so the built-in set is the
+ * installation's (DEFAULT_LOCALE, else English, which has none).
+ */
+async function workspaceMessageDefaults(
+  workspaceId: string
+): Promise<MessageDefaults | null> {
+  const workspace = await prisma.workspace.findUnique({
+    where: { id: workspaceId },
+    select: { messageDefaults: true },
+  });
+  if (!workspace) return null;
+  const stored = parseMessageDefaults(workspace.messageDefaults);
+  if (stored) return stored;
+
+  const seed = builtInMessageDefaults(resolveLocale(process.env.DEFAULT_LOCALE));
+  if (!seed) return null;
+  const { count } = await prisma.workspace.updateMany({
+    where: { id: workspaceId, messageDefaults: { equals: Prisma.DbNull } },
+    data: { messageDefaults: seed },
+  });
+  if (count > 0) return seed;
+
+  // The column was no longer NULL: what it holds now, or the built-in set
+  // while it holds something unreadable (an admin's save replaces it).
+  const current = await prisma.workspace.findUnique({
+    where: { id: workspaceId },
+    select: { messageDefaults: true },
+  });
+  return parseMessageDefaults(current?.messageDefaults) ?? seed;
+}
+
+/**
+ * What a campaign created without the editor starts from (R14): the campaign
+ * section of the workspace's message defaults, the texts and switches a new
+ * campaign opens with in the editor. Empty when the workspace has none. As in
+ * the editor, the defaults switch offers on only while the workspace has an
+ * active offer; until then the campaign has nothing to offer.
+ */
+export async function campaignDefaultsFor(
+  workspaceId: string
+): Promise<Partial<CampaignDefaults>> {
+  const defaults = await workspaceMessageDefaults(workspaceId);
+  if (!defaults) return {};
+  const campaign = { ...defaults.campaign };
+  if (campaign.offersEnabled) {
+    const activeOffer = await prisma.offer.findFirst({
+      where: { workspaceId, isActive: true, archivedAt: null },
+      select: { id: true },
+    });
+    campaign.offersEnabled = activeOffer !== null;
+  }
+  return campaign;
 }

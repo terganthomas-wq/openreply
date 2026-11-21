@@ -11,7 +11,7 @@ import { buildTrackedUrl } from "@/lib/tracking/message";
 import { TRACKED_LINK_ORDER } from "@/lib/tracking/link-order";
 import { syncCampaignLinks } from "@/lib/campaigns/links";
 import {
-  newCampaignData,
+  createCampaign,
   offersExist,
   uniqueOfferIds,
 } from "@/lib/campaigns/create";
@@ -224,57 +224,19 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const requestedInstagramAccountId =
-    parsed.data.instagramAccountId && parsed.data.instagramAccountId !== "all"
-      ? parsed.data.instagramAccountId
-      : null;
-  const offerIds = uniqueOfferIds(parsed.data.offerIds);
-
-  const [workspace, instagramAccount, offersKnown] = await Promise.all([
-    prisma.workspace.findUnique({
-      where: { id: workspaceId },
-      select: { id: true },
-    }),
-    requestedInstagramAccountId
-      ? prisma.instagramAccount.findFirst({
-          where: { id: requestedInstagramAccountId, workspaceId },
-        })
-      : prisma.instagramAccount.findFirst({
-          where: { workspaceId },
-          orderBy: { connectedAt: "desc" },
-        }),
-    offersExist(workspaceId, offerIds),
-  ]);
-
-  if (!workspace) {
+  // The same account and offer checks and the same row as the service API
+  // (lib/campaigns/create.ts); the editor has already put the workspace's
+  // default texts into the body.
+  const result = await createCampaign(workspaceId, parsed.data);
+  if (!result.ok) {
     return NextResponse.json(
-      { success: false, error: "Workspace not found" },
-      { status: 404 }
+      { success: false, error: result.error },
+      { status: result.status }
     );
   }
-
-  if (!instagramAccount) {
-    return NextResponse.json(
-      { success: false, error: "Connect Instagram before creating campaigns" },
-      { status: 400 }
-    );
-  }
-
-  if (!offersKnown) return unknownOfferResponse();
-
-  // The same row the import writes (lib/campaigns/create.ts).
-  const automation = await prisma.automation.create({
-    data: newCampaignData(parsed.data, {
-      workspaceId,
-      instagramAccountId: instagramAccount.id,
-    }),
-    include: {
-      trackedLinks: true,
-    },
-  });
 
   return NextResponse.json(
-    { success: true, data: automation },
+    { success: true, data: result.campaign },
     { status: 201 }
   );
 }

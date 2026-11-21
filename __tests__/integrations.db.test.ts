@@ -8,9 +8,10 @@ import { PrismaClient } from "../app/generated/prisma/client";
 
 const state = vi.hoisted(() => ({ db: undefined as unknown as import("../app/generated/prisma/client").PrismaClient }));
 vi.mock("@/lib/db/client", () => ({ get prisma() { return state.db; } }));
-import { getCampaign, listCampaigns } from "../lib/integrations/campaigns";
+import { createServiceCampaign, getCampaign, listCampaigns } from "../lib/integrations/campaigns";
 import { hashServiceToken, newServiceToken } from "../lib/integrations/auth";
 import { callTool } from "../lib/integrations/mcp";
+import { builtInMessageDefaults } from "../lib/campaigns/message-defaults";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const schema = `integrations_${randomBytes(4).toString("hex")}`;
@@ -98,5 +99,42 @@ describe.skipIf(!databaseUrl)("read-only integrations on real PostgreSQL", () =>
     await state.db.workspace.delete({ where: { id: "other" } });
     expect(await state.db.serviceKey.count({ where: { workspaceId: "other" } })).toBe(0);
     expect(await state.db.serviceKey.count({ where: { workspaceId: "workspace" } })).toBe(1);
+  });
+  it("creates paused campaigns for a write key with the workspace's seeded defaults", async () => {
+    vi.stubEnv("DEFAULT_LOCALE", "de");
+    try {
+      await state.db.workspace.create({ data: { id: "writer", name: "writer", ownerId: "owner" } });
+      await state.db.instagramAccount.create({ data: { id: "account_writer", workspaceId: "writer", instagramId: "writer", username: "writer", accessToken: "local-only-secret" } });
+      const writer = { workspaceId: "writer", keyId: "writer-key", scopes: ["campaigns:read", "campaigns:write"] };
+      const link = "https://drive.google.com/file/d/abc123/view?usp=sharing";
+      const reel = { name: "Prompt reel", keywords: ["Prompt", "Promt"], postId: "media_writer", trackedDestinationUrl: link };
+      const german = builtInMessageDefaults("de")!;
+
+      const first = await createServiceCampaign(writer, reel);
+      expect(first).toMatchObject({
+        name: "Prompt reel", isActive: false, instagramAccountId: "account_writer", postId: "media_writer",
+        openingDmMessage: german.campaign.openingDmMessage, dmMessage: `${german.campaign.dmMessage} {link}`,
+        followPromptRetryMessage: german.campaign.followPromptRetryMessage, publicReplyMessages: german.campaign.publicReplyMessages,
+        ignoreQuestionComments: true, offersEnabled: false, trackedDestinationUrl: link,
+      });
+      expect(await getCampaign(writer, first.id)).toEqual(first);
+      expect(JSON.stringify(first)).not.toMatch(/local-only-secret|reportShareSlug/);
+      // The built-in set was written into the empty column once.
+      expect((await state.db.workspace.findUniqueOrThrow({ where: { id: "writer" } })).messageDefaults).toEqual(german);
+
+      // With an active offer the defaults switch offers on.
+      await state.db.offer.create({ data: { workspaceId: "writer", name: "Guide", offerMessages: ["Want it?"], offerDelaysSeconds: [0],
+        offerButtonLabel: "Ja, gerne!", cardTitle: "Guide", cardButtonLabel: "Holen", destinationUrl: "https://example.test/guide",
+        linkSlug: "writer-guide", tagOffered: "o", tagInterested: "i", tagSent: "s", tagClicked: "c" } });
+      expect(await createServiceCampaign(writer, { ...reel, postId: "media_writer_2", isActive: true })).toMatchObject({ offersEnabled: true, isActive: true });
+
+      // Another workspace's account is unknown here; a read key cannot create.
+      await expect(createServiceCampaign(writer, { ...reel, instagramAccountId: "account_workspace" })).rejects.toMatchObject({ status: 400 });
+      await expect(createServiceCampaign({ ...writer, scopes: ["campaigns:read"] }, reel)).rejects.toMatchObject({ status: 403 });
+      expect(await state.db.automation.count({ where: { workspaceId: "writer" } })).toBe(2);
+      expect(await state.db.automation.count({ where: { instagramAccountId: "account_workspace", name: "Prompt reel" } })).toBe(0);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });

@@ -4,6 +4,7 @@ import { apiError, ApiError, checkOrigin, readJson } from "@/lib/integrations/ht
 import { callTool, listTools } from "@/lib/integrations/mcp";
 
 const versions = ["2025-03-26", "2025-06-18", "2025-11-25"];
+const instructions = "Workspace-scoped. With campaigns:read the tools list and read campaigns; with campaigns:write create_campaign creates one. A created campaign takes the workspace's default texts for every field the call leaves out and starts paused unless isActive is true; once active it answers matching comments with DMs. No tool changes or deletes an existing campaign or sends a message itself.";
 const rpcSchema = z.object({ jsonrpc: z.literal("2.0"), id: z.union([z.string(), z.number()]).optional(), method: z.string(), params: z.unknown().optional() });
 export async function GET(request: Request) {
   try { checkOrigin(request); await authenticateService(request); return new Response(null, { status: 405, headers: { Allow: "POST" } }); }
@@ -29,7 +30,7 @@ export async function POST(request: Request) {
       const params = z.object({ protocolVersion: z.string(), capabilities: z.object({}).passthrough(), clientInfo: z.object({ name: z.string(), version: z.string() }).passthrough() }).safeParse(rpc.params);
       if (!params.success) return Response.json({ jsonrpc: "2.0", id: rpc.id, error: { code: -32602, message: "Invalid initialize parameters" } });
       result = { protocolVersion: versions.includes(params.data.protocolVersion) ? params.data.protocolVersion : versions.at(-1),
-        capabilities: { tools: { listChanged: false } }, serverInfo: { name: "openreply", version: "1.0.0" }, instructions: "Read-only and workspace-scoped. No tool can modify campaigns or send messages." };
+        capabilities: { tools: { listChanged: false } }, serverInfo: { name: "openreply", version: "1.0.0" }, instructions };
     } else if (rpc.method === "ping") result = {};
     else if (rpc.method === "tools/list") result = { tools: listTools(context) };
     else if (rpc.method === "tools/call") {
