@@ -137,6 +137,13 @@ curl -X POST https://YOUR-DOMAIN/api/v1/campaigns \
   offers that are not deleted); empty uses the workspace's default order.
   Offers need the opening DM: a body that switches the opening DM off while the
   defaults switch offers on must also send `"offersEnabled": false`.
+- **Offer start.** `offerDelayHours` is `0`, the default (the offer follows
+  the link), or `22`: the offer starts 22 hours after the person's tap or DM,
+  while Instagram's 24-hour window is still open, and gets no reminder. Any
+  other value is refused with a `400`. It is not among the workspace's
+  default texts. Late starts already queued keep their time when a campaign's
+  setting changes (see `docs/offers.md`). `list_campaigns`, `get_campaign`
+  and the REST reads return the field.
 - **Errors.** `400` with `Invalid campaign: <field>: <problem>; ...` for an
   unknown or misspelt field (the body is checked strictly) and for every rule
   the dashboard's create route applies, `Unknown offer`, or `Connect Instagram before creating

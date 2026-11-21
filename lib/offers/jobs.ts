@@ -11,7 +11,7 @@ import {
   type ProcessOfferJob,
 } from "@/lib/queue/client";
 import { formatError } from "@/lib/queue/send-helpers";
-import { offerJobId } from "./schedule";
+import { lateStartDelayMs, offerJobId } from "./schedule";
 
 /**
  * Queue one offer job. Its id is deterministic, so a job that is still
@@ -34,9 +34,16 @@ export async function enqueueOfferJob(
   });
 }
 
-/** Start an offer for a delivered link: pick it, record it, queue its first message. */
+/**
+ * Start an offer for a delivered link: pick it, record it, queue its first
+ * message. Right away, or with `lateStart` 22 hours after the tap or DM that
+ * brought the link (lateStartFireAt), when the campaign starts its offers
+ * late. Such a start keeps its time even if the campaign is switched back
+ * to starting right away before it runs.
+ */
 export async function enqueueOfferStart({
   startKey,
+  lateStart = false,
   ...start
 }: {
   workspaceId: string;
@@ -46,15 +53,22 @@ export async function enqueueOfferStart({
   userId: string;
   interactionAt: number;
   startKey: string;
+  lateStart?: boolean;
 }): Promise<void> {
   // The job id follows the start key, so a repeated start of one trigger is
-  // dropped while the first is still queued. Once that job is done and gone,
-  // the stored key (ContactOffer.startKey) keeps a late duplicate from
-  // starting a second offer.
+  // dropped while the first is still queued, for the 22 hours of a late
+  // start too. Once that job is done and gone, the stored key
+  // (ContactOffer.startKey) keeps a late duplicate from starting a second
+  // offer.
   const digest = createHash("sha256").update(startKey).digest("hex");
   await enqueueOfferJob(
-    { phase: "start", ...start, startKey },
-    { jobId: offerJobId.start(start.automationId, start.userId, digest) }
+    // The flag travels with the job: after the start nothing reads the
+    // campaign, and its setting may have changed by then.
+    { phase: "start", ...start, startKey, ...(lateStart ? { lateStart } : {}) },
+    {
+      jobId: offerJobId.start(start.automationId, start.userId, digest),
+      delayMs: lateStart ? lateStartDelayMs(start.interactionAt) : 0,
+    }
   );
 }
 

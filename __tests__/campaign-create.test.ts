@@ -38,7 +38,12 @@ import {
   builtInMessageDefaults,
   type MessageDefaults,
 } from "../lib/campaigns/message-defaults";
-import { createAutomationSchema, isWebLink } from "../lib/campaigns/schema";
+import {
+  createAutomationSchema,
+  isWebLink,
+  OFFER_DELAY_MESSAGE,
+  updateAutomationSchema,
+} from "../lib/campaigns/schema";
 
 const german = builtInMessageDefaults("de") as MessageDefaults;
 
@@ -111,6 +116,8 @@ const expectedRow = {
   deliveryTag: "[LM] Guide sent",
   offersEnabled: true,
   offerIds: ["offer_2", "offer_1"],
+  // The body leaves it out: the offer starts right after the link.
+  offerDelayHours: 0,
   workspaceId: "workspace_123",
   instagramAccountId: "account_123",
   reportShareSlug: expect.any(String),
@@ -250,6 +257,77 @@ describe("createCampaign", () => {
 
     expect(mockPrisma.offer.count).not.toHaveBeenCalled();
     expect(mockPrisma.automation.create.mock.calls[0][0].data.offerIds).toEqual([]);
+  });
+
+  it.each([0, 22])("stores when the offer starts: %i hours after the link", async (hours) => {
+    const result = await createCampaign(
+      "workspace_123",
+      parse({ ...body, offerDelayHours: hours })
+    );
+
+    expect(result.ok).toBe(true);
+    expect(mockPrisma.automation.create.mock.calls[0][0].data.offerDelayHours).toBe(hours);
+  });
+});
+
+// G1: an offer starts right after the link (0) or 22 hours later (22).
+// Every way a campaign is created or changed takes only these two.
+describe("offerDelayHours", () => {
+  it.each([1, 5, 21, 23, 24, 48, -22, 22.5, "22", "0", null, true])(
+    "refuses %j as a field error",
+    (hours) => {
+      for (const schema of [createAutomationSchema, updateAutomationSchema]) {
+        const parsed = schema.safeParse({ ...body, offerDelayHours: hours });
+        expect(parsed.success).toBe(false);
+        expect(parsed.error?.flatten().fieldErrors).toEqual({
+          offerDelayHours: [OFFER_DELAY_MESSAGE],
+        });
+      }
+    }
+  );
+
+  it("names both values in its message", () => {
+    expect(OFFER_DELAY_MESSAGE).toContain("0");
+    expect(OFFER_DELAY_MESSAGE).toContain("22");
+  });
+
+  it("defaults to 0 on create and leaves a stored value alone on update", () => {
+    expect(parse(body).offerDelayHours).toBe(0);
+    expect(updateAutomationSchema.parse({ isActive: false })).toEqual({ isActive: false });
+    expect(updateAutomationSchema.parse({ offerDelayHours: 22 })).toEqual({ offerDelayHours: 22 });
+  });
+
+  it("is answered as the field in the dashboard's create route", async () => {
+    const response = await POST(postRequest({ ...body, offerDelayHours: 12 }));
+
+    expect(response.status).toBe(400);
+    expect((await response.json()).details.fieldErrors).toEqual({
+      offerDelayHours: [OFFER_DELAY_MESSAGE],
+    });
+    expect(mockPrisma.automation.create).not.toHaveBeenCalled();
+  });
+
+  // It is not among the workspace's default texts: a campaign made without
+  // the editor starts its offer right after the link, as one made in it.
+  it("is 0 for a campaign made from the workspace's defaults", async () => {
+    mockPrisma.workspace.findUnique.mockResolvedValue({ messageDefaults: german });
+    mockPrisma.offer.findFirst.mockResolvedValue({ id: "offer_1" });
+
+    const defaults = await campaignDefaultsFor("workspace_123");
+    expect(defaults).not.toHaveProperty("offerDelayHours");
+    const parsed = createAutomationSchema.strict().parse({
+      ...defaults,
+      isActive: false,
+      name: "Prompt reel",
+      keywords: ["Prompt"],
+      postId: "media_1",
+      trackedDestinationUrl: "https://drive.google.com/file/d/abc/view",
+    });
+    expect(parsed.offerDelayHours).toBe(0);
+
+    mockPrisma.workspace.findUnique.mockResolvedValue({ id: "workspace_123" });
+    await createCampaign("workspace_123", parsed);
+    expect(mockPrisma.automation.create.mock.calls[0][0].data.offerDelayHours).toBe(0);
   });
 });
 

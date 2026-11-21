@@ -4,10 +4,11 @@
  * Campaign Offers Section
  *
  * The campaign editor's Weg-2 card inside "After the link" (R4, R11, R13):
- * whether the campaign offers a lead magnet once its link is out, and in
- * which order. The workspace's default order from the Offers page is the
- * default, so swapping a lead magnet never means editing campaigns; a custom
- * order pins this campaign's own list.
+ * whether the campaign offers a lead magnet once its link is out, in which
+ * order, and when the offer starts: right after the link or 22 hours later.
+ * The workspace's default order from the Offers page is the default, so
+ * swapping a lead magnet never means editing campaigns; a custom order pins
+ * this campaign's own list.
  *
  * The editor owns the state; this card only shows and changes it.
  */
@@ -16,10 +17,20 @@ import Link from "next/link";
 import { Radio, Toggle } from "@/components/form-controls";
 import { useI18n } from "@/lib/i18n/provider";
 import { moveItem, type OfferRecord } from "@/lib/offers/editor";
-import { resolveOfferOrder } from "@/lib/offers/schedule";
+import {
+  OFFER_LATE_START_HOURS,
+  resolveOfferOrder,
+  type OfferDelayHours,
+} from "@/lib/offers/schedule";
 
-/** What the editor needs of an offer: its name and whether it is paused. */
-export type OfferOption = Pick<OfferRecord, "id" | "name" | "isActive">;
+/**
+ * What the editor needs of an offer: its name, whether it is paused, and
+ * its messages and button for the campaign's preview.
+ */
+export type OfferOption = Pick<
+  OfferRecord,
+  "id" | "name" | "isActive" | "offerMessages" | "offerButtonLabel"
+>;
 
 /** The workspace's default order, or the campaign's own list of offers. */
 export type OfferOrderMode = "default" | "custom";
@@ -33,11 +44,15 @@ export async function fetchOfferOptions(): Promise<OfferOption[] | null> {
     const res = await fetch("/api/offers", { cache: "no-store" });
     const payload = await res.json();
     if (!payload.success || !Array.isArray(payload.data)) return null;
-    return (payload.data as OfferRecord[]).map(({ id, name, isActive }) => ({
-      id,
-      name,
-      isActive,
-    }));
+    return (payload.data as OfferRecord[]).map(
+      ({ id, name, isActive, offerMessages, offerButtonLabel }) => ({
+        id,
+        name,
+        isActive,
+        offerMessages,
+        offerButtonLabel,
+      })
+    );
   } catch {
     return null;
   }
@@ -77,6 +92,9 @@ interface CampaignOffersSectionProps {
   onOrderModeChange: (mode: OfferOrderMode) => void;
   customIds: string[];
   onCustomIdsChange: (ids: string[]) => void;
+  /** When the offer starts: right after the link (0) or 22 hours later. */
+  delayHours: OfferDelayHours;
+  onDelayHoursChange: (hours: OfferDelayHours) => void;
   openingDmEnabled: boolean;
   /** Switching offers on just switched the opening DM on as well. */
   openingDmSwitchedOn: boolean;
@@ -93,6 +111,8 @@ export default function CampaignOffersSection({
   onOrderModeChange,
   customIds,
   onCustomIdsChange,
+  delayHours,
+  onDelayHoursChange,
   openingDmEnabled,
   openingDmSwitchedOn,
   followUpEnabled,
@@ -300,6 +320,34 @@ export default function CampaignOffersSection({
           <p className="text-xs text-muted">
             {t("Each person gets the first offer they have not been offered yet, never one twice.")}
           </p>
+
+          {/* When the offer starts. Late, it comes the next day while
+              Instagram's window is still open, and whoever leaves it
+              untapped hears nothing more. */}
+          <div className="space-y-2">
+            <p className="text-sm text-foreground">
+              {t("When should the offer start?")}
+            </p>
+            <Radio
+              checked={delayHours !== OFFER_LATE_START_HOURS}
+              onSelect={() => onDelayHoursChange(0)}
+            >
+              {t("Right after the link")}
+            </Radio>
+            <Radio
+              checked={delayHours === OFFER_LATE_START_HOURS}
+              onSelect={() => onDelayHoursChange(OFFER_LATE_START_HOURS)}
+            >
+              {t("{hours} hours later", { hours: OFFER_LATE_START_HOURS })}
+            </Radio>
+            <p className="text-xs text-muted">
+              {t(
+                "Instagram only allows messages up to 24 hours after the person's last tap or DM. At {hours} hours that window is still open. There is no reminder in this mode.",
+                { hours: OFFER_LATE_START_HOURS }
+              )}
+            </p>
+          </div>
+
           {followUpEnabled && (
             <p className="text-xs text-warning">
               {t("The follow-up message also goes out after the link, so it can land between the offer messages.")}

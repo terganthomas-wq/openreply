@@ -15,10 +15,10 @@ vi.mock("ioredis", () => ({ default: class { status = "ready"; eval = state.eval
 
 import { authenticateService, hashServiceToken, newServiceToken } from "../lib/integrations/auth";
 import { checkOrigin, readJson } from "../lib/integrations/http";
-import { getCampaign } from "../lib/integrations/campaigns";
+import { getCampaign, listCampaigns } from "../lib/integrations/campaigns";
 import { callTool, listTools } from "../lib/integrations/mcp";
 import { builtInMessageDefaults, type MessageDefaults } from "../lib/campaigns/message-defaults";
-import { WEB_LINK_MESSAGE } from "../lib/campaigns/schema";
+import { OFFER_DELAY_MESSAGE, WEB_LINK_MESSAGE } from "../lib/campaigns/schema";
 import { keyAccess } from "../lib/integrations/scopes";
 import { GET as listKeys, POST as createKey, DELETE as revokeKey } from "../app/api/integrations/keys/route";
 import { POST as mcp } from "../app/api/mcp/route";
@@ -173,6 +173,14 @@ describe("read-only MCP and REST", () => {
     expect(await getCampaign(context, "campaign")).toMatchObject(weg2);
     const { select } = state.campaigns.findFirst.mock.calls[0][0];
     expect(Object.fromEntries(Object.keys(weg2).map(field => [field, select[field]]))).toEqual(Object.fromEntries(Object.keys(weg2).map(field => [field, true])));
+  });
+  it("returns when the offer starts in the list and the detail", async () => {
+    state.campaigns.findMany.mockResolvedValue([{ id: "campaign", offerDelayHours: 22 }]);
+    state.campaigns.findFirst.mockResolvedValue({ id: "campaign", offerDelayHours: 22, trackedLinks: [] });
+    expect(await listCampaigns(context)).toEqual([{ id: "campaign", offerDelayHours: 22 }]);
+    expect(await getCampaign(context, "campaign")).toMatchObject({ offerDelayHours: 22 });
+    expect(state.campaigns.findMany.mock.calls[0][0].select.offerDelayHours).toBe(true);
+    expect(state.campaigns.findFirst.mock.calls[0][0].select.offerDelayHours).toBe(true);
   });
   it("does not leak foreign campaigns or invent missing links", async () => {
     state.campaigns.findFirst.mockResolvedValue(null);
@@ -409,6 +417,37 @@ describe("creating campaigns (campaigns:write)", () => {
     const listed = await (await mcp(request({ jsonrpc: "2.0", id: 8, method: "tools/list" }))).json();
     const tool = listed.result.tools.find((entry: { name: string }) => entry.name === "create_campaign");
     expect(tool.inputSchema.properties.trackedDestinationUrl.description).toContain("http:// or https://");
+  });
+
+  it("starts the offer right after the link unless the body asks for 22 hours later", async () => {
+    expect((await restCreate(post(reel))).status).toBe(201);
+    expect(created().offerDelayHours).toBe(0);
+    expect((await restCreate(post({ ...reel, offerDelayHours: 22 }))).status).toBe(201);
+    expect(created(1).offerDelayHours).toBe(22);
+    const called = await (await mcp(callCreate(9, { ...reel, offerDelayHours: 22 }))).json();
+    expect(called.result.isError).toBeUndefined();
+    expect(created(2).offerDelayHours).toBe(22);
+  });
+
+  it.each([1, 12, 23, 24, "22", null])("refuses %j as when the offer starts over REST and MCP", async (hours) => {
+    const body = { ...reel, offerDelayHours: hours };
+    const error = `Invalid campaign: offerDelayHours: ${OFFER_DELAY_MESSAGE}`;
+    const response = await restCreate(post(body));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error });
+    const called = await (await mcp(callCreate(10, body))).json();
+    expect(called.result).toEqual({ isError: true, content: [{ type: "text", text: error }] });
+    expect(state.campaigns.create).not.toHaveBeenCalled();
+  });
+
+  it("tells MCP clients the two values the offer start takes", async () => {
+    const listed = await (await mcp(request({ jsonrpc: "2.0", id: 11, method: "tools/list" }))).json();
+    const tool = listed.result.tools.find((entry: { name: string }) => entry.name === "create_campaign");
+    const property = tool.inputSchema.properties.offerDelayHours;
+    expect(property).toMatchObject({ type: "number", enum: [0, 22] });
+    expect(property).not.toHaveProperty("default");
+    expect(property.description).toContain("22");
+    expect(tool.inputSchema.required).toEqual(["name"]);
   });
 
   it("answers a create-only key with its campaign but lets it read nothing else", async () => {

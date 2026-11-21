@@ -68,6 +68,7 @@ import {
   REMINDER_DELAY_MAX_HOURS,
   offerInputSchema,
 } from "@/lib/offers/schema";
+import { OFFER_LATE_START_HOURS } from "@/lib/offers/schedule";
 import { BUTTON_TEXT_MAX, CARD_TEXT_MAX } from "@/lib/validation/text";
 
 const MESSAGE_DEFAULTS_URL = "/api/workspace/message-defaults";
@@ -1079,6 +1080,16 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
                   />
                   <p className="text-xs text-muted">
                     {t("Only if they have not tapped. It carries the card's button. Instagram allows it up to 24 hours after their last tap or DM.")}
+                  </p>
+                  {/* A campaign can start the offer 22 hours after its link
+                      (campaign editor, After the link). No reminder
+                      follows such an offer: whoever leaves it untapped
+                      gets nothing more. */}
+                  <p className="text-xs text-muted">
+                    {t(
+                      "Only for campaigns that start the offer right after the link. Campaigns that start it {hours} hours later send no reminder.",
+                      { hours: OFFER_LATE_START_HOURS }
+                    )}
                   </p>
                 </div>
               )}

@@ -104,6 +104,37 @@ function upsertContact({
 }
 
 /**
+ * The stored contact, never created: null when there is none. For work that
+ * runs long after the contact was recorded, such as an offer that starts 22
+ * hours after its link: a contact deleted in the meantime (on request, GDPR)
+ * must stay deleted. A found contact's last interaction moves forward to
+ * `interactionAt` like in ensureContact. Throws on a database error.
+ */
+export async function findContact({
+  workspaceId,
+  instagramAccountId,
+  igsid,
+  interactionAt,
+}: Omit<ContactIdentity, "username">): Promise<ContactSummary | null> {
+  const contact = await prisma.contact.findFirst({
+    where: { workspaceId, instagramAccountId, igsid },
+    select: { id: true, username: true, lastInteractionAt: true },
+  });
+  if (!contact) return null;
+
+  if (
+    interactionAt &&
+    (!contact.lastInteractionAt ||
+      contact.lastInteractionAt.getTime() < interactionAt.getTime())
+  ) {
+    // By id and forward only: a contact deleted since the read stays gone.
+    await touchContactInteraction(contact.id, interactionAt);
+    return { ...contact, lastInteractionAt: interactionAt };
+  }
+  return contact;
+}
+
+/**
  * ensureContact for the paths that send a DM. A failed write is logged and
  * the caller goes on: thrown, it would retry the job five minutes later and
  * hold back the DM for a bookkeeping row.

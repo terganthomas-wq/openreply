@@ -6,10 +6,13 @@ import { TRACKED_LINK_ORDER } from "@/lib/tracking/link-order";
 import { ApiError } from "./http";
 import { requireScope, type ServiceContext } from "./auth";
 
+// offerDelayHours: when the offer starts after the link (0 right away, 22
+// later), so a list shows which campaigns start their offers late.
 const summarySelect = {
   id: true, name: true, goal: true, instagramAccountId: true, isActive: true,
   postId: true, postUrl: true, pendingNextReel: true, matchAnyPost: true,
-  keywords: true, matchAnyWord: true, dmMessage: true, createdAt: true, updatedAt: true,
+  keywords: true, matchAnyWord: true, dmMessage: true, offerDelayHours: true,
+  createdAt: true, updatedAt: true,
 } as const;
 
 export async function listCampaigns(context: ServiceContext) {

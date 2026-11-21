@@ -25,7 +25,56 @@ const WINDOW_MARGIN_MS = 5 * MINUTE_MS;
 // A reminder fires at most 23.5 hours after the last interaction, so its
 // retries (5 and 15 minutes later) still land inside the window.
 const REMINDER_LATEST_MS = 23.5 * HOUR_MS;
-const REMINDER_GRID_MS = 30 * MINUTE_MS;
+
+// Jobs that wait for hours fire on a full or half hour (UTC). Those of
+// people whose taps fell into the same half hour then run together and wake
+// the database once instead of once each.
+const WAKE_UP_GRID_MS = 30 * MINUTE_MS;
+
+/**
+ * A campaign can start its offer this many hours after the link instead of
+ * right after it (Automation.offerDelayHours), as the A-037 guide does: the
+ * messaging window, 24 hours from the tap or DM that brought the link, is
+ * still open then. Such an offer gets no reminder: whoever does not tap gets
+ * nothing more.
+ */
+export const OFFER_LATE_START_HOURS = 22;
+
+/** The values Automation.offerDelayHours takes: right away, or late. */
+export const OFFER_DELAY_HOURS = [0, OFFER_LATE_START_HOURS] as const;
+export type OfferDelayHours = (typeof OFFER_DELAY_HOURS)[number];
+
+/**
+ * Whether a campaign starts its offer late. Only the late value counts, so a
+ * row that somehow holds anything else starts the offer right away, as
+ * every campaign did before the setting existed.
+ */
+export function offerStartsLate(
+  offerDelayHours: number | null | undefined
+): boolean {
+  return offerDelayHours === OFFER_LATE_START_HOURS;
+}
+
+/**
+ * When a late offer starts (epoch ms): OFFER_LATE_START_HOURS after the tap
+ * or DM that brought the link, rounded down to a full or half hour (UTC) like
+ * the reminder. Never later than that, so the offer messages and their
+ * retries stay well inside the window.
+ */
+export function lateStartFireAt(interactionAt: Date | number): number {
+  return floorToWakeUpGrid(toMs(interactionAt) + OFFER_LATE_START_HOURS * HOUR_MS);
+}
+
+/**
+ * How long a late start waits from `now`: until lateStartFireAt, or not at
+ * all when that time has passed (the window check at the start decides).
+ */
+export function lateStartDelayMs(
+  interactionAt: Date | number,
+  now: number = Date.now()
+): number {
+  return Math.max(0, lateStartFireAt(interactionAt) - now);
+}
 
 /**
  * The workspace's default offer order. `position` decides it; `createdAt` and
@@ -104,9 +153,11 @@ export function reminderFireAt({
     : 23;
   const wanted = toMs(pitchSentAt) + hours * HOUR_MS;
   const latest = toMs(lastInteractionAt) + REMINDER_LATEST_MS;
-  return (
-    Math.floor(Math.min(wanted, latest) / REMINDER_GRID_MS) * REMINDER_GRID_MS
-  );
+  return floorToWakeUpGrid(Math.min(wanted, latest));
+}
+
+function floorToWakeUpGrid(ms: number): number {
+  return Math.floor(ms / WAKE_UP_GRID_MS) * WAKE_UP_GRID_MS;
 }
 
 function toMs(value: Date | number): number {

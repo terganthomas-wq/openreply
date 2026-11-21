@@ -11,7 +11,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { mockPrisma } = vi.hoisted(() => ({
   mockPrisma: {
-    contact: { upsert: vi.fn(), updateMany: vi.fn() },
+    contact: { upsert: vi.fn(), updateMany: vi.fn(), findFirst: vi.fn() },
     contactTag: { createMany: vi.fn() },
   },
 }));
@@ -22,6 +22,7 @@ import {
   addContactTags,
   ensureContact,
   ensureContactSafe,
+  findContact,
   touchContactInteraction,
 } from "../lib/contacts/store";
 import { hashRecipientId } from "../lib/tracking/server";
@@ -48,6 +49,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockPrisma.contact.upsert.mockReset().mockResolvedValue(storedContact());
   mockPrisma.contact.updateMany.mockReset().mockResolvedValue({ count: 1 });
+  mockPrisma.contact.findFirst.mockReset().mockResolvedValue(storedContact());
   mockPrisma.contactTag.createMany
     .mockReset()
     .mockResolvedValue({ count: 1 });
@@ -201,6 +203,71 @@ describe("ensureContactSafe", () => {
     } finally {
       consoleError.mockRestore();
     }
+  });
+});
+
+// A late offer start runs 22 hours after its link: a contact deleted on
+// request in the meantime must not come back.
+describe("findContact", () => {
+  it("reads the contact of this workspace, account and IGSID and creates none", async () => {
+    await expect(findContact(IDENTITY)).resolves.toEqual(storedContact());
+
+    expect(mockPrisma.contact.findFirst).toHaveBeenCalledWith({
+      where: {
+        workspaceId: "workspace_1",
+        instagramAccountId: "account_row_1",
+        igsid: "igsid_1",
+      },
+      select: { id: true, username: true, lastInteractionAt: true },
+    });
+    expect(mockPrisma.contact.upsert).not.toHaveBeenCalled();
+    expect(mockPrisma.contact.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("returns null for a contact that is gone, and writes nothing", async () => {
+    mockPrisma.contact.findFirst.mockResolvedValue(null);
+
+    await expect(findContact({ ...IDENTITY, interactionAt: NOW })).resolves.toBeNull();
+
+    expect(mockPrisma.contact.upsert).not.toHaveBeenCalled();
+    expect(mockPrisma.contact.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("moves the last interaction forward, by id", async () => {
+    mockPrisma.contact.findFirst.mockResolvedValue(
+      storedContact({ lastInteractionAt: EARLIER })
+    );
+
+    await expect(findContact({ ...IDENTITY, interactionAt: NOW })).resolves.toEqual(
+      storedContact({ lastInteractionAt: NOW })
+    );
+
+    expect(mockPrisma.contact.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: "contact_1",
+        OR: [{ lastInteractionAt: null }, { lastInteractionAt: { lt: NOW } }],
+      },
+      data: { lastInteractionAt: NOW },
+    });
+    expect(mockPrisma.contact.upsert).not.toHaveBeenCalled();
+  });
+
+  it("never moves a newer interaction back", async () => {
+    mockPrisma.contact.findFirst.mockResolvedValue(
+      storedContact({ lastInteractionAt: LATER })
+    );
+
+    await expect(findContact({ ...IDENTITY, interactionAt: NOW })).resolves.toEqual(
+      storedContact({ lastInteractionAt: LATER })
+    );
+    expect(mockPrisma.contact.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("throws a database error for the job to retry", async () => {
+    const lost = new Error("Connection terminated unexpectedly");
+    mockPrisma.contact.findFirst.mockRejectedValue(lost);
+
+    await expect(findContact(IDENTITY)).rejects.toBe(lost);
   });
 });
 

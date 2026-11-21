@@ -8,6 +8,8 @@
  * offer twice. Each message is claimed before it is sent, so a retried or
  * repeated job continues the sequence without sending anything twice, and
  * Instagram's refusals end the offer quietly instead of raising worker alerts.
+ * A campaign can also start its offer 22 hours after the link: that start
+ * never creates the contact, and its offer gets no reminder.
  */
 
 import { createHash } from "node:crypto";
@@ -28,7 +30,7 @@ const {
 } = vi.hoisted(() => ({
   mockPrisma: {
     automation: { findFirst: vi.fn() },
-    contact: { upsert: vi.fn(), updateMany: vi.fn() },
+    contact: { upsert: vi.fn(), updateMany: vi.fn(), findFirst: vi.fn() },
     contactTag: { createMany: vi.fn() },
     contactOffer: {
       findUnique: vi.fn(),
@@ -210,6 +212,7 @@ function contactOffer(
     offerId: "offer_a",
     automationId: "auto_789",
     startKey: "auto_789:tap:mid_tap_1",
+    lateStart: false,
     offeredAt: new Date(TAP_TIME + 1000),
     pitchSentAt: null,
     interestedAt: null,
@@ -350,6 +353,7 @@ beforeEach(() => {
     lastInteractionAt: null,
   });
   mockPrisma.contact.updateMany.mockReset().mockResolvedValue({ count: 1 });
+  mockPrisma.contact.findFirst.mockReset().mockResolvedValue(null);
   mockPrisma.contactTag.createMany.mockReset().mockResolvedValue({ count: 1 });
   mockPrisma.contactOffer.findUnique.mockReset().mockResolvedValue(null);
   mockPrisma.contactOffer.findFirst.mockReset().mockResolvedValue(null);
@@ -431,6 +435,8 @@ describe("start", () => {
           offerId: "offer_a",
           automationId: "auto_789",
           startKey: "auto_789:tap:mid_tap_1",
+          // Started right after the link: its reminder follows.
+          lateStart: false,
           offeredAt: new Date(NOW),
         },
       })
@@ -838,6 +844,215 @@ describe("start", () => {
   });
 });
 
+// A campaign can start its offer 22 hours after the link (offerDelayHours).
+// The start job then runs at that time and carries the flag; it never
+// creates the contact, and its row records that it started late.
+describe("late start", () => {
+  // 22 hours after the tap at 12:09, rounded down to the half hour.
+  const FIRE_TIME = Date.parse("2026-11-21T10:00:00.000Z");
+  const STORED_CONTACT = {
+    id: "contact_1",
+    username: "commenter_user",
+    lastInteractionAt: new Date(TAP_TIME),
+  };
+
+  function lateJob(
+    data: Partial<ProcessOfferJob> = {},
+    job: { attemptsMade?: number; timestamp?: number } = {}
+  ) {
+    return offerJob(
+      {
+        phase: "start",
+        automationId: "auto_789",
+        userId: "commenter_999",
+        interactionAt: TAP_TIME,
+        startKey: "auto_789:tap:mid_tap_1",
+        lateStart: true,
+        ...data,
+      },
+      // Queued right after the delivery, run 22 hours later.
+      { timestamp: TAP_TIME + 2000, ...job }
+    );
+  }
+
+  beforeEach(() => {
+    vi.setSystemTime(FIRE_TIME);
+    mockPrisma.contact.findFirst.mockResolvedValue(STORED_CONTACT);
+  });
+
+  it("looks the contact up within the workspace instead of recording it", async () => {
+    await processOffer(lateJob());
+
+    expect(mockPrisma.contact.findFirst).toHaveBeenCalledWith({
+      where: {
+        workspaceId: "workspace_123",
+        instagramAccountId: "ig_account_row_1",
+        igsid: "commenter_999",
+      },
+      select: { id: true, username: true, lastInteractionAt: true },
+    });
+    expect(mockPrisma.contact.upsert).not.toHaveBeenCalled();
+  });
+
+  it("records that the offer started late and queues its first message", async () => {
+    await processOffer(lateJob());
+
+    expect(mockPrisma.contactOffer.create).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.contactOffer.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: {
+          workspaceId: "workspace_123",
+          contactId: "contact_1",
+          offerId: "offer_a",
+          automationId: "auto_789",
+          startKey: "auto_789:tap:mid_tap_1",
+          lateStart: true,
+          offeredAt: new Date(FIRE_TIME),
+        },
+      })
+    );
+    expect(mockPrisma.contactTag.createMany).toHaveBeenCalledWith(
+      tagWrite("offer_a angeboten")
+    );
+    expect(mockQueueAdd).toHaveBeenCalledTimes(1);
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-offer",
+      { ...JOB_BASE, phase: "offer", contactOfferId: "co_offer_a", step: 0 },
+      { jobId: "offer_co_offer_a_offer_0", delay: 5000, removeOnComplete: true }
+    );
+  });
+
+  // The flag comes with the job: the campaign's setting is not read, so a
+  // campaign switched back to starting right away keeps its late starts.
+  it("starts late whatever the campaign says by now", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue({
+      id: "auto_789",
+      offersEnabled: true,
+      offerIds: [],
+      offerDelayHours: 0,
+      instagramAccount: { instagramId: "ig_456" },
+    });
+
+    await processOffer(lateJob());
+
+    expect(mockPrisma.automation.findFirst.mock.calls[0][0].select).not.toHaveProperty(
+      "offerDelayHours"
+    );
+    expect(mockPrisma.contactOffer.create.mock.calls[0][0].data.lateStart).toBe(true);
+  });
+
+  it("creates nothing and brings no deleted contact back", async () => {
+    mockPrisma.contact.findFirst.mockResolvedValue(null);
+
+    await processOffer(lateJob());
+
+    expect(mockPrisma.contact.upsert).not.toHaveBeenCalled();
+    expect(mockPrisma.contact.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.offer.findMany).not.toHaveBeenCalled();
+    expect(mockPrisma.contactOffer.create).not.toHaveBeenCalled();
+    expect(mockPrisma.contactTag.createMany).not.toHaveBeenCalled();
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+    expect(sends()).toBe(0);
+    // A log line that names no person: the contact was deleted on request.
+    expect(mockPrisma.operationalEvent.create).not.toHaveBeenCalled();
+    expect(console.log).toHaveBeenCalledWith(
+      "[Offers] Late start skipped: the contact no longer exists",
+      { automationId: "auto_789" }
+    );
+    expect(JSON.stringify(vi.mocked(console.log).mock.calls)).not.toContain(
+      "commenter_999"
+    );
+  });
+
+  it("skips with the INFO event when the window has closed by then", async () => {
+    // The worker was down: the start runs three hours late, 24 h 51 min
+    // after the tap.
+    vi.setSystemTime(FIRE_TIME + 3 * HOUR);
+
+    await processOffer(lateJob());
+
+    expect(mockPrisma.contactOffer.create).not.toHaveBeenCalled();
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith({
+      data: {
+        workspaceId: "workspace_123",
+        source: "WORKER",
+        level: "INFO",
+        message: "Offer skipped: messaging window closed",
+        payload: { automationId: "auto_789", userId: "commenter_999" },
+      },
+    });
+  });
+
+  it("counts the window from a later tap or DM of the person", async () => {
+    vi.setSystemTime(FIRE_TIME + 3 * HOUR);
+    mockPrisma.contact.findFirst.mockResolvedValue({
+      ...STORED_CONTACT,
+      lastInteractionAt: new Date(TAP_TIME + 10 * HOUR),
+    });
+
+    await processOffer(lateJob());
+
+    expect(mockPrisma.contactOffer.create).toHaveBeenCalledTimes(1);
+    // A later interaction is never moved back to the trigger's.
+    expect(mockPrisma.contact.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("moves the contact's last interaction forward to the trigger's, by id", async () => {
+    mockPrisma.contact.findFirst.mockResolvedValue({
+      ...STORED_CONTACT,
+      lastInteractionAt: null,
+    });
+
+    await processOffer(lateJob());
+
+    expect(mockPrisma.contact.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: "contact_1",
+        OR: [{ lastInteractionAt: null }, { lastInteractionAt: { lt: new Date(TAP_TIME) } }],
+      },
+      data: { lastInteractionAt: new Date(TAP_TIME) },
+    });
+    expect(mockPrisma.contactOffer.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("carries on when its own earlier attempt created the row", async () => {
+    // Its row is from the run 22 hours after the job was queued.
+    mockPrisma.contactOffer.findUnique.mockResolvedValue({
+      id: "co1",
+      offeredAt: new Date(FIRE_TIME),
+      offer: { tagOffered: "Guide angeboten", offerDelaysSeconds: [5] },
+    });
+
+    await processOffer(lateJob({}, { attemptsMade: 1 }));
+
+    expect(mockPrisma.contactOffer.create).not.toHaveBeenCalled();
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      ...next("offer", { step: 0 }, { jobId: "offer_co1_offer_0", delay: 5000 })
+    );
+  });
+
+  it.each([
+    { label: "its offers were switched off", campaign: { offersEnabled: false } },
+    { label: "it was deleted", campaign: null },
+  ])("starts nothing when $label in the meantime", async ({ campaign }) => {
+    mockPrisma.automation.findFirst.mockResolvedValue(
+      campaign && {
+        id: "auto_789",
+        offerIds: [],
+        instagramAccount: { instagramId: "ig_456" },
+        ...campaign,
+      }
+    );
+
+    await processOffer(lateJob());
+
+    expect(mockPrisma.contact.findFirst).not.toHaveBeenCalled();
+    expect(mockPrisma.contactOffer.create).not.toHaveBeenCalled();
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+});
+
 describe("start job", () => {
   it("is keyed on a digest of the start key, whatever the mid holds", async () => {
     const startKey = "auto_789:tap:aWdfZAG1:faXRl/bTo+xOk==";
@@ -864,6 +1079,50 @@ describe("start job", () => {
       { jobId: `offerstart_auto_789_commenter_999_${digest}`, removeOnComplete: true }
     );
     expect(mockQueueAdd.mock.calls[0][2].jobId).not.toContain(":");
+  });
+
+  it("queues a late start 22 hours after the tap, on a half hour, under the same id", async () => {
+    const startKey = "auto_789:tap:mid_tap_1";
+    const start = {
+      ...JOB_BASE,
+      automationId: "auto_789",
+      userId: "commenter_999",
+      interactionAt: TAP_TIME,
+      startKey,
+    };
+
+    await enqueueOfferStart(start);
+    await enqueueOfferStart({ ...start, lateStart: true });
+
+    const [[, rightAway, rightAwayOptions], [, late, lateOptions]] =
+      mockQueueAdd.mock.calls;
+    // 12:09 + 22 h = 10:09 the next day, rounded down to 10:00 UTC.
+    const fireAt = Date.parse("2026-11-21T10:00:00.000Z");
+    expect(late).toEqual({ ...start, phase: "start", lateStart: true });
+    expect(lateOptions).toEqual({
+      jobId: rightAwayOptions.jobId,
+      delay: fireAt - NOW,
+      removeOnComplete: true,
+    });
+    expect(lateOptions.delay).toBeLessThanOrEqual(22 * HOUR);
+    // A start right away is queued as before: no flag, no delay.
+    expect(rightAway).toEqual({ ...start, phase: "start" });
+    expect(rightAwayOptions).not.toHaveProperty("delay");
+  });
+
+  it("runs a late start at once when its time has passed", async () => {
+    await enqueueOfferStart({
+      ...JOB_BASE,
+      automationId: "auto_789",
+      userId: "commenter_999",
+      interactionAt: NOW - 22 * HOUR - 10 * MINUTE,
+      startKey: "auto_789:dm:mid_old",
+      lateStart: true,
+    });
+
+    const [, data, options] = mockQueueAdd.mock.calls[0];
+    expect(data.lateStart).toBe(true);
+    expect(options).not.toHaveProperty("delay");
   });
 
   it("removes a waiting job as best effort", async () => {
@@ -985,6 +1244,44 @@ describe("offer messages", () => {
 
     expect(mockSendDirectMessageWithButton).toHaveBeenCalledTimes(1);
     expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+
+  // Whoever does not tap an offer that started 22 hours after its link gets
+  // nothing more, even though the offer has a reminder.
+  it("queues no reminder for an offer that started late", async () => {
+    mockPrisma.contactOffer.findFirst.mockResolvedValue(
+      contactOffer({ lateStart: true })
+    );
+
+    await step(2);
+
+    expect(mockSendDirectMessageWithButton).toHaveBeenCalledWith(
+      META_AUTH,
+      "ig_456",
+      "commenter_999",
+      "Soll ich ihn dir schicken?",
+      "Ja, gerne! 🙌",
+      "offer:co1"
+    );
+    expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledWith({
+      where: { id: "co1", pitchSentAt: null },
+      data: { pitchSentAt: new Date(NOW) },
+    });
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+    expect(mockPrisma.operationalEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("still sends the messages before the last one of an offer that started late", async () => {
+    mockPrisma.contactOffer.findFirst.mockResolvedValue(
+      contactOffer({ lateStart: true })
+    );
+
+    await step(0);
+
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      ...next("offer", { step: 1 }, { jobId: "offer_co1_offer_1", delay: 3000 })
+    );
   });
 
   it("skips the reminder when the window closes too soon for it", async () => {
@@ -1881,6 +2178,8 @@ describe("the reminder", () => {
     { label: "once the reminder was switched off", row: {}, offer: { reminderEnabled: false } },
     { label: "without a text", row: {}, offer: { reminderMessage: "   " } },
     { label: "for a deleted offer", row: {}, offer: { archivedAt: new Date(NOW - HOUR) } },
+    // None is queued for it; a reminder job that exists all the same sends nothing.
+    { label: "for an offer that started late", row: { lateStart: true }, offer: {} },
   ])("sends nothing $label", async ({ row, offer }) => {
     mockPrisma.contactOffer.findFirst.mockResolvedValue(pitched(row, offer));
 

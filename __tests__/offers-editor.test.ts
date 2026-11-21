@@ -27,6 +27,7 @@ import {
   offerFieldOfPath,
   offerPayload,
   percentOfOffered,
+  previewOffer,
   sentMessages,
   tagNamesFromTemplates,
   type OfferEditorState,
@@ -316,6 +317,33 @@ describe("cleanCustomOrder", () => {
   it("empties an order whose offers are all gone", () => {
     expect(cleanCustomOrder(["gone", "o2"], offers)).toEqual([]);
     expect(cleanCustomOrder([], offers)).toEqual([]);
+  });
+});
+
+// The campaign preview shows the offer someone new gets after the link.
+describe("previewOffer", () => {
+  const offers = [
+    { id: "paused", isActive: false },
+    { id: "first", isActive: true },
+    { id: "second", isActive: true },
+  ];
+
+  it("takes the first active offer of the default order", () => {
+    expect(previewOffer(offers, [])).toEqual({ id: "first", isActive: true });
+  });
+
+  it("follows the campaign's own order and skips paused and unknown offers", () => {
+    expect(previewOffer(offers, ["gone", "paused", "second", "first"])).toEqual({
+      id: "second",
+      isActive: true,
+    });
+  });
+
+  it("shows none when no offer is left or the offers did not load", () => {
+    expect(previewOffer(offers, ["paused"])).toBeNull();
+    expect(previewOffer([], [])).toBeNull();
+    expect(previewOffer(null, [])).toBeNull();
+    expect(previewOffer(undefined, ["first"])).toBeNull();
   });
 });
 

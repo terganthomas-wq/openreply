@@ -247,6 +247,10 @@ model Automation {
   offersEnabled                Boolean  @default(false)
   // Custom offer order (Offer ids). Empty = workspace default order (R13).
   offerIds                     String[] @default([])
+  // When the offer starts after the link: 0 right away, 22 (OFFER_LATE_START_HOURS,
+  // lib/offers/schedule.ts) hours after the tap or DM that brought the link, then
+  // without a reminder. Only these two values; lib/campaigns/schema.ts checks them.
+  offerDelayHours              Int      @default(0)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -468,6 +472,9 @@ model ContactOffer {
   /// key, not the campaign, keeps a redelivered webhook, a retried job or a repeated
   /// tap with the same mid from starting a second offer.
   startKey       String?
+  /// Started 22 hours after the delivery (Automation.offerDelayHours), taken from the
+  /// start job: no reminder follows. False for every offer started right away.
+  lateStart      Boolean   @default(false)
   offeredAt      DateTime  @default(now())
   /// The last offer message (with the button) went out; anchors the reminder.
   pitchSentAt    DateTime?

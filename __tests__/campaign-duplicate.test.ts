@@ -54,6 +54,8 @@ const sourceCampaign = {
   deliveryTag: "[LM] Guide sent",
   offersEnabled: true,
   offerIds: ["offer_2", "offer_1"],
+  // The offer starts 22 hours after the link.
+  offerDelayHours: 22,
   createdAt: new Date("2026-05-01T00:00:00.000Z"),
   updatedAt: new Date("2026-05-20T00:00:00.000Z"),
   trackedLinks: [
@@ -124,7 +126,7 @@ describe("duplicateCampaign", () => {
     });
   });
 
-  it("keeps the question filter, second follow request, delivery tag and offers", async () => {
+  it("keeps the question filter, second follow request, delivery tag, offers and their start", async () => {
     await duplicateCampaign({
       automationId: "automation_123",
       workspaceId: "workspace_123",
@@ -138,6 +140,7 @@ describe("duplicateCampaign", () => {
       offersEnabled: true,
       // The custom order, in the original's order.
       offerIds: ["offer_2", "offer_1"],
+      offerDelayHours: 22,
     });
   });
 

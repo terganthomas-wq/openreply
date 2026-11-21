@@ -101,6 +101,32 @@ abruft.
   zeigen. Hochgeladene, aber nie gespeicherte Bilder bleiben liegen; die
   kannst du bei Bedarf in Vercel unter *Storage* löschen.
 
+## Angebote: direkt nach dem Link oder 22 Stunden später
+
+Im Kampagnen-Editor unter *Nach dem Link* legst du bei „Wann soll das Angebot
+starten?“ pro Kampagne fest, wann das Lead-Magnet-Angebot kommt:
+
+- **Direkt nach dem Link** (Standard, wie bisher): Die Angebotsnachrichten
+  folgen Sekunden nach dem Link. Wer nicht tippt, bekommt die Erinnerung.
+- **22 Stunden später** (wie in der Anleitung „Automation 2“): Das Angebot
+  startet 22 Stunden nach dem Tippen oder der DM, die zum Link geführt hat,
+  abgerundet auf die volle oder halbe Stunde, damit die Datenbank seltener
+  aufwacht. Instagrams 24-Stunden-Fenster ist dann noch offen. Es gibt keine
+  Erinnerung: Wer nicht tippt, bekommt danach nichts mehr.
+- Schon geplante späte Starts behalten ihre Zeit, auch wenn du die Kampagne
+  zurück auf „Direkt nach dem Link“ stellst. Schaltest du bei der Kampagne
+  die Angebote aus oder löschst du die Kampagne, startet keins der geplanten
+  Angebote mehr. Eine pausierte Kampagne startet sie trotzdem, denn die Links
+  sind schon raus. Ein inzwischen gelöschter Kontakt bekommt nichts und wird
+  nicht neu angelegt. Ist das Fenster zum Start doch zu (etwa weil der Worker
+  stundenlang aus war), steht in *Diagnostics* „Offer skipped: messaging
+  window closed“.
+- Die späten Starts warten als verzögerte Jobs in Redis (einige hundert Bytes
+  pro Person). Erst wenn auch der Worker aktualisiert ist (siehe *Updates*),
+  starten Angebote 22 Stunden später, vorher weiter direkt.
+- Über die API und MCP heißt das Feld `offerDelayHours`, mit `0` oder `22`
+  (siehe `docs/integrations.md`).
+
 ## Worker-Server einrichten
 
 ```bash

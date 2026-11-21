@@ -135,4 +135,24 @@ describe("interface translations", () => {
       expect(translation, source).not.toMatch(/\b(?:Sie|Ihnen|Ihr|Ihre[mnrs]?)\b/);
     }
   });
+
+  // G1: the campaign editor's choice when the offer starts, the preview's
+  // marker and the offer editor's note on the reminder.
+  it("names when the offer starts in every language", () => {
+    const keys = [
+      "When should the offer start?",
+      "Right after the link",
+      "{hours} hours later",
+      "Instagram only allows messages up to 24 hours after the person's last tap or DM. At {hours} hours that window is still open. There is no reminder in this mode.",
+      "Only for campaigns that start the offer right after the link. Campaigns that start it {hours} hours later send no reminder.",
+    ] as const;
+    for (const catalog of [zhTW, ptBR, ru, de]) {
+      for (const key of keys) expect(catalog[key], key).toBeTruthy();
+    }
+    const { t } = createI18n("de");
+    expect(t("When should the offer start?")).toBe("Wann soll das Angebot starten?");
+    expect(t("Right after the link")).toBe("Direkt nach dem Link");
+    expect(t("{hours} hours later", { hours: 22 })).toBe("22 Stunden später");
+    expect(createI18n("en").t("{hours} hours later", { hours: 22 })).toBe("22 hours later");
+  });
 });

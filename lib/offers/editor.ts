@@ -3,8 +3,8 @@
  * R13): the body the editor saves, the tag names a new offer takes from the
  * workspace's tag templates, the API's rules by form field in the interface
  * language, a funnel stage's share of everyone offered, moving an entry up
- * or down, cleaning up a campaign's own offer order and what went wrong with
- * a card image upload.
+ * or down, cleaning up a campaign's own offer order, the offer a campaign's
+ * preview shows and what went wrong with a card image upload.
  *
  * Kept apart from the pages so it can be unit-tested
  * (__tests__/offers-editor.test.ts). Client-safe: no database, queue or
@@ -25,6 +25,7 @@ import {
   OFFER_IMAGE_TYPES,
   REMINDER_DELAY_MAX_HOURS,
 } from "@/lib/offers/schema";
+import { resolveOfferOrder } from "@/lib/offers/schedule";
 import { issueMessage } from "@/lib/validation/messages";
 
 /** One message of a list and the pause before it, in seconds. */
@@ -541,4 +542,22 @@ export function cleanCustomOrder(
     kept.push(id);
   }
   return kept;
+}
+
+/**
+ * The offer a campaign's preview shows after the link: the first active one
+ * in the order the campaign uses (its own ids, or none for the workspace's
+ * default order), which is what someone new gets. Null when there is none
+ * or the offers could not be loaded. `offers` come in the default order.
+ */
+export function previewOffer<T extends { id: string; isActive: boolean }>(
+  offers: readonly T[] | null | undefined,
+  customIds: readonly string[]
+): T | null {
+  if (!offers) return null;
+  const [first] = resolveOfferOrder(
+    customIds,
+    offers.filter((offer) => offer.isActive)
+  );
+  return first ?? null;
 }

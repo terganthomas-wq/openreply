@@ -17,7 +17,11 @@ import {
   fetchOfferOptions,
   type OfferOption,
 } from "@/components/campaign-offers-section";
-import { cleanCustomOrder } from "@/lib/offers/editor";
+import { cleanCustomOrder, previewOffer } from "@/lib/offers/editor";
+import {
+  OFFER_LATE_START_HOURS,
+  offerStartsLate,
+} from "@/lib/offers/schedule";
 
 interface Campaign {
   id: string;
@@ -49,6 +53,7 @@ interface Campaign {
   deliveryTag?: string | null;
   offersEnabled?: boolean;
   offerIds?: string[];
+  offerDelayHours?: number;
   isActive: boolean;
   instagramAccountId: string;
   instagramAccount: { username: string };
@@ -81,19 +86,17 @@ export default function CampaignDetailPage() {
   const [tab, setTab] = useState<Tab>("insights");
   const [previewTab, setPreviewTab] = useState<PreviewTab>("dm");
   const [busy, setBusy] = useState(false);
-  // The offers a custom order names: undefined while loading, null when
-  // they could not be loaded.
+  // The workspace's offers: undefined while loading, null when they could
+  // not be loaded.
   const [offerOptions, setOfferOptions] = useState<
     OfferOption[] | null | undefined
   >(undefined);
 
-  // Only a campaign with its own order needs the offers' names; the default
-  // order lives on the Offers page.
-  const customOrderKey = campaign?.offersEnabled
-    ? (campaign.offerIds ?? []).join(",")
-    : "";
+  // A campaign with offers needs them: a custom order shows their names,
+  // and the preview shows the offer someone new gets after the link.
+  const offersOn = campaign?.offersEnabled === true;
   useEffect(() => {
-    if (!customOrderKey) return;
+    if (!offersOn) return;
     let active = true;
     void fetchOfferOptions().then((offers) => {
       if (active) setOfferOptions(offers);
@@ -101,7 +104,7 @@ export default function CampaignDetailPage() {
     return () => {
       active = false;
     };
-  }, [customOrderKey]);
+  }, [offersOn]);
 
   useEffect(() => {
     fetch("/api/automations", { cache: "no-store" })
@@ -201,6 +204,8 @@ export default function CampaignDetailPage() {
         return offer ? [offer] : [];
       })
     : [];
+  // Right after the link, or 22 hours later.
+  const offerLate = offerStartsLate(campaign.offerDelayHours);
 
   const trigger = campaign.matchAnyPost
     ? t("Any post or reel")
@@ -418,6 +423,14 @@ export default function CampaignDetailPage() {
                     </ol>
                   </FieldBox>
                 )}
+                <p className="text-xs text-muted">
+                  {t("When should the offer start?")}
+                </p>
+                <FieldBox>
+                  {offerLate
+                    ? t("{hours} hours later", { hours: OFFER_LATE_START_HOURS })
+                    : t("Right after the link")}
+                </FieldBox>
               </div>
             )}
           </Summary>
@@ -508,6 +521,12 @@ export default function CampaignDetailPage() {
             followUpEnabled={campaign.followUpEnabled ?? false}
             followUpMessage={campaign.followUpMessage ?? ""}
             followUpDelayMinutes={campaign.followUpDelayMinutes ?? 0}
+            offer={
+              campaign.offersEnabled
+                ? previewOffer(offerOptions, customOfferIds)
+                : null
+            }
+            offerDelayHours={campaign.offerDelayHours ?? 0}
           />
           </div>
         )}

@@ -6,6 +6,10 @@
 
 import { z } from "zod";
 import {
+  OFFER_DELAY_HOURS,
+  OFFER_LATE_START_HOURS,
+} from "@/lib/offers/schedule";
+import {
   BUTTON_LABEL_MAX,
   BUTTON_TEXT_MAX,
   utf16Max,
@@ -37,6 +41,16 @@ export function offerRuleViolated(campaign: {
 
 // Offer ids are cuids; the caps only bound the request.
 const offerIdList = z.array(z.string().min(1).max(40)).max(20);
+
+export const OFFER_DELAY_MESSAGE = `Must be 0 (the offer starts right after the link) or ${OFFER_LATE_START_HOURS} (${OFFER_LATE_START_HOURS} hours later, without a reminder)`;
+
+/**
+ * When the offer starts after the link (Automation.offerDelayHours): 0 right
+ * away, or OFFER_LATE_START_HOURS later. No other value, whatever its type.
+ */
+const offerDelayHours = z.literal(OFFER_DELAY_HOURS, {
+  error: OFFER_DELAY_MESSAGE,
+});
 
 export const WEB_LINK_MESSAGE =
   "Must be a full web address that starts with http:// or https://";
@@ -118,6 +132,8 @@ export const createAutomationSchema = z
     offersEnabled: z.boolean().optional().default(false),
     // Custom offer order; empty uses the workspace default order.
     offerIds: offerIdList.optional().default([]),
+    // Right after the link unless the campaign asks for the late start.
+    offerDelayHours: offerDelayHours.optional().default(0),
   })
   // A campaign must target a specific post, any post, or the next reel.
   .refine(
@@ -194,4 +210,7 @@ export const updateAutomationSchema = z.object({
   deliveryTag: z.string().trim().max(100).optional().nullable(),
   offersEnabled: z.boolean().optional(),
   offerIds: offerIdList.optional(),
+  // A change applies to links delivered from then on: late starts already
+  // queued keep their time.
+  offerDelayHours: offerDelayHours.optional(),
 });

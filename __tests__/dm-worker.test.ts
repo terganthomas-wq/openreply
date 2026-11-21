@@ -3641,4 +3641,108 @@ describe("DM Worker — offers after a delivered link", () => {
     expect(mockPrisma.contact.upsert).not.toHaveBeenCalled();
     expect(mockSendDirectMessage).not.toHaveBeenCalled();
   });
+
+  // offerDelayHours 22: the offer starts 22 hours after the tap or DM that
+  // brought the link, rounded down to the half hour, as a delayed start job.
+  describe("for a campaign that starts its offers 22 hours later", () => {
+    const lateOffers = { ...withOffers, offerDelayHours: 22 };
+    // The link goes out five seconds after the tap.
+    const DELIVERED_AT = TAP_TIME + 5_000;
+
+    function lateStartAdd(startKey: string, interactionAt: number, fireAt: string) {
+      const [name, data, options] = startAdd(startKey, interactionAt);
+      return [
+        name,
+        { ...(data as Record<string, unknown>), lateStart: true },
+        {
+          ...(options as Record<string, unknown>),
+          delay: Date.parse(fireAt) - DELIVERED_AT,
+        },
+      ];
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(DELIVERED_AT);
+    });
+    afterEach(() => vi.useRealTimers());
+
+    it("queues the start of a tap 22 hours later, under the same job id", async () => {
+      mockPrisma.automation.findFirst.mockResolvedValue(lateOffers);
+
+      await getProcessor()(tap("mid_tap_1"));
+
+      expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+      // 10:00 + 22 h = 08:00 the next day, already on the half hour.
+      expect(offerAdds()).toEqual([
+        lateStartAdd("auto_789:tap:mid_tap_1", TAP_TIME, "2026-11-21T08:00:00.000Z"),
+      ]);
+      expect(mockPrisma.operationalEvent.create).not.toHaveBeenCalled();
+    });
+
+    it("counts from the tap a follow re-check repeats, rounded down", async () => {
+      mockPrisma.automation.findFirst.mockResolvedValue({
+        ...lateOffers,
+        requireFollow: true,
+      });
+      mockGetUserFollowStatus.mockResolvedValue(true);
+      const tappedAt = TAP_TIME - 7 * 60_000;
+
+      await getProcessor()({
+        ...createMockPostbackJob({
+          instagramAccountId: "ig_456",
+          userId: "commenter_999",
+          payload: "followcheck:auto_789",
+          mid: "mid_tap_1",
+          followRecheck: true,
+          followRecheckAttempt: 1,
+          tappedAt,
+        }),
+        id: "postback_recheck_auto_789_commenter_999_1_88",
+        timestamp: TAP_TIME,
+      });
+
+      // 09:53 + 22 h = 07:53, rounded down to 07:30.
+      expect(offerAdds()).toEqual([
+        lateStartAdd("auto_789:tap:mid_tap_1", tappedAt, "2026-11-21T07:30:00.000Z"),
+      ]);
+    });
+
+    it("queues the start of a DM trigger the same way", async () => {
+      mockPrisma.automation.findMany.mockResolvedValue([
+        { ...dmTriggerCampaign, offersEnabled: true, offerDelayHours: 22 },
+      ]);
+
+      await getProcessor()(inboundDmJob());
+
+      expect(offerAdds()).toEqual([
+        lateStartAdd("auto_789:dm:mid_abc", TAP_TIME, "2026-11-21T08:00:00.000Z"),
+      ]);
+    });
+
+    it.each([0, 5, 24])(
+      "starts right away for a campaign that holds %i",
+      async (offerDelayHours) => {
+        mockPrisma.automation.findFirst.mockResolvedValue({
+          ...withOffers,
+          offerDelayHours,
+        });
+
+        await getProcessor()(tap("mid_tap_1"));
+
+        expect(offerAdds()).toEqual([startAdd("auto_789:tap:mid_tap_1", TAP_TIME)]);
+      }
+    );
+
+    it("still skips a link that went out as a private reply", async () => {
+      mockPrisma.automation.findMany.mockResolvedValue([lateOffers]);
+
+      await getProcessor()(createMockJob());
+
+      expect(offerAdds()).toEqual([]);
+      expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ message: START_EVENT }),
+      });
+    });
+  });
 });

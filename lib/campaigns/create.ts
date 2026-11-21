@@ -120,6 +120,8 @@ export function newCampaignData(
     deliveryTag: data.deliveryTag || null,
     offersEnabled: data.offersEnabled,
     offerIds: uniqueOfferIds(data.offerIds),
+    // 0 unless the body asks for the late start (the schema's default).
+    offerDelayHours: data.offerDelayHours,
     workspaceId,
     instagramAccountId,
     reportShareSlug: generateReportShareSlug(),
@@ -249,7 +251,10 @@ async function workspaceMessageDefaults(
  * the workspace has an active offer (until then the campaign has nothing to
  * offer), and only with the opening DM the defaults bring along (R11). The
  * defaults do not enforce that rule themselves, so without this a minimal
- * create would fail on defaults that switch the opening DM off.
+ * create would fail on defaults that switch the opening DM off. When the
+ * offer starts is not among the defaults: as in the editor, a new campaign
+ * starts it right after the link (offerDelayHours 0, the schema's default)
+ * unless the body asks for the late start.
  */
 export async function campaignDefaultsFor(
   workspaceId: string

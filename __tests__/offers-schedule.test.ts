@@ -6,11 +6,16 @@
  * BullMQ's retries, and every send checks the window with a safety margin.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  lateStartDelayMs,
+  lateStartFireAt,
+  OFFER_DELAY_HOURS,
+  OFFER_LATE_START_HOURS,
   OFFER_ORDER,
   offerJobId,
   offerStartKey,
+  offerStartsLate,
   reminderFireAt,
   resolveOfferOrder,
   withinWindow,
@@ -150,6 +155,81 @@ describe("reminderFireAt", () => {
         delayHours: 5,
       })
     ).toBe(reminderFireAt({ pitchSentAt: NOW, lastInteractionAt: NOW, delayHours: 5 }));
+  });
+});
+
+// A campaign can start its offer 22 hours after the link (A-037), while
+// Instagram's window, 24 hours from the tap or DM, is still open.
+describe("late offer start", () => {
+  it("takes 22 hours, and campaigns know only right away and late", () => {
+    expect(OFFER_LATE_START_HOURS).toBe(22);
+    expect(OFFER_DELAY_HOURS).toEqual([0, 22]);
+  });
+
+  it("starts late only for the late value", () => {
+    expect(offerStartsLate(22)).toBe(true);
+    for (const value of [0, 1, 21, 23, 24, -22, 22.5, Number.NaN, null, undefined]) {
+      expect(offerStartsLate(value)).toBe(false);
+    }
+  });
+
+  it("fires 22 hours after the tap, rounded down to a half hour in UTC", () => {
+    // 12:10 + 22 h = 10:10 the next day, rounded down to 10:00.
+    expect(new Date(lateStartFireAt(NOW)).toISOString()).toBe(
+      "2026-11-21T10:00:00.000Z"
+    );
+  });
+
+  it("never fires later than 22 hours after the tap, and less than half an hour earlier", () => {
+    for (const minute of [0, 1, 29, 30, 31, 59]) {
+      for (const second of [0, 1, 59]) {
+        const tap =
+          Date.parse("2026-11-20T08:00:00.000Z") + minute * MINUTE + second * 1000;
+        const fireAt = lateStartFireAt(tap);
+        expect(fireAt % (30 * MINUTE)).toBe(0);
+        expect(fireAt).toBeLessThanOrEqual(tap + 22 * HOUR);
+        expect(fireAt).toBeGreaterThan(tap + 22 * HOUR - 30 * MINUTE);
+        // Inside the window, with the margin every send keeps, and with
+        // room for the retries 5 and 15 minutes later.
+        expect(withinWindow(tap, fireAt + 20 * MINUTE)).toBe(true);
+      }
+    }
+  });
+
+  it("keeps a tap on the half hour exactly 22 hours", () => {
+    const tap = Date.parse("2026-11-20T08:30:00.000Z");
+    expect(lateStartFireAt(tap)).toBe(tap + 22 * HOUR);
+  });
+
+  it("accepts Date and epoch milliseconds alike", () => {
+    expect(lateStartFireAt(new Date(NOW))).toBe(lateStartFireAt(NOW));
+    expect(lateStartDelayMs(new Date(NOW), NOW)).toBe(lateStartDelayMs(NOW, NOW));
+  });
+
+  it("waits until the fire time", () => {
+    expect(lateStartDelayMs(NOW, NOW)).toBe(
+      Date.parse("2026-11-21T10:00:00.000Z") - NOW
+    );
+    // Queued a while after the tap, it still fires on the same half hour.
+    expect(NOW + 5 * MINUTE + lateStartDelayMs(NOW, NOW + 5 * MINUTE)).toBe(
+      lateStartFireAt(NOW)
+    );
+  });
+
+  it("does not wait once the fire time has passed", () => {
+    expect(lateStartDelayMs(NOW - 22 * HOUR, NOW)).toBe(0);
+    expect(lateStartDelayMs(NOW - 23 * HOUR, NOW)).toBe(0);
+    expect(lateStartDelayMs(NOW - 3 * 24 * HOUR, NOW)).toBe(0);
+  });
+
+  it("reads the clock when no time is given", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(NOW);
+      expect(lateStartDelayMs(NOW)).toBe(lateStartDelayMs(NOW, NOW));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

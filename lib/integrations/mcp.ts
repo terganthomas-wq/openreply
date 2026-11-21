@@ -26,6 +26,7 @@ const fieldHints: Record<string, string> = {
   isActive: "true starts answering comments at once. Default: false, the campaign is created paused.",
   offersEnabled: "Offer the workspace's lead magnets after the link (needs the opening DM).",
   offerIds: "Custom offer order. Empty: the workspace's default order.",
+  offerDelayHours: "When the offer starts: 0 right after the link (default), or 22 for 22 hours after the person's tap or DM, while Instagram's 24-hour window is still open; then no reminder follows. No other value.",
 };
 
 /**

@@ -2,12 +2,13 @@
  * The offer engine (Weg 2): a lead-magnet offer after a delivered link.
  *
  * A campaign with offers starts one once its link went out after a button tap
- * or a DM (lib/queue/after-delivery.ts). The start takes the first offer in
- * the campaign's order that this person has not had yet and records it as a
- * ContactOffer row. From there each message is its own delayed job: the offer
- * messages, the last one with a "yes, send it" button; after a tap on it the
- * confirmations and the card with the lead magnet's link; without a tap, one
- * reminder before Instagram's 24-hour messaging window closes.
+ * or a DM (lib/queue/after-delivery.ts), right away or, if the campaign says
+ * so, 22 hours later. The start takes the first offer in the campaign's order
+ * that this person has not had yet and records it as a ContactOffer row. From
+ * there each message is its own delayed job: the offer messages, the last one
+ * with a "yes, send it" button; after a tap on it the confirmations and the
+ * card with the lead magnet's link; without a tap, one reminder before
+ * Instagram's 24-hour messaging window closes, unless the offer started late.
  *
  * After the start nothing here reads the campaign. Campaigns get paused or
  * deleted every few weeks, and that must not cut off offers already running;
@@ -34,6 +35,7 @@ import {
 import {
   addContactTags,
   ensureContact,
+  findContact,
   touchContactInteraction,
 } from "@/lib/contacts/store";
 import { prisma } from "@/lib/db/client";
@@ -181,6 +183,10 @@ async function loadContactOffer(
  * A new trigger of the same campaign starts the next offer this person has
  * not had; a repeat of the same trigger starts nothing; no offer twice, from
  * whichever campaign (ContactOffer is unique per contact and offer).
+ *
+ * A late start (job.data.lateStart) runs 22 hours after the delivery and
+ * otherwise works the same, with two differences: it never creates the
+ * contact, and its row records that it started late, so no reminder follows.
  */
 async function startOffer(job: Job<ProcessOfferJob>): Promise<void> {
   const {
@@ -192,6 +198,7 @@ async function startOffer(job: Job<ProcessOfferJob>): Promise<void> {
     interactionAt,
     startKey,
   } = job.data;
+  const lateStart = job.data.lateStart === true;
   if (!automationId || !userId || interactionAt === undefined || !startKey) {
     console.warn("[Offers] Ignoring a start without its trigger", job.id);
     return;
@@ -215,13 +222,25 @@ async function startOffer(job: Job<ProcessOfferJob>): Promise<void> {
     return;
   }
 
-  // Throws on a database error: nothing was sent yet, so BullMQ retries.
-  const contact = await ensureContact({
+  const identity = {
     workspaceId,
     instagramAccountId: accountConnectionId,
     igsid: userId,
     interactionAt: new Date(interactionAt),
-  });
+  };
+  // The delivery recorded the contact. A late start comes 22 hours later,
+  // and a contact that is gone by then was deleted on request (GDPR): it is
+  // not created again, and no offer follows. The log names no person. Both
+  // throw on a database error: nothing was sent yet, so BullMQ retries.
+  const contact = lateStart
+    ? await findContact(identity)
+    : await ensureContact(identity);
+  if (!contact) {
+    console.log("[Offers] Late start skipped: the contact no longer exists", {
+      automationId,
+    });
+    return;
+  }
 
   let started: StartedOffer | null = await prisma.contactOffer.findUnique({
     where: { contactId_startKey: { contactId: contact.id, startKey } },
@@ -232,7 +251,8 @@ async function startOffer(job: Job<ProcessOfferJob>): Promise<void> {
     // belongs to an earlier job for the same trigger, which queued the first
     // message itself. A newer row is this job's own, from an attempt that
     // failed before it got that far: carry on. Both times come from the
-    // worker's clock, which queued this job.
+    // worker's clock, which queued this job. A late start's job was queued
+    // 22 hours before its row, so its own row is newer as well.
     if (started.offeredAt.getTime() < job.timestamp) return;
   } else {
     if (!withinWindow(contact.lastInteractionAt)) {
@@ -249,6 +269,7 @@ async function startOffer(job: Job<ProcessOfferJob>): Promise<void> {
       contactId: contact.id,
       automation,
       startKey,
+      lateStart,
     });
     // A concurrent run of this very start created the row and goes on.
     if (claim === "same-trigger") return;
@@ -288,11 +309,13 @@ async function claimNextOffer({
   contactId,
   automation,
   startKey,
+  lateStart,
 }: {
   workspaceId: string;
   contactId: string;
   automation: { id: string; offerIds: string[] };
   startKey: string;
+  lateStart: boolean;
 }): Promise<StartedOffer | "same-trigger" | null> {
   const active = await prisma.offer.findMany({
     where: { workspaceId, isActive: true, archivedAt: null },
@@ -327,6 +350,9 @@ async function claimNextOffer({
           offerId,
           automationId: automation.id,
           startKey,
+          // From the start job, not the campaign, whose setting may have
+          // changed since the link went out.
+          lateStart,
           // The worker's clock, like the job timestamp a resumed start
           // compares it with.
           offeredAt: new Date(),
@@ -397,6 +423,9 @@ async function sendOfferStep(
     data: { pitchSentAt: new Date(now) },
   });
   if (!co.offer.reminderEnabled) return;
+  // An offer that started 22 hours after its link gets no reminder, as in
+  // the A-037 guide: whoever does not tap gets nothing more.
+  if (co.lateStart) return;
 
   // The reminder (R7) is queued now and removed by a tap, so nobody who
   // tapped wakes the database 23 hours later.
@@ -615,11 +644,13 @@ async function sendReminder(
   const reminder = offer.reminderMessage?.trim();
   // A tap, an earlier reminder or a stop leaves nothing to remind of, and an
   // offer deleted since, or edited to have no reminder, sends none. A paused
-  // offer still sends it: pausing only keeps the offer from new people.
+  // offer still sends it: pausing only keeps the offer from new people. An
+  // offer that started late has none (sendOfferStep queues none for it).
   if (
     co.interestedAt ||
     co.reminderSentAt ||
     co.stoppedAt ||
+    co.lateStart ||
     offer.archivedAt ||
     !offer.reminderEnabled ||
     !reminder

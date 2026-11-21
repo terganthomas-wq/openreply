@@ -103,6 +103,10 @@ export interface ProcessOfferJob {
   // .startKey). Every new trigger starts the next offer; a repeat of the
   // same trigger starts nothing.
   startKey?: string;
+  // start: queued to run 22 hours after the delivery (the campaign's
+  // offerDelayHours when its link went out). The ContactOffer row records it
+  // and gets no reminder. Absent on starts that run right away.
+  lateStart?: boolean;
   // Every other phase: the ContactOffer row.
   contactOfferId?: string;
   // offer, confirm: the index of the message.

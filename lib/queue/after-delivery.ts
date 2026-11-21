@@ -11,7 +11,7 @@
 
 import { addContactTags, ensureContact } from "@/lib/contacts/store";
 import { enqueueOfferStart } from "@/lib/offers/jobs";
-import { offerStartKey } from "@/lib/offers/schedule";
+import { offerStartKey, offerStartsLate } from "@/lib/offers/schedule";
 import { FOLLOWUP_JOB_NAME, getDMQueue } from "./client";
 import { formatError, logWorkerEvent } from "./send-helpers";
 
@@ -33,6 +33,7 @@ export interface LinkDelivery {
     followUpMessage: string | null;
     followUpDelayMinutes: number;
     offersEnabled: boolean;
+    offerDelayHours: number;
     instagramAccount: { instagramId: string };
   };
   userId: string;
@@ -176,6 +177,8 @@ export async function afterLinkDelivered({
   // start is recorded and the delivered link stays SENT. A start lost to a
   // crash right after the delivery stays lost: a second offer for the same
   // trigger would be worse, and the person gets one with their next trigger.
+  // A campaign that starts its offers late queues the start 22 hours after
+  // the trigger, while Instagram's window is still open.
   try {
     await enqueueOfferStart({
       workspaceId: automation.workspaceId,
@@ -185,6 +188,7 @@ export async function afterLinkDelivered({
       userId,
       interactionAt,
       startKey: offerStartKey(automation.id, via, triggerId),
+      lateStart: offerStartsLate(automation.offerDelayHours),
     });
   } catch (error) {
     console.error("[DM Worker] Failed to start the offer:", formatError(error));

@@ -12,15 +12,18 @@ offers on uses them.
 1. Someone triggers a campaign and gets its link after tapping a button (the
    opening DM or the follow request) or after sending a DM.
 2. The campaign picks the first offer this person has not been offered yet,
-   in its order (below). Nobody gets the same offer twice, whichever campaign
-   or post it comes from. With none left, nothing more is sent.
+   in its order (below), right after the link or 22 hours later (see
+   [When the offer starts](#when-the-offer-starts)). Nobody gets the same
+   offer twice, whichever campaign or post it comes from. With none left,
+   nothing more is sent.
 3. The offer messages go out one after another, each after its own pause (0
    to 60 seconds). The last one carries the button, for example
    "Ja, gerne! 🙌".
 4. A tap on the button sends the confirmation messages, then the card: image,
    title, subtitle and a button that opens your link.
 5. Without a tap, the reminder goes out after the hours you set (1 to 23),
-   with the card's button.
+   with the card's button. An offer that started 22 hours after the link has
+   no reminder.
 
 Every new trigger of a campaign by the same person (a new comment whose
 opening DM they tap, a new tap, a new DM) sends the link again and starts the
@@ -50,6 +53,31 @@ the person got the link, for example because the messaging window closed.
 Paused offers are skipped in both. Turning offers on in the campaign editor
 also turns the opening DM on (see below) and fills it from the default texts
 when it is empty.
+
+## When the offer starts
+
+**When should the offer start?** in the campaign editor (under **After the
+link**; `offerDelayHours` in the campaign API) has two settings:
+
+- **Right after the link** (the default, `0`): the offer messages follow the
+  link within seconds, and the reminder goes to everyone who does not tap.
+- **22 hours later** (`22`): the offer starts the next day, 22 hours after
+  the tap or DM that brought the link, rounded down to a full or half hour
+  (UTC) so that starts within the same half hour wake the database once.
+  Instagram's 24-hour window is still open then, and a tap on the offer's
+  button opens a new one for the confirmations and the card. There is no
+  reminder: whoever does not tap gets nothing more.
+
+At its start a late offer works like any other: it takes the campaign's
+current offer order and checks the window. A contact deleted in the
+meantime gets nothing and is not created again. If the window has closed
+after all, for example because the worker was down, the start is skipped and
+Diagnostics says "Offer skipped: messaging window closed".
+
+The setting applies to links delivered from then on. Late starts already
+waiting keep their time when it changes, also when a campaign goes back to
+**Right after the link**. Switching the campaign's offers off or deleting the
+campaign stops them; pausing it does not, since their links went out.
 
 ## Instagram's 24-hour window
 

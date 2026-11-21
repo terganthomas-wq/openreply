@@ -1,6 +1,11 @@
 "use client";
 
 import { useI18n } from "@/lib/i18n/provider";
+import {
+  OFFER_LATE_START_HOURS,
+  offerStartsLate,
+} from "@/lib/offers/schedule";
+import { renderMessageWithoutLink } from "@/lib/tracking/message";
 
 
 /* eslint-disable @next/next/no-img-element */
@@ -16,6 +21,13 @@ import { useI18n } from "@/lib/i18n/provider";
  */
 
 export type PreviewTab = "post" | "comments" | "dm" | "dmTrigger";
+
+/** What the DM thread shows of the offer after the link (Weg 2). */
+export interface PreviewOffer {
+  offerMessages: string[];
+  /** The last offer message carries this button. */
+  offerButtonLabel: string;
+}
 
 interface CampaignPreviewProps {
   tab: PreviewTab;
@@ -48,6 +60,10 @@ interface CampaignPreviewProps {
   followUpEnabled: boolean;
   followUpMessage: string;
   followUpDelayMinutes?: number;
+  // The offer someone new gets after the link; null or absent: none.
+  offer?: PreviewOffer | null;
+  // When it starts: 0 right after the link, 22 under a "22 hours later" marker.
+  offerDelayHours?: number;
 }
 
 /** The commenter's name in the previews, where {username} goes. */
@@ -377,6 +393,8 @@ function DmScreen({
   followUpEnabled,
   followUpMessage,
   followUpDelayMinutes = 0,
+  offer = null,
+  offerDelayHours = 0,
   linkUrl,
   inboundMessage,
 }: {
@@ -399,12 +417,50 @@ function DmScreen({
   followUpEnabled: boolean;
   followUpMessage: string;
   followUpDelayMinutes?: number;
+  offer?: PreviewOffer | null;
+  offerDelayHours?: number;
   // Present on the keyword-trigger thread: the DM the user sends to start it.
   inboundMessage?: string;
 }) {
   const { t } = useI18n();
   const followPrompt = followPromptMessage || DEFAULT_FOLLOW_PROMPT;
   const followButton = followPromptButtonLabel || DEFAULT_FOLLOW_BUTTON;
+
+  // The offer goes out right after the link, or 22 hours later under a
+  // marker. A follow-up that waits longer than that comes after it.
+  const offerLate = offerStartsLate(offerDelayHours);
+  const offerMessages = offer?.offerMessages ?? [];
+  const offerBlock =
+    offerMessages.length > 0 ? (
+      <>
+        {offerLate && (
+          <p className="py-1 text-center text-[11px] text-zinc-500">
+            {t("{hours} hours later", { hours: OFFER_LATE_START_HOURS })}
+          </p>
+        )}
+        {offerMessages.map((text, i) => (
+          <div key={i} className="flex items-end gap-2">
+            <Avatar url={avatarUrl} size={24} />
+            <div className="max-w-[80%] overflow-hidden rounded-2xl rounded-bl-md bg-zinc-800">
+              {/* As the worker sends it: the name in, no {link} left. */}
+              <p className="whitespace-pre-wrap break-words px-3 py-2 text-sm">
+                {renderMessageWithoutLink({ message: text, commenterName: SAMPLE_USER })}
+              </p>
+              {/* The last message carries the "yes, send it" button. */}
+              {i === offerMessages.length - 1 && (
+                <div className="mx-1.5 mb-1.5 break-words rounded-xl bg-zinc-700 px-4 py-1.5 text-center text-sm font-medium text-white">
+                  {offer?.offerButtonLabel || t("Button label")}
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+      </>
+    ) : null;
+  const offerBeforeFollowUp =
+    followUpEnabled &&
+    followUpDelayMinutes > (offerLate ? OFFER_LATE_START_HOURS * 60 : 0);
+
   return (
     <div className="flex h-full flex-col text-white">
       <StatusBar />
@@ -516,6 +572,7 @@ function DmScreen({
             </div>
           );
         })()}
+        {offerBeforeFollowUp && offerBlock}
         {followUpEnabled && (
           <>
             {followUpDelayMinutes > 0 && (
@@ -535,6 +592,7 @@ function DmScreen({
             </div>
           </>
         )}
+        {!offerBeforeFollowUp && offerBlock}
       </div>
 
       <DmComposer />
@@ -601,6 +659,8 @@ export default function CampaignPreview(props: CampaignPreviewProps) {
             followUpEnabled={props.followUpEnabled}
             followUpMessage={props.followUpMessage}
             followUpDelayMinutes={props.followUpDelayMinutes}
+            offer={props.offer}
+            offerDelayHours={props.offerDelayHours}
             linkUrl={props.linkUrl}
           />
         )}
@@ -625,6 +685,9 @@ export default function CampaignPreview(props: CampaignPreviewProps) {
             followUpEnabled={props.followUpEnabled}
             followUpMessage={props.followUpMessage}
             followUpDelayMinutes={props.followUpDelayMinutes}
+            // A DM that brings the link starts the offer as a tap does.
+            offer={props.offer}
+            offerDelayHours={props.offerDelayHours}
             linkUrl={props.linkUrl}
             inboundMessage={props.sampleComment}
           />

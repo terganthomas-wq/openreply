@@ -44,7 +44,11 @@ vi.mock("@/lib/campaigns/links", async (importOriginal) => ({
 }));
 
 import { PATCH, POST } from "../app/api/automations/route";
-import { OFFER_RULE_MESSAGE, WEB_LINK_MESSAGE } from "../lib/campaigns/schema";
+import {
+  OFFER_DELAY_MESSAGE,
+  OFFER_RULE_MESSAGE,
+  WEB_LINK_MESSAGE,
+} from "../lib/campaigns/schema";
 
 // Links that are no web links. Each would end up behind a DM button (the
 // tracked /r/ redirect) or as the post's link on the campaigns page.
@@ -113,6 +117,7 @@ const legacyRow = {
   deliveryTag: null,
   offersEnabled: false,
   offerIds: [],
+  offerDelayHours: 0,
 };
 
 const offerCampaignRow = {
@@ -386,6 +391,27 @@ describe("POST /api/automations", () => {
     expect(mockPrisma.automation.create).not.toHaveBeenCalled();
   });
 
+  it("starts the offer right after the link unless the body says 22", async () => {
+    const offers = { ...newCampaign, ...openingDm, offersEnabled: true };
+    expect((await POST(postRequest(offers))).status).toBe(201);
+    expect(createData().offerDelayHours).toBe(0);
+
+    mockPrisma.automation.create.mockClear();
+    expect((await POST(postRequest({ ...offers, offerDelayHours: 22 }))).status).toBe(201);
+    expect(createData().offerDelayHours).toBe(22);
+  });
+
+  it.each([3, 21, 23, "22"])("refuses %j as when the offer starts", async (hours) => {
+    const response = await POST(
+      postRequest({ ...newCampaign, ...openingDm, offersEnabled: true, offerDelayHours: hours })
+    );
+
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.details.fieldErrors).toEqual({ offerDelayHours: [OFFER_DELAY_MESSAGE] });
+    expect(mockPrisma.automation.create).not.toHaveBeenCalled();
+  });
+
   it("stores http and https links", async () => {
     const response = await POST(
       postRequest({
@@ -619,6 +645,30 @@ describe("PATCH /api/automations", () => {
     expect(updateData()).toEqual({ offerIds: [] });
     expect(mockPrisma.offer.count).not.toHaveBeenCalled();
   });
+
+  it.each([22, 0])("sets when the offer starts to %i hours after the link", async (hours) => {
+    mockPrisma.automation.findFirst.mockResolvedValue(offerCampaignRow);
+
+    const response = await PATCH(patchRequest({ offerDelayHours: hours }));
+
+    expect(response.status).toBe(200);
+    expect(updateData()).toEqual({ offerDelayHours: hours });
+    expect((await response.json()).data.offerDelayHours).toBe(hours);
+  });
+
+  it.each([1, 12, 23, 24, "22", null])(
+    "refuses %j as when the offer starts and changes nothing",
+    async (hours) => {
+      mockPrisma.automation.findFirst.mockResolvedValue(offerCampaignRow);
+
+      const response = await PATCH(patchRequest({ offerDelayHours: hours }));
+
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(body.details.fieldErrors).toEqual({ offerDelayHours: [OFFER_DELAY_MESSAGE] });
+      expect(mockPrisma.automation.update).not.toHaveBeenCalled();
+    }
+  );
 
   it.each(BAD_LINKS)("refuses a %s of %j and changes nothing", async (field, link) => {
     const response = await PATCH(patchRequest({ [field]: link }));

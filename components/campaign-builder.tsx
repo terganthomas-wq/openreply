@@ -46,7 +46,12 @@ import {
   type CampaignDefaults,
 } from "@/lib/campaigns/message-defaults";
 import { isWebLink, offerRuleViolated } from "@/lib/campaigns/schema";
-import { cleanCustomOrder } from "@/lib/offers/editor";
+import { cleanCustomOrder, previewOffer } from "@/lib/offers/editor";
+import {
+  OFFER_LATE_START_HOURS,
+  offerStartsLate,
+  type OfferDelayHours,
+} from "@/lib/offers/schedule";
 
 type TriggerScope = "specific" | "any" | "next";
 type MatchMode = "specific" | "any";
@@ -117,6 +122,7 @@ interface LoadedCampaign {
   deliveryTag?: string | null;
   offersEnabled?: boolean;
   offerIds?: string[];
+  offerDelayHours?: number;
 }
 
 interface CampaignBuilderProps {
@@ -240,6 +246,9 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
   const [offerOrderMode, setOfferOrderMode] =
     useState<OfferOrderMode>("default");
   const [customOfferIds, setCustomOfferIds] = useState<string[]>([]);
+  // When the offer starts: right after the link, or 22 hours later. New
+  // campaigns start it right after the link.
+  const [offerDelayHours, setOfferDelayHours] = useState<OfferDelayHours>(0);
   // Switching offers on switched the opening DM on too: the card says why.
   const [openingDmSwitchedOn, setOpeningDmSwitchedOn] = useState(false);
   // Whether the workspace's default texts were asked for (new mode always).
@@ -375,6 +384,9 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
         setCustomOfferIds(
           offers ? cleanCustomOrder(storedIds, offers) : storedIds
         );
+        setOfferDelayHours(
+          offerStartsLate(c.offerDelayHours) ? OFFER_LATE_START_HOURS : 0
+        );
       })
       .catch(() => {
         if (!cancelled) setNotFound(true);
@@ -485,6 +497,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
     setKeywordText((row.keywords ?? []).join(", "));
     setOfferOrderMode("default");
     setCustomOfferIds([]);
+    setOfferDelayHours(0);
     applyCampaignFields(withImportRow(defaults, row), offers);
     const link = row.trackedUrl ?? "";
     setTrackedDestinationUrl(link);
@@ -737,6 +750,8 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
       // no order of their own.
       offerIds:
         offersEnabled && offerOrderMode === "custom" ? customOfferIds : [],
+      // Kept with offers off too: it only applies while they are on.
+      offerDelayHours,
       isActive: activeValue,
     };
 
@@ -1561,6 +1576,8 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
             onOrderModeChange={setOfferOrderMode}
             customIds={customOfferIds}
             onCustomIdsChange={setCustomOfferIds}
+            delayHours={offerDelayHours}
+            onDelayHoursChange={setOfferDelayHours}
             openingDmEnabled={openingDmEnabled}
             openingDmSwitchedOn={openingDmSwitchedOn}
             followUpEnabled={followUpEnabled}
@@ -1645,6 +1662,15 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
             followUpEnabled={followUpEnabled}
             followUpMessage={followUpMessage}
             followUpDelayMinutes={followUpDelayMinutes}
+            offer={
+              offersEnabled
+                ? previewOffer(
+                    offerOptions,
+                    offerOrderMode === "custom" ? customOfferIds : []
+                  )
+                : null
+            }
+            offerDelayHours={offerDelayHours}
           />
         </div>
       </div>
