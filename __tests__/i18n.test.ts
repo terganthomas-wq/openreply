@@ -139,21 +139,37 @@ describe("interface translations", () => {
   // G1: the campaign editor's choice when the offer starts, the preview's
   // marker and the offer editor's note on the reminder.
   it("names when the offer starts in every language", () => {
+    const hint =
+      "Instagram only allows messages up to 24 hours after the person's last tap or DM. At {hours} hours that window is still open. With “{hours} hours later” there is no reminder.";
     const keys = [
       "When should the offer start?",
       "Right after the link",
       "{hours} hours later",
-      "Instagram only allows messages up to 24 hours after the person's last tap or DM. At {hours} hours that window is still open. There is no reminder in this mode.",
+      hint,
       "Only for campaigns that start the offer right after the link. Campaigns that start it {hours} hours later send no reminder.",
     ] as const;
     for (const catalog of [zhTW, ptBR, ru, de]) {
       for (const key of keys) expect(catalog[key], key).toBeTruthy();
+      // The hint shows under either option, so it names the one without a
+      // reminder in the words of its label: "this mode" read as the selected
+      // one, by default the one that has a reminder.
+      expect(catalog[hint], "hint names the late option").toContain(
+        catalog["{hours} hours later"]
+      );
+      expect(catalog, "old hint").not.toHaveProperty([
+        "Instagram only allows messages up to 24 hours after the person's last tap or DM. At {hours} hours that window is still open. There is no reminder in this mode.",
+      ]);
     }
     const { t } = createI18n("de");
     expect(t("When should the offer start?")).toBe("Wann soll das Angebot starten?");
     expect(t("Right after the link")).toBe("Direkt nach dem Link");
     expect(t("{hours} hours later", { hours: 22 })).toBe("22 Stunden später");
-    expect(createI18n("en").t("{hours} hours later", { hours: 22 })).toBe("22 hours later");
+    expect(t(hint, { hours: 22 })).toBe(
+      "Instagram erlaubt Nachrichten nur bis 24 Stunden nach dem letzten Tippen oder der letzten DM der Person. Nach 22 Stunden ist dieses Fenster noch offen. Bei „22 Stunden später“ gibt es keine Erinnerung."
+    );
+    const en = createI18n("en");
+    expect(en.t("{hours} hours later", { hours: 22 })).toBe("22 hours later");
+    expect(en.t(hint, { hours: 22 })).toContain("With “22 hours later” there is no reminder.");
   });
 
   // G2: the offer editor's sign-up feedback, the funnel stage, the contact
@@ -163,7 +179,7 @@ describe("interface translations", () => {
       "Report the sign-up back",
       "Report sign-ups from the landing page",
       "For a landing page with a sign-up form, for example for your newsletter. The link on the card and in the reminder then gets a personal code (ig=…). Your landing page sends it back as soon as the person has signed up. They then get the tag and, if Instagram still allows it, your message in the chat.",
-      "Address for your landing page",
+      "Your landing page reports the sign-up to this address",
       "Your landing page also needs a key with the access “{access}”.",
       "Create the key under API & MCP",
       "A key runs out after 90 days at the latest. Create a new one in time and replace it on your landing page.",
@@ -191,11 +207,17 @@ describe("interface translations", () => {
       for (const key of keys) expect(catalog[key], key).toBeTruthy();
       // The four tags of before are five now.
       expect(catalog, "old tag count").not.toHaveProperty(["Fill in all four tags."]);
+      // The callback address is this tool's, not the landing page's own:
+      // the label says what it is for.
+      expect(catalog, "old address label").not.toHaveProperty(["Address for your landing page"]);
     }
     const { t } = createI18n("de");
     expect(t("Report the sign-up back")).toBe("Eintragung zurückmelden");
     expect(t("Report sign-ups")).toBe("Eintragungen melden");
     expect(t("Signed up")).toBe("Eingetragen");
+    expect(t("Your landing page reports the sign-up to this address")).toBe(
+      "An diese Adresse meldet deine Landingpage die Eintragung"
+    );
     expect(t("Your landing page also needs a key with the access “{access}”.", { access: t("Report sign-ups") })).toBe(
       "Deine Landingpage braucht dafür einen Schlüssel mit dem Zugriff „Eintragungen melden“."
     );

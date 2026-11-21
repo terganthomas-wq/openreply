@@ -340,9 +340,12 @@ export default function CampaignOffersSection({
             >
               {t("{hours} hours later", { hours: OFFER_LATE_START_HOURS })}
             </Radio>
+            {/* Shown under either option, so it names the one without a
+                reminder: under "Right after the link", "this mode" read as
+                that one. */}
             <p className="text-xs text-muted">
               {t(
-                "Instagram only allows messages up to 24 hours after the person's last tap or DM. At {hours} hours that window is still open. There is no reminder in this mode.",
+                "Instagram only allows messages up to 24 hours after the person's last tap or DM. At {hours} hours that window is still open. With “{hours} hours later” there is no reminder.",
                 { hours: OFFER_LATE_START_HOURS }
               )}
             </p>

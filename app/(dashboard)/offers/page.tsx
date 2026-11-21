@@ -397,10 +397,13 @@ export default function OffersPage() {
               {/* Funnel: every stage against everyone offered, since the
                   reminder counts as sent without any interest. Each tile
                   lists the contacts with that stage's tag. Five tiles go
-                  three to a row until there is room for all five. */}
+                  three to a row until there is room for all five: beside
+                  the sidebar that is from xl on. At lg (1024 px) a tile is
+                  128 px wide, too narrow for a label like "Eingetragen"
+                  next to its share. */}
               <div
                 className={`mt-4 grid grid-cols-2 gap-2 ${
-                  stages.length > 4 ? "sm:grid-cols-3 lg:grid-cols-5" : "sm:grid-cols-4"
+                  stages.length > 4 ? "sm:grid-cols-3 xl:grid-cols-5" : "sm:grid-cols-4"
                 }`}
               >
                 {stages.map((stage) => (
@@ -410,10 +413,15 @@ export default function OffersPage() {
                     title={stage.tag}
                     className="min-w-0 rounded-lg border border-border bg-background px-3 py-2 transition-colors hover:border-border-hover"
                   >
-                    <div className="flex items-baseline justify-between gap-2">
-                      <span className="truncate text-xs text-muted">{stage.label}</span>
+                    {/* The stage's name is never cut: where it and the share
+                        do not fit side by side (a narrow phone, a longer
+                        word in another language), the share wraps. */}
+                    <div className="flex flex-wrap items-baseline justify-between gap-x-2">
+                      <span className="min-w-0 break-words text-xs text-muted">
+                        {stage.label}
+                      </span>
                       {stage.share !== null && (
-                        <span className="shrink-0 text-xs tabular-nums text-muted">
+                        <span className="ml-auto shrink-0 text-xs tabular-nums text-muted">
                           {percent.format(stage.share / 100)}
                         </span>
                       )}

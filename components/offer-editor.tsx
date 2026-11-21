@@ -369,8 +369,8 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
     } catch {
       // No clipboard (no https, no permission): the address is selected for
       // copying by hand.
-      const input = document.getElementById(fieldId("signupUrl"));
-      if (input instanceof HTMLInputElement) input.select();
+      const address = document.getElementById(fieldId("signupUrl"));
+      if (address) window.getSelection()?.selectAllChildren(address);
     }
   }
 
@@ -1205,31 +1205,36 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
               </div>
               {form.signupTrackingEnabled && (
                 <div className="mt-3 space-y-4">
-                  {/* Where the landing page reports, and with which key. */}
+                  {/* Where the landing page reports, and with which key. The
+                      whole address shows, wrapped where needed: a one-line
+                      field cut it off, so it could be neither checked nor
+                      passed on to whoever builds the landing page. A click
+                      selects all of it; on a phone, Copy goes below it. */}
                   <div className="space-y-1">
-                    <label
-                      htmlFor={fieldId("signupUrl")}
-                      className="block text-xs text-muted"
+                    <div
+                      role="group"
+                      aria-labelledby={fieldId("signupUrl-label")}
+                      className="space-y-1"
                     >
-                      {t("Address for your landing page")}
-                    </label>
-                    <div className="flex min-w-0 gap-2">
-                      <input
-                        id={fieldId("signupUrl")}
-                        readOnly
-                        value={signupUrl}
-                        onFocus={(e) => e.currentTarget.select()}
-                        spellCheck={false}
-                        className={inputClass(false, "min-w-0 flex-1 font-mono")}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => void copySignupUrl()}
-                        disabled={!signupUrl}
-                        className="shrink-0 rounded-lg border border-border px-3 py-2 text-sm font-medium text-muted hover:text-foreground disabled:opacity-50"
-                      >
-                        {signupUrlCopied ? t("Copied!") : t("Copy")}
-                      </button>
+                      <p id={fieldId("signupUrl-label")} className="text-xs text-muted">
+                        {t("Your landing page reports the sign-up to this address")}
+                      </p>
+                      <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start">
+                        <code
+                          id={fieldId("signupUrl")}
+                          className="block min-h-9.5 min-w-0 select-all break-all rounded-lg border border-border bg-surface px-3 py-2 font-mono text-xs leading-5 text-foreground sm:flex-1"
+                        >
+                          {signupUrl}
+                        </code>
+                        <button
+                          type="button"
+                          onClick={() => void copySignupUrl()}
+                          disabled={!signupUrl}
+                          className="shrink-0 self-start rounded-lg border border-border px-3 py-2 text-sm font-medium text-muted hover:text-foreground disabled:opacity-50"
+                        >
+                          {signupUrlCopied ? t("Copied!") : t("Copy")}
+                        </button>
+                      </div>
                     </div>
                     <p className="text-xs text-muted">
                       {t("Your landing page also needs a key with the access “{access}”.", {
