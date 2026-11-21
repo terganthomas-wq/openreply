@@ -30,7 +30,10 @@ vi.mock("@/lib/db/client", () => ({
 }));
 vi.mock("@/lib/queue/client", () => ({
   getDMQueue: () => ({ add: mockQueueAdd, remove: vi.fn() }),
+  // No account is paused for a Meta request limit.
+  getRedisConnection: () => ({ get: async () => null }),
   OFFER_JOB_NAME: "process-offer",
+  POSTBACK_JOB_NAME: "process-postback",
 }));
 
 import { processOffer } from "../lib/offers/worker";

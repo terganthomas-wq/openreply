@@ -22,19 +22,23 @@ vi.mock("@/lib/db/client", () => ({
   prisma: { operationalEvent: { create: eventCreate } },
 }));
 
-import { RateLimitError } from "../lib/meta/client";
+import { MetaApiError, RateLimitError } from "../lib/meta/client";
 import {
   accountPauseKey,
   checkAccountPause,
   countPausedJobs,
   MAX_PAUSE_REQUEUES,
+  metaLimitOf,
+  nextPauseWait,
   PAUSE_JITTER_MS,
   pauseAccountForLimit,
   pauseJitterMs,
   pausedRunAt,
+  pauseWaitMessage,
   readAccountPauses,
   requeueForPause,
 } from "../lib/queue/account-pause";
+import { ClaimReleaseError } from "../lib/queue/send-helpers";
 
 const NOW = new Date("2026-11-21T13:00:00.000Z").getTime();
 const MINUTE = 60_000;
@@ -306,6 +310,64 @@ describe("putting a job back for the pause", () => {
 
   it("caps the waits at twelve, about four hours of throttles", () => {
     expect(MAX_PAUSE_REQUEUES).toBe(12);
+  });
+});
+
+describe("the next wait of a job", () => {
+  it("names the copy after the job's usual id and its wait, run at the pause's end plus its jitter", () => {
+    const resumeAt = NOW + 20 * MINUTE;
+    expect(nextPauseWait("offer_co1_card", undefined, resumeAt)).toEqual({
+      number: 1,
+      jobId: "offer_co1_card_pause_1",
+      runAt: pausedRunAt(resumeAt, "offer_co1_card_pause_1"),
+      capped: false,
+    });
+    expect(nextPauseWait("offer_co1_card", 4, resumeAt)).toMatchObject({
+      number: 5,
+      jobId: "offer_co1_card_pause_5",
+    });
+  });
+
+  it("is the same for the same job, so a job held twice for one pause stays one copy", () => {
+    const resumeAt = NOW + 20 * MINUTE;
+    expect(nextPauseWait("followup_a_b", 2, resumeAt)).toEqual(
+      nextPauseWait("followup_a_b", 2, resumeAt)
+    );
+  });
+
+  it("is capped after twelve waits", () => {
+    expect(nextPauseWait("x", MAX_PAUSE_REQUEUES - 1, NOW).capped).toBe(false);
+    expect(nextPauseWait("x", MAX_PAUSE_REQUEUES, NOW)).toMatchObject({
+      number: MAX_PAUSE_REQUEUES + 1,
+      capped: true,
+    });
+  });
+
+  it("says when the job is tried next, in UTC", () => {
+    expect(pauseWaitMessage(Date.parse("2026-11-21T13:20:31.000Z"))).toBe(
+      "Instagram request limit; next try at 13:20 UTC"
+    );
+  });
+});
+
+describe("the request limit behind a failed send", () => {
+  it("is the error itself for a throttle or a block", () => {
+    expect(metaLimitOf(throttle)).toBe(throttle);
+    expect(metaLimitOf(block)).toBe(block);
+  });
+
+  it("is the refusal of a message whose claim could not be given back", () => {
+    const kept = new ClaimReleaseError(throttle, new Error("Connection terminated"));
+    expect(metaLimitOf(kept)).toBe(throttle);
+  });
+
+  it("is none for other refusals, Zernio's own limit and other failures", () => {
+    const zernio = new RateLimitError("Zernio request failed (HTTP 429)", undefined, undefined, 429);
+    const refused = new MetaApiError(100, undefined, undefined, "Invalid parameter");
+    expect(metaLimitOf(zernio)).toBeNull();
+    expect(metaLimitOf(refused)).toBeNull();
+    expect(metaLimitOf(new ClaimReleaseError(refused, new Error("lost")))).toBeNull();
+    expect(metaLimitOf(new Error("socket hang up"))).toBeNull();
   });
 });
 

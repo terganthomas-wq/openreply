@@ -42,7 +42,10 @@ reports sign-ups, or once there are some): a reminder counts as sent without
 any interest, so the stages are not nested, and sent and clicked can be
 higher than interested (the page then says why under the tiles). "Stopped
 early" counts offers that ended before the person got the link, for example
-because the messaging window closed.
+because the messaging window closed. A Meta request limit only delays a
+message: it waits for the end of the account's pause, and the offer stops
+only when the window closes meanwhile or after twelve waits
+([delivery retries](delivery-retries.md#metas-request-limits)).
 
 ## Which offer a campaign uses
 

@@ -19,7 +19,9 @@
  * Every message is claimed before it is sent (PostbackDelivery), counts toward
  * the workspace's monthly DMs and re-checks the messaging window. A retried or
  * repeated job therefore picks the sequence up where it stopped and never
- * sends a message twice.
+ * sends a message twice. While Meta refuses the account's calls for a request
+ * limit (lib/queue/account-pause.ts), a message waits for the end of the
+ * pause instead of being sent or given up.
  *
  * An offer that reports sign-ups gets one message more: once its landing
  * page reported the sign-up (lib/offers/signup.ts), the confirmation in the
@@ -49,6 +51,7 @@ import {
   classifySendError,
   isConfirmedSendRejection,
   isDeliveryUnconfirmed,
+  isMetaThrottle,
 } from "@/lib/instagram/delivery-errors";
 import {
   createInstagramContext,
@@ -60,7 +63,22 @@ import {
   sendDirectMessageWithLinkButton,
   type InstagramContext,
 } from "@/lib/instagram/provider";
-import type { ProcessOfferJob, ProcessPostbackJob } from "@/lib/queue/client";
+import {
+  checkAccountPause,
+  MAX_PAUSE_REQUEUES,
+  metaLimitOf,
+  nextPauseWait,
+  pauseAccountForLimit,
+  pauseWaitMessage,
+  requeueForPause,
+} from "@/lib/queue/account-pause";
+import {
+  OFFER_JOB_NAME,
+  POSTBACK_JOB_NAME,
+  type DmQueueJob,
+  type ProcessOfferJob,
+  type ProcessPostbackJob,
+} from "@/lib/queue/client";
 import {
   claimPostbackDelivery,
   ClaimReleaseError,
@@ -127,9 +145,28 @@ type OnStop = (
   details?: Record<string, Prisma.InputJsonValue | null>
 ) => Promise<void>;
 
-// What the send policy needs of the job that sends: a rate limit is retried
-// while attempts are left.
+// What the send policy needs of the job that sends: Zernio's own rate limit
+// is retried while attempts are left.
 type Attempts = Pick<Job, "attemptsMade" | "opts">;
+
+// What became of a message under the send policy (sendOfferMessage). Only
+// "sent" and "claimed" let the sequence go on; a message that waits for the
+// account's pause ("held") carries on from its copy.
+type SendOutcome = "sent" | "claimed" | "stopped" | "held";
+
+// The job that sends a message once more, for the end of the account's pause:
+// its name, its data and the id it is queued under. The copy runs as
+// `<jobId>_pause_<n>`.
+interface PauseCopy {
+  name: string;
+  data: DmQueueJob;
+  jobId: string;
+}
+
+/** The offer job itself again, for the end of the account's pause. */
+function sameJob(job: Job<ProcessOfferJob>, jobId: string): PauseCopy {
+  return { name: OFFER_JOB_NAME, data: job.data, jobId };
+}
 
 // A reminder that could only go out within a minute is not worth a job.
 const MIN_REMINDER_DELAY_MS = 60_000;
@@ -410,19 +447,25 @@ async function sendOfferStep(
   const isLast = step >= messages.length - 1;
   const text = render(co, messages[Math.min(step, messages.length - 1)]);
   const target = sendTarget(co);
-  const outcome = await sendOfferMessage(job, co, "offer", step, (context) =>
-    isLast
-      ? sendDirectMessageWithButton({
-          ...target,
-          context,
-          text,
-          buttonTitle: co.offer.offerButtonLabel,
-          // A cuid has no colon, so the tap's payload parses back to the row.
-          payload: `${OFFER_PAYLOAD_PREFIX}${co.id}`,
-        })
-      : sendDirectMessage({ ...target, context, message: text })
+  const outcome = await sendOfferMessage(
+    job,
+    co,
+    "offer",
+    step,
+    (context) =>
+      isLast
+        ? sendDirectMessageWithButton({
+            ...target,
+            context,
+            text,
+            buttonTitle: co.offer.offerButtonLabel,
+            // A cuid has no colon, so the tap's payload parses back to the row.
+            payload: `${OFFER_PAYLOAD_PREFIX}${co.id}`,
+          })
+        : sendDirectMessage({ ...target, context, message: text }),
+    sameJob(job, offerJobId.step(co.id, "offer", step))
   );
-  if (outcome === "stopped") return;
+  if (outcome === "stopped" || outcome === "held") return;
 
   if (!isLast) {
     await enqueueOfferJob(nextJob(co, { phase: "offer", step: step + 1 }), {
@@ -495,8 +538,9 @@ export async function processOfferTap(
   }
 
   // The tap opens Instagram's messaging window again (R1), for this offer
-  // and for anything else this person is sent.
-  const tappedAt = new Date(job.timestamp ?? Date.now());
+  // and for anything else this person is sent. A copy queued for the
+  // account's pause carries the time of the tap it repeats.
+  const tappedAt = new Date(job.data.tappedAt ?? job.timestamp ?? Date.now());
   await touchContactInteraction(co.contactId, tappedAt);
 
   if (co.offer.archivedAt) {
@@ -555,7 +599,23 @@ export async function processOfferTap(
     console.log("[Offers] Tap handled too late to answer", job.id);
     return;
   }
-  await deliverCard(job, co, "retap", mid ?? job.id ?? tappedAt.getTime());
+  // The tap, as the card's claim names it. A copy queued for the account's
+  // pause carries it, so it sends this tap's card under the same claim.
+  const tap = job.data.tapId ?? mid ?? job.id ?? tappedAt.getTime();
+  // The window now counts from this tap at the latest.
+  const seen = co.contact.lastInteractionAt;
+  const tapped =
+    seen && seen.getTime() >= tappedAt.getTime()
+      ? co
+      : { ...co, contact: { ...co.contact, lastInteractionAt: tappedAt } };
+  await deliverCard(job, tapped, "retap", tap, {
+    name: POSTBACK_JOB_NAME,
+    data: { ...job.data, tappedAt: tappedAt.getTime(), tapId: String(tap) },
+    jobId: offerJobId.retap(
+      co.id,
+      createHash("sha256").update(String(tap)).digest("hex")
+    ),
+  });
 }
 
 /** Confirmation `step` after the tap; after the last one, the card. */
@@ -570,14 +630,20 @@ async function sendConfirmation(
   if (step >= messages.length) return queueCard(co);
   if (!withinWindow(co.contact.lastInteractionAt)) return stopWindowClosed(co);
 
-  const outcome = await sendOfferMessage(job, co, "confirm", step, (context) =>
-    sendDirectMessage({
-      ...sendTarget(co),
-      context,
-      message: render(co, messages[step]),
-    })
+  const outcome = await sendOfferMessage(
+    job,
+    co,
+    "confirm",
+    step,
+    (context) =>
+      sendDirectMessage({
+        ...sendTarget(co),
+        context,
+        message: render(co, messages[step]),
+      }),
+    sameJob(job, offerJobId.step(co.id, "confirm", step))
   );
-  if (outcome === "stopped") return;
+  if (outcome === "stopped" || outcome === "held") return;
 
   if (step + 1 < messages.length) {
     await enqueueOfferJob(nextJob(co, { phase: "confirm", step: step + 1 }), {
@@ -596,7 +662,7 @@ async function sendCardStep(
   if (!co.interestedAt || co.stoppedAt) return;
   if (co.offer.archivedAt) return stopArchived(co);
   if (!withinWindow(co.contact.lastInteractionAt)) return stopWindowClosed(co);
-  await deliverCard(job, co, "card", 0);
+  await deliverCard(job, co, "card", 0, sameJob(job, offerJobId.card(co.id)));
 }
 
 /**
@@ -608,25 +674,33 @@ async function deliverCard(
   job: Attempts,
   co: LoadedContactOffer,
   phase: "card" | "retap",
-  step: number | string
+  step: number | string,
+  copy: PauseCopy
 ): Promise<void> {
   const { offer, contact } = co;
   const url = buildOfferUrl(offer.linkSlug, hashRecipientId(contact.igsid));
   const delivered: { via: OfferCardVia | null } = { via: null };
-  const outcome = await sendOfferMessage(job, co, phase, step, async (context) => {
-    delivered.via = await sendOfferCard({
-      ...sendTarget(co),
-      context,
-      workspaceId: co.workspaceId,
-      card: {
-        title: offer.cardTitle,
-        subtitle: offer.cardSubtitle,
-        imageUrl: offer.cardImageUrl,
-        button: { title: offer.cardButtonLabel, url },
-      },
-    });
-  });
-  if (outcome === "stopped") return;
+  const outcome = await sendOfferMessage(
+    job,
+    co,
+    phase,
+    step,
+    async (context) => {
+      delivered.via = await sendOfferCard({
+        ...sendTarget(co),
+        context,
+        workspaceId: co.workspaceId,
+        card: {
+          title: offer.cardTitle,
+          subtitle: offer.cardSubtitle,
+          imageUrl: offer.cardImageUrl,
+          button: { title: offer.cardButtonLabel, url },
+        },
+      });
+    },
+    copy
+  );
+  if (outcome === "stopped" || outcome === "held") return;
 
   // How the card went out is known only when this run sent it. One an
   // earlier run claimed, or one with an unknown outcome, counts as sent all
@@ -681,30 +755,37 @@ async function sendReminder(
   const url = buildOfferUrl(offer.linkSlug, hashRecipientId(contact.igsid));
   const text = render(co, reminder);
   const target = sendTarget(co);
-  const outcome = await sendOfferMessage(job, co, "reminder", 0, async (context) => {
-    try {
-      await sendDirectMessageWithLinkButton({
-        ...target,
-        context,
-        text,
-        buttons: [{ title: offer.cardButtonLabel, url }],
-      });
-    } catch (buttonError) {
-      // As for a campaign's link: plain text only after a proven rejection
-      // of the button template, and the fallback's own outcome counts.
-      if (!isTemplateRejection(buttonError)) throw buttonError;
+  const outcome = await sendOfferMessage(
+    job,
+    co,
+    "reminder",
+    0,
+    async (context) => {
       try {
-        await sendDirectMessage({
+        await sendDirectMessageWithLinkButton({
           ...target,
           context,
-          message: `${text}\n${url}`,
+          text,
+          buttons: [{ title: offer.cardButtonLabel, url }],
         });
-      } catch (fallbackError) {
-        throw classifySendError(fallbackError);
+      } catch (buttonError) {
+        // As for a campaign's link: plain text only after a proven rejection
+        // of the button template, and the fallback's own outcome counts.
+        if (!isTemplateRejection(buttonError)) throw buttonError;
+        try {
+          await sendDirectMessage({
+            ...target,
+            context,
+            message: `${text}\n${url}`,
+          });
+        } catch (fallbackError) {
+          throw classifySendError(fallbackError);
+        }
       }
-    }
-  });
-  if (outcome === "stopped") return;
+    },
+    sameJob(job, offerJobId.reminder(co.id))
+  );
+  if (outcome === "stopped" || outcome === "held") return;
 
   const now = new Date();
   await prisma.contactOffer.updateMany({
@@ -759,9 +840,10 @@ async function sendSignupConfirmation(
         context,
         message: render(co, text),
       }),
+    sameJob(job, offerJobId.signup(co.id)),
     (reason, details) => reportSignupSkipped(co, reason, details)
   );
-  if (outcome === "stopped") return;
+  if (outcome === "stopped" || outcome === "held") return;
 
   // Sent, claimed by an earlier run or with an unknown outcome: it may be in
   // the inbox, so it never goes out again.
@@ -806,15 +888,22 @@ function reportSignupSkipped(
  *   went out, or may have: it is not sent again and the sequence goes on.
  * - An unknown outcome may have reached the inbox. It is recorded, never sent
  *   again, and the sequence goes on.
- * - A rate limit is retried by BullMQ (after 5 and 15 minutes, still inside
- *   the window) and stops the offer on the last attempt.
+ * - While Meta refuses the account's calls for a request limit (the account
+ *   is paused), nothing is reserved, claimed or sent, and the message waits
+ *   for the end of the pause (holdOfferMessage). A message Meta refuses with
+ *   a request limit pauses the account and waits the same way. Only after
+ *   MAX_PAUSE_REQUEUES waits does a request limit stop the offer
+ *   (RATE_LIMITED), and a closed window by then stops it as a closed window.
+ * - Zernio's own rate limit is retried by BullMQ (after 5 and 15 minutes,
+ *   still inside the window) and stops the offer on the last attempt.
  * - A closed window or any other refusal stops the offer and is recorded.
  * - A refusal stays a refusal when its claim cannot be given back; the claim
  *   left taken is reported on its own (refusedWithClaimKept).
  *
  * Only rate limits and database errors leave the job failed, so an expected
  * refusal never raises a worker alert. Where the policy says the offer stops,
- * `onStop` runs; by default it stops the offer (stopOffer).
+ * `onStop` runs; by default it stops the offer (stopOffer). `copy` is the job
+ * that sends this message, for the end of the account's pause.
  */
 async function sendOfferMessage(
   job: Attempts,
@@ -822,8 +911,9 @@ async function sendOfferMessage(
   phase: SendPhase,
   step: number | string,
   send: (context: InstagramContext) => Promise<unknown>,
+  copy: PauseCopy,
   onStop: OnStop = (reason, details) => stopOffer(co, reason, details)
-): Promise<"sent" | "claimed" | "stopped"> {
+): Promise<SendOutcome> {
   const account = co.contact.instagramAccount;
   if (!hasInstagramCredentials(account)) {
     await onStop("ACCOUNT_UNAVAILABLE");
@@ -839,6 +929,12 @@ async function sendOfferMessage(
   } catch (error) {
     await onStop("ACCOUNT_UNAVAILABLE", { error: formatError(error) });
     return "stopped";
+  }
+
+  const hold = { co, phase, step, copy, onStop };
+  const pausedUntil = await checkAccountPause(account.instagramId);
+  if (pausedUntil !== null) {
+    return holdOfferMessage({ ...hold, resumeAt: pausedUntil });
   }
 
   const usage = await reserveWorkspaceDMSend(co.workspaceId);
@@ -899,6 +995,19 @@ async function sendOfferMessage(
     if (!isConfirmedSendRejection(error)) throw error;
     await release();
 
+    // A Meta request limit: nothing was sent, and the account's next calls
+    // would be refused as well. The account pauses, and the message waits
+    // for the end of the pause instead of BullMQ's retries after 5 and 15
+    // minutes, which would only run into the limit again.
+    if (isMetaThrottle(error)) {
+      const pause = await pauseAccountForLimit({
+        instagramAccountId: account.instagramId,
+        workspaceId: co.workspaceId,
+        account: account.username,
+        error,
+      });
+      return holdOfferMessage({ ...hold, resumeAt: pause.resumeAt, error });
+    }
     if (
       error instanceof RateLimitError &&
       job.attemptsMade + 1 < (job.opts?.attempts ?? 3)
@@ -911,14 +1020,78 @@ async function sendOfferMessage(
 }
 
 /**
+ * An offer message meets its account's pause, before anything was sent: the
+ * pause was found, or Instagram refused the message with a request limit
+ * (sendClaimedPostback gave its claim back and the reservation went back, as
+ * for any refusal). Its job runs again after the pause, as `<its
+ * id>_pause_<n>`, and sends the same message under the same claim, so the
+ * message can never go out twice and the sequence goes on from there.
+ *
+ * Only while Instagram's window, counted from the person's last tap or DM,
+ * is still open when the copy runs (withinWindow, with its margin): else the
+ * message stops as for a closed window. After MAX_PAUSE_REQUEUES waits it
+ * stops with RATE_LIMITED, the one stop a Meta request limit still causes.
+ * Either stop goes through `onStop`, so the sign-up confirmation reports it
+ * instead of stopping the offer.
+ */
+async function holdOfferMessage({
+  co,
+  phase,
+  step,
+  copy,
+  onStop,
+  resumeAt,
+  error,
+}: {
+  co: LoadedContactOffer;
+  phase: SendPhase;
+  step: number | string;
+  copy: PauseCopy;
+  onStop: OnStop;
+  resumeAt: number;
+  /** What Instagram answered, if it was asked. */
+  error?: unknown;
+}): Promise<"held" | "stopped"> {
+  const wait = nextPauseWait(copy.jobId, copy.data.pauseRequeue, resumeAt);
+  const pausedUntil = new Date(resumeAt).toISOString();
+  if (!withinWindow(co.contact.lastInteractionAt, wait.runAt)) {
+    await onStop("WINDOW_CLOSED", { phase, step, pausedUntil });
+    return "stopped";
+  }
+  if (wait.capped) {
+    await onStop("RATE_LIMITED", {
+      phase,
+      step,
+      pausedUntil,
+      waits: MAX_PAUSE_REQUEUES,
+      ...(error === undefined ? {} : { error: formatError(error) }),
+    });
+    return "stopped";
+  }
+  await requeueForPause({
+    name: copy.name,
+    data: { ...copy.data, pauseRequeue: wait.number },
+    jobId: wait.jobId,
+    instagramAccountId: co.contact.instagramAccount.instagramId,
+    resumeAt,
+  });
+  console.log(
+    `[Offers] ${copy.jobId}: ${pauseWaitMessage(wait.runAt)} (wait ${wait.number})`
+  );
+  return "held";
+}
+
+/**
  * Instagram refused the message, and the database failed while giving its
  * claim back. Nothing was delivered, so this is a refusal like any other:
  * the reservation goes back and the offer stops for the refusal's reason.
  * The claim stays taken, though, and a retry of this job would take the
  * message for sent and carry on as if it had gone out. So there is no retry,
- * not even for a rate limit, and the claim left behind is reported on its
- * own. Should recording the refusal fail as well, the job ends for good
- * rather than being retried into that mistake.
+ * not even for a rate limit, nor a wait for the account's pause, and the
+ * claim left behind is reported on its own. A Meta request limit still
+ * pauses the account, so its other messages wait. Should recording the
+ * refusal fail as well, the job ends for good rather than being retried into
+ * that mistake.
  */
 async function refusedWithClaimKept(
   co: LoadedContactOffer,
@@ -933,6 +1106,15 @@ async function refusedWithClaimKept(
     "[Offers] Claim of a refused message not released:",
     formatError(error.releaseError)
   );
+  const limit = metaLimitOf(error);
+  if (limit) {
+    await pauseAccountForLimit({
+      instagramAccountId: co.contact.instagramAccount.instagramId,
+      workspaceId: co.workspaceId,
+      account: co.contact.instagramAccount.username,
+      error: limit,
+    });
+  }
   await logWorkerEvent({
     workspaceId: co.workspaceId,
     level: "WARNING",

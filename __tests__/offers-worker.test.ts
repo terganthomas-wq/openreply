@@ -54,6 +54,9 @@ const {
   mockReserveWorkspaceDMSend: vi.fn(),
   mockReleaseWorkspaceDMReservation: vi.fn(),
 }));
+// Redis, for the account pause (lib/queue/account-pause.ts): a new, empty
+// FakeRedis for every test.
+const redis = vi.hoisted(() => ({ current: null as unknown }));
 
 vi.mock("@/lib/db/client", () => ({ prisma: mockPrisma }));
 
@@ -100,7 +103,9 @@ vi.mock("@/lib/meta/oauth", () => ({ decryptToken: mockDecryptToken }));
 
 vi.mock("@/lib/queue/client", () => ({
   getDMQueue: () => ({ add: mockQueueAdd, remove: mockQueueRemove }),
+  getRedisConnection: () => redis.current,
   OFFER_JOB_NAME: "process-offer",
+  POSTBACK_JOB_NAME: "process-postback",
 }));
 
 vi.mock("@/lib/billing/usage", () => ({
@@ -118,6 +123,7 @@ import { OFFER_ORDER } from "@/lib/offers/schedule";
 import { processOffer, processOfferTap } from "@/lib/offers/worker";
 import type { ProcessOfferJob, ProcessPostbackJob } from "@/lib/queue/client";
 import { hashRecipientId } from "@/lib/tracking/server";
+import { FakeRedis } from "./helpers/fake-redis";
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -346,6 +352,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(NOW);
+  // No account is paused for a Meta request limit.
+  redis.current = new FakeRedis();
 
   mockPrisma.automation.findFirst.mockReset().mockResolvedValue({
     id: "auto_789",
@@ -412,6 +420,14 @@ function started(offerId: string) {
     offeredAt: new Date(),
     offer: { tagOffered: `${offerId} angeboten`, offerDelaysSeconds: [5, 3, 2] },
   };
+}
+
+// Zernio's own limit: a RateLimitError with HTTP 429 as its code
+// (lib/zernio/client.ts), which is no Meta request limit.
+function zernioLimit() {
+  return Object.assign(new RateLimitError("Zernio request failed (HTTP 429)"), {
+    code: 429,
+  });
 }
 
 function sends() {
@@ -1333,8 +1349,10 @@ describe("offer messages", () => {
     expect(mockQueueAdd).not.toHaveBeenCalled();
   });
 
-  it("retries a rate limit while attempts are left", async () => {
-    mockSendDirectMessage.mockRejectedValue(new RateLimitError("Too many messages"));
+  // Zernio's own limit (HTTP 429) is no Meta request limit: BullMQ retries
+  // it, as before. Meta's limits wait for the account's pause (below).
+  it("retries Zernio's rate limit while attempts are left", async () => {
+    mockSendDirectMessage.mockRejectedValue(zernioLimit());
 
     await expect(step(0)).rejects.toMatchObject({ name: "RateLimitError" });
 
@@ -1347,8 +1365,8 @@ describe("offer messages", () => {
     expect(mockQueueAdd).not.toHaveBeenCalled();
   });
 
-  it("stops with RATE_LIMITED on the last attempt", async () => {
-    mockSendDirectMessage.mockRejectedValue(new RateLimitError("Too many messages"));
+  it("stops with RATE_LIMITED on the last attempt of Zernio's rate limit", async () => {
+    mockSendDirectMessage.mockRejectedValue(zernioLimit());
 
     await expect(step(0, { attemptsMade: 2 })).resolves.toBeUndefined();
 
@@ -1462,7 +1480,13 @@ describe("offer messages", () => {
 
       expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledWith(stopWrite("RATE_LIMITED"));
       expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledTimes(1);
+      // No copy for the account's pause either: it would find the claim.
       expect(mockQueueAdd).not.toHaveBeenCalled();
+      // The account still pauses (368, a block: an hour), so its other
+      // messages wait.
+      await expect(
+        (redis.current as FakeRedis).get("meta:pause:ig_456")
+      ).resolves.toBe(String(NOW + 60 * MINUTE));
     });
 
     it("stops quietly for a closed window", async () => {
@@ -2401,8 +2425,8 @@ describe("the sign-up confirmation", () => {
     );
   });
 
-  it("retries a rate limit while attempts are left and reports it on the last one", async () => {
-    mockSendDirectMessage.mockRejectedValue(new RateLimitError("Too many calls"));
+  it("retries Zernio's rate limit while attempts are left and reports it on the last one", async () => {
+    mockSendDirectMessage.mockRejectedValue(zernioLimit());
 
     await expect(confirm({ attemptsMade: 0 })).rejects.toBeInstanceOf(RateLimitError);
     expect(mockPrisma.operationalEvent.create).not.toHaveBeenCalled();
@@ -2499,5 +2523,535 @@ describe("the sign-up confirmation", () => {
 
     expect(sends()).toBe(0);
     expect(mockPrisma.contactOffer.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+// R1: a Meta request limit costs an offer message time, not the message.
+// While the account is paused, or once Instagram refused a message with a
+// limit, the message's job runs again after the pause as <its id>_pause_<n>
+// and sends the same message under the same claim. Only a closed window by
+// then, and twelve waits, still stop the offer.
+describe("Meta request limits: offer messages wait for the account's pause", () => {
+  const PAUSE_KEY = "meta:pause:ig_456";
+  const fake = () => redis.current as FakeRedis;
+
+  // Meta's answer while the app is over its limit, as seen live.
+  function limit(code = 4) {
+    return Object.assign(
+      new RateLimitError(
+        `(#4) Application request limit reached (/v25.0/ig_456/messages) [code=${code} sub=- type=OAuthException trace=t]`
+      ),
+      { code }
+    );
+  }
+
+  function pauseFor(minutes: number) {
+    return fake().set(PAUSE_KEY, String(NOW + minutes * MINUTE), "PX", minutes * MINUTE);
+  }
+
+  function pauseCopies() {
+    return mockQueueAdd.mock.calls.filter(([, , opts]) =>
+      String(opts?.jobId).includes("_pause_")
+    );
+  }
+
+  function pauseEvents() {
+    return mockPrisma.operationalEvent.create.mock.calls.filter(
+      ([args]) =>
+        (args as { data: { payload?: { kind?: string } } }).data.payload
+          ?.kind === "meta-pause"
+    );
+  }
+
+  function stopWrites() {
+    return mockPrisma.contactOffer.updateMany.mock.calls.filter(
+      ([args]) => "stopReason" in (args as { data: object }).data
+    );
+  }
+
+  // The job BullMQ runs for a queued copy, at the time it was queued for.
+  function runCopy([name, data, opts]: unknown[], extra: Record<string, unknown> = {}) {
+    const { jobId, delay } = opts as { jobId: string; delay: number };
+    vi.setSystemTime(NOW + delay);
+    const job = {
+      name,
+      id: jobId,
+      attemptsMade: 0,
+      opts: { attempts: 3 },
+      timestamp: NOW,
+      data,
+      ...extra,
+    };
+    return name === "process-postback"
+      ? processOfferTap(job as unknown as Job<ProcessPostbackJob>)
+      : processOffer(job as unknown as Job<ProcessOfferJob>);
+  }
+
+  const interested = (row: Record<string, unknown> = {}, offer: Partial<typeof OFFER> = {}) =>
+    contactOffer(
+      {
+        pitchSentAt: new Date(NOW - 10 * MINUTE),
+        interestedAt: new Date(NOW - 5000),
+        interestedMid: "mid_yes",
+        ...row,
+      },
+      offer,
+      { lastInteractionAt: new Date(NOW - 5000) }
+    );
+
+  const step = (i: number, data: Partial<ProcessOfferJob> = {}, job = {}) =>
+    processOffer(
+      offerJob({ phase: "offer", contactOfferId: "co1", step: i, ...data }, job)
+    );
+
+  beforeEach(() => {
+    mockPrisma.contactOffer.findFirst.mockResolvedValue(contactOffer());
+  });
+
+  it("waits for the pause without reserving, claiming or sending", async () => {
+    await pauseFor(10);
+
+    await expect(step(0)).resolves.toBeUndefined();
+
+    expect(sends()).toBe(0);
+    expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
+    expect(mockPrisma.postbackDelivery.create).not.toHaveBeenCalled();
+    // The offer goes on; it is not stopped.
+    expect(stopWrites()).toEqual([]);
+    expect(pauseCopies()).toEqual([
+      [
+        "process-offer",
+        { ...JOB_BASE, phase: "offer", contactOfferId: "co1", step: 0, pauseRequeue: 1 },
+        {
+          jobId: "offer_co1_offer_0_pause_1",
+          delay: expect.any(Number),
+          removeOnComplete: true,
+        },
+      ],
+    ]);
+    const { delay } = pauseCopies()[0][2];
+    expect(delay).toBeGreaterThanOrEqual(10 * MINUTE);
+    expect(delay).toBeLessThan(11 * MINUTE);
+    // Whoever started the pause recorded it.
+    expect(pauseEvents()).toHaveLength(0);
+    // The next message waits for this one.
+    expect(mockQueueAdd).toHaveBeenCalledTimes(1);
+  });
+
+  it("pauses the account and waits when Instagram refuses a message with a request limit", async () => {
+    mockSendDirectMessage.mockRejectedValueOnce(limit(4));
+
+    // No error: BullMQ's retries after 5 and 15 minutes would only run into
+    // the limit again.
+    await expect(step(0)).resolves.toBeUndefined();
+
+    // Refused: the claim and the reservation go back, as for any refusal.
+    expect(mockPrisma.postbackDelivery.delete).toHaveBeenCalledWith({
+      where: { id: claimId("offer", 0) },
+    });
+    expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledTimes(1);
+    await expect(fake().get(PAUSE_KEY)).resolves.toBe(String(NOW + 20 * MINUTE));
+    expect(pauseEvents()).toHaveLength(1);
+    expect(pauseEvents()[0][0].data).toMatchObject({
+      workspaceId: "workspace_123",
+      level: "WARNING",
+      message: "Instagram request limit reached for @brand: sending paused until 12:30 UTC",
+    });
+    expect(stopWrites()).toEqual([]);
+    expect(pauseCopies().map(([, , opts]) => opts.jobId)).toEqual([
+      "offer_co1_offer_0_pause_1",
+    ]);
+    expect(mockQueueAdd).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([17, 32, 613, 80002, 80006, 368])("waits for code %i as well", async (code) => {
+    mockSendDirectMessage.mockRejectedValueOnce(limit(code));
+
+    await expect(step(0)).resolves.toBeUndefined();
+
+    expect(pauseCopies()).toHaveLength(1);
+    await expect(fake().get(PAUSE_KEY)).resolves.toBe(
+      String(NOW + (code === 368 ? 60 : 20) * MINUTE)
+    );
+  });
+
+  it("sends the message with its copy after the pause, once, and goes on", async () => {
+    const claims = new Set<string>();
+    mockPrisma.postbackDelivery.create.mockImplementation(
+      async ({ data }: { data: { id: string } }) => {
+        if (claims.has(data.id)) throw { code: "P2002" };
+        claims.add(data.id);
+        return data;
+      }
+    );
+    mockPrisma.postbackDelivery.delete.mockImplementation(
+      async ({ where }: { where: { id: string } }) => {
+        claims.delete(where.id);
+      }
+    );
+    mockSendDirectMessage.mockRejectedValueOnce(limit(4));
+    await step(0);
+    const [copy] = pauseCopies();
+    mockQueueAdd.mockClear();
+
+    // The copy and a retry of the same step (a redelivered job) race.
+    await Promise.all([runCopy(copy), step(0, {}, { attemptsMade: 1 })]);
+
+    // The refused try and one send, under the step's one claim.
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(2);
+    expect(mockSendDirectMessage).toHaveBeenLastCalledWith(
+      META_AUTH,
+      "ig_456",
+      "commenter_999",
+      "Ich hab übrigens noch einen Guide, commenter_user."
+    );
+    expect([...claims]).toEqual([claimId("offer", 0)]);
+    // Both go on with the next message, which its id keeps to one job.
+    expect(mockQueueAdd.mock.calls.map(([, , opts]) => opts.jobId)).toEqual([
+      "offer_co1_offer_1",
+      "offer_co1_offer_1",
+    ]);
+  });
+
+  it.each([
+    {
+      label: "the last offer message with its button",
+      phase: "offer" as const,
+      stepNo: 2,
+      row: () => contactOffer(),
+      refuse: () => mockSendDirectMessageWithButton.mockRejectedValueOnce(limit()),
+      jobId: "offer_co1_offer_2_pause_1",
+    },
+    {
+      label: "a confirmation",
+      phase: "confirm" as const,
+      stepNo: 1,
+      row: () => interested(),
+      refuse: () => mockSendDirectMessage.mockRejectedValueOnce(limit()),
+      jobId: "offer_co1_confirm_1_pause_1",
+    },
+    {
+      label: "the card",
+      phase: "card" as const,
+      stepNo: undefined,
+      row: () => interested(),
+      refuse: () => mockSendDirectMessageWithCard.mockRejectedValueOnce(limit()),
+      jobId: "offer_co1_card_pause_1",
+    },
+    {
+      label: "the card's button fallback",
+      phase: "card" as const,
+      stepNo: undefined,
+      row: () => interested(),
+      refuse: () => {
+        mockSendDirectMessageWithCard.mockRejectedValueOnce(
+          new MetaApiError(100, undefined, undefined, "Invalid image_url")
+        );
+        mockSendDirectMessageWithLinkButton.mockRejectedValueOnce(limit());
+      },
+      jobId: "offer_co1_card_pause_1",
+    },
+    {
+      label: "the card's text fallback",
+      phase: "card" as const,
+      stepNo: undefined,
+      row: () => interested(),
+      refuse: () => {
+        mockSendDirectMessageWithCard.mockRejectedValueOnce(
+          new MetaApiError(100, undefined, undefined, "Invalid image_url")
+        );
+        mockSendDirectMessageWithLinkButton.mockRejectedValueOnce(
+          new MetaApiError(100, undefined, undefined, "Unsupported button template")
+        );
+        mockSendDirectMessage.mockRejectedValueOnce(limit());
+      },
+      jobId: "offer_co1_card_pause_1",
+    },
+    {
+      label: "the reminder",
+      phase: "reminder" as const,
+      stepNo: undefined,
+      row: () =>
+        contactOffer({ pitchSentAt: new Date(NOW - 22 * HOUR) }, {}, {
+          lastInteractionAt: new Date(NOW - 23 * HOUR),
+        }),
+      refuse: () => mockSendDirectMessageWithLinkButton.mockRejectedValueOnce(limit()),
+      jobId: "offer_co1_reminder_pause_1",
+    },
+    {
+      label: "the reminder's text fallback",
+      phase: "reminder" as const,
+      stepNo: undefined,
+      row: () =>
+        contactOffer({ pitchSentAt: new Date(NOW - 22 * HOUR) }, {}, {
+          lastInteractionAt: new Date(NOW - 23 * HOUR),
+        }),
+      refuse: () => {
+        mockSendDirectMessageWithLinkButton.mockRejectedValueOnce(
+          new MetaApiError(100, undefined, undefined, "Unsupported button template")
+        );
+        mockSendDirectMessage.mockRejectedValueOnce(limit());
+      },
+      jobId: "offer_co1_reminder_pause_1",
+    },
+  ])("waits with $label, as its own job", async ({ phase, stepNo, row, refuse, jobId }) => {
+    mockPrisma.contactOffer.findFirst.mockResolvedValue(row());
+    refuse();
+    const data = {
+      phase,
+      contactOfferId: "co1",
+      ...(stepNo === undefined ? {} : { step: stepNo }),
+    };
+
+    await expect(processOffer(offerJob(data))).resolves.toBeUndefined();
+
+    expect(stopWrites()).toEqual([]);
+    expect(pauseCopies()).toEqual([
+      [
+        "process-offer",
+        { ...JOB_BASE, ...data, pauseRequeue: 1 },
+        { jobId, delay: expect.any(Number), removeOnComplete: true },
+      ],
+    ]);
+    // Nothing was delivered: nothing is recorded as sent, nothing queued next.
+    expect(mockPrisma.contactOffer.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.contactTag.createMany).not.toHaveBeenCalled();
+    expect(mockQueueAdd).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops for the closed window when it closes before the pause ends", async () => {
+    // The window closes 35 minutes from now (5 of them margin), the block
+    // lasts an hour.
+    mockPrisma.contactOffer.findFirst.mockResolvedValue(
+      contactOffer({}, {}, { lastInteractionAt: new Date(NOW - 23 * HOUR - 20 * MINUTE) })
+    );
+    mockSendDirectMessage.mockRejectedValueOnce(limit(368));
+
+    await expect(step(0)).resolves.toBeUndefined();
+
+    expect(pauseCopies()).toEqual([]);
+    expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledWith(stopWrite("WINDOW_CLOSED"));
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+      event("INFO", "Offer stopped: messaging window closed", {
+        reason: "WINDOW_CLOSED",
+        phase: "offer",
+        step: 0,
+        pausedUntil: "2026-11-20T13:10:00.000Z",
+      })
+    );
+  });
+
+  it("still waits late in the window when its copy runs before it closes", async () => {
+    // 23 h 50 min after the last tap at the latest: inside the margin.
+    mockPrisma.contactOffer.findFirst.mockResolvedValue(
+      contactOffer({ pitchSentAt: new Date(NOW - 22 * HOUR) }, {}, {
+        lastInteractionAt: new Date(NOW - 23 * HOUR - 30 * MINUTE),
+      })
+    );
+    mockSendDirectMessageWithLinkButton.mockRejectedValueOnce(limit(4));
+
+    await processOffer(offerJob({ phase: "reminder", contactOfferId: "co1" }));
+
+    expect(stopWrites()).toEqual([]);
+    expect(pauseCopies()).toHaveLength(1);
+  });
+
+  it("stops with RATE_LIMITED after the twelfth wait", async () => {
+    mockSendDirectMessage.mockRejectedValueOnce(limit(4));
+
+    await expect(step(0, { pauseRequeue: 12 })).resolves.toBeUndefined();
+
+    expect(pauseCopies()).toEqual([]);
+    expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledWith(stopWrite("RATE_LIMITED"));
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+      event("WARNING", "Offer stopped: Instagram rate limit reached", {
+        reason: "RATE_LIMITED",
+        phase: "offer",
+        step: 0,
+        waits: 12,
+        error: expect.stringContaining("Application request limit reached"),
+      })
+    );
+    // The account still pauses: the next message waits.
+    await expect(fake().get(PAUSE_KEY)).resolves.toBe(String(NOW + 20 * MINUTE));
+  });
+
+  it("stops with RATE_LIMITED without calling Instagram when the thirteenth try still finds the pause", async () => {
+    await pauseFor(10);
+
+    await expect(step(0, { pauseRequeue: 12 })).resolves.toBeUndefined();
+
+    expect(sends()).toBe(0);
+    expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
+    expect(pauseCopies()).toEqual([]);
+    expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledWith(stopWrite("RATE_LIMITED"));
+  });
+
+  it("leaves Zernio's own limit to BullMQ's retries, pausing nothing", async () => {
+    mockSendDirectMessage.mockRejectedValueOnce(zernioLimit());
+
+    await expect(step(0)).rejects.toMatchObject({ name: "RateLimitError" });
+
+    await expect(fake().get(PAUSE_KEY)).resolves.toBeNull();
+    expect(pauseCopies()).toEqual([]);
+  });
+
+  it("sends as before when Redis cannot be read", async () => {
+    redis.current = {
+      get: async () => {
+        throw new Error("Connection is closed.");
+      },
+    };
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await step(0);
+
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+  });
+
+  describe("the sign-up confirmation", () => {
+    const signedUp = (contact: Partial<typeof CONTACT> = {}) =>
+      contactOffer(
+        {
+          pitchSentAt: new Date(NOW - 10 * MINUTE),
+          interestedAt: new Date(TAP_TIME),
+          sentAt: new Date(NOW - 50_000),
+          sentVia: "CARD",
+          signedUpAt: new Date(NOW - 1000),
+        },
+        { signupTrackingEnabled: true, signupMessage: "Danke fürs Eintragen!" },
+        contact
+      );
+    const confirm = (data: Partial<ProcessOfferJob> = {}) =>
+      processOffer(offerJob({ phase: "signup", contactOfferId: "co1", ...data }));
+
+    beforeEach(() => {
+      mockPrisma.contactOffer.findFirst.mockResolvedValue(signedUp());
+    });
+
+    it("waits for the pause and goes out after it", async () => {
+      mockSendDirectMessage.mockRejectedValueOnce(limit(4));
+
+      await expect(confirm()).resolves.toBeUndefined();
+
+      expect(pauseCopies()).toEqual([
+        [
+          "process-offer",
+          { ...JOB_BASE, phase: "signup", contactOfferId: "co1", pauseRequeue: 1 },
+          { jobId: "offer_co1_signup_pause_1", delay: expect.any(Number), removeOnComplete: true },
+        ],
+      ]);
+      expect(mockPrisma.contactOffer.updateMany).not.toHaveBeenCalled();
+
+      await runCopy(pauseCopies()[0]);
+      expect(mockSendDirectMessage).toHaveBeenCalledTimes(2);
+      expect(mockPrisma.contactOffer.updateMany).toHaveBeenCalledWith({
+        where: { id: "co1", signupMessageSentAt: null },
+        data: { signupMessageSentAt: expect.any(Date) },
+      });
+    });
+
+    it("reports a window that closes before the pause ends, and stops nothing", async () => {
+      mockPrisma.contactOffer.findFirst.mockResolvedValue(
+        signedUp({ lastInteractionAt: new Date(NOW - 23 * HOUR - 50 * MINUTE) })
+      );
+      mockSendDirectMessage.mockRejectedValueOnce(limit(4));
+
+      await confirm();
+
+      expect(pauseCopies()).toEqual([]);
+      expect(stopWrites()).toEqual([]);
+      expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+        event("INFO", "Sign-up confirmation not sent: messaging window closed", {
+          phase: "signup",
+          reason: "WINDOW_CLOSED",
+        })
+      );
+    });
+
+    it("reports the twelfth wait as a WARNING, and stops nothing", async () => {
+      await pauseFor(10);
+
+      await confirm({ pauseRequeue: 12 });
+
+      expect(sends()).toBe(0);
+      expect(stopWrites()).toEqual([]);
+      expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+        event("WARNING", "Sign-up confirmation not sent: Instagram rate limit reached", {
+          phase: "signup",
+          reason: "RATE_LIMITED",
+          waits: 12,
+        })
+      );
+    });
+  });
+
+  describe("the card for a later tap", () => {
+    const delivered = () =>
+      contactOffer({
+        pitchSentAt: new Date(NOW - 3 * HOUR),
+        interestedAt: new Date(NOW - 2 * HOUR),
+        interestedMid: "mid_yes",
+        sentAt: new Date(NOW - 2 * HOUR),
+        sentVia: "CARD",
+      }, {}, { lastInteractionAt: new Date(NOW - 2 * HOUR) });
+    const retapCopyId = `offer_co1_retap_${createHash("sha256")
+      .update("mid_later")
+      .digest("hex")}_pause_1`;
+
+    beforeEach(() => {
+      mockPrisma.contactOffer.findUnique.mockResolvedValue(delivered());
+      mockPrisma.contactOffer.updateMany.mockResolvedValue({ count: 0 });
+    });
+
+    it("waits as a copy of the tap and sends the card once after the pause", async () => {
+      mockSendDirectMessageWithCard.mockRejectedValueOnce(limit(4));
+
+      await expect(processOfferTap(tapJob({ mid: "mid_later" }))).resolves.toBeUndefined();
+
+      expect(pauseCopies()).toEqual([
+        [
+          "process-postback",
+          {
+            instagramAccountId: "ig_456",
+            accountConnectionId: "ig_account_row_1",
+            userId: "commenter_999",
+            payload: "offer:co1",
+            mid: "mid_later",
+            tappedAt: NOW,
+            tapId: "mid_later",
+            pauseRequeue: 1,
+          },
+          { jobId: retapCopyId, delay: expect.any(Number), removeOnComplete: true },
+        ],
+      ]);
+
+      await runCopy(pauseCopies()[0]);
+
+      expect(mockSendDirectMessageWithCard).toHaveBeenCalledTimes(2);
+      // The same claim as the tap's own try.
+      expect(mockPrisma.postbackDelivery.create.mock.calls).toEqual([
+        [{ data: { id: claimId("retap", "mid_later") } }],
+        [{ data: { id: claimId("retap", "mid_later") } }],
+      ]);
+      // The window still counts from the tap, not from the copy.
+      expect(mockPrisma.contact.updateMany).toHaveBeenLastCalledWith(
+        expect.objectContaining({ data: { lastInteractionAt: new Date(NOW) } })
+      );
+    });
+
+    it("counts the window from the tap, even when the row was read before it", async () => {
+      // The person's last interaction before this tap was 23 h 50 min ago:
+      // without the tap the window would be closed by the end of the pause.
+      mockPrisma.contactOffer.findUnique.mockResolvedValue({
+        ...delivered(),
+        contact: { ...CONTACT, lastInteractionAt: new Date(NOW - 23 * HOUR - 50 * MINUTE) },
+      });
+      mockSendDirectMessageWithCard.mockRejectedValueOnce(limit(4));
+
+      await processOfferTap(tapJob({ mid: "mid_later" }));
+
+      expect(pauseCopies()).toHaveLength(1);
+    });
   });
 });

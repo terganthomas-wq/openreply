@@ -195,4 +195,9 @@ export const offerJobId = {
   reminder: (contactOfferId: string) => `offer_${contactOfferId}_reminder`,
   // One per row: the landing page reports a sign-up once.
   signup: (contactOfferId: string) => `offer_${contactOfferId}_signup`,
+  // The card again for a later tap, keyed on a digest of the tap. It runs in
+  // the tap's own job; only its copy for the account's pause
+  // (`<id>_pause_<n>`, lib/queue/account-pause.ts) is queued under this id.
+  retap: (contactOfferId: string, tapDigest: string) =>
+    `offer_${contactOfferId}_retap_${tapDigest}`,
 };

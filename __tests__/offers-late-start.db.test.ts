@@ -45,7 +45,10 @@ vi.mock("@/lib/db/client", () => ({
 }));
 vi.mock("@/lib/queue/client", () => ({
   getDMQueue: () => ({ add: mockQueueAdd, remove: vi.fn() }),
+  // No account is paused for a Meta request limit.
+  getRedisConnection: () => ({ get: async () => null }),
   OFFER_JOB_NAME: "process-offer",
+  POSTBACK_JOB_NAME: "process-postback",
 }));
 // Closed: a Meta function the engine starts to use without a mock here fails
 // the suite instead of calling Instagram.

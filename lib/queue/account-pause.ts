@@ -17,9 +17,9 @@
  * - Whoever starts a pause records it in Diagnostics, once per pause, not
  *   once per job.
  *
- * The comment path uses these helpers (lib/queue/dm-worker.ts). They are
- * meant for every other messaging path as well: button taps, DM replies,
- * follow-ups and offer messages.
+ * Every messaging path uses these helpers: the comment's private reply, button
+ * taps, DM replies and follow-ups (lib/queue/dm-worker.ts) and the offer
+ * messages (lib/offers/worker.ts).
  */
 
 import { createHash } from "node:crypto";
@@ -28,10 +28,11 @@ import {
   isMetaThrottle,
   throttlePauseMs,
 } from "@/lib/instagram/delivery-errors";
+import type { RateLimitError } from "@/lib/meta/client";
 import { DEFAULT_THROTTLE_PAUSE_MINUTES } from "@/lib/meta/limits";
 import { META_PAUSE_EVENT } from "@/lib/ops/event-details";
 import { getDMQueue, getRedisConnection, type DmQueueJob } from "./client";
-import { formatError, logWorkerEvent } from "./send-helpers";
+import { ClaimReleaseError, formatError, logWorkerEvent } from "./send-helpers";
 
 /** A job waits this much at most after a pause ends, spread by its id. */
 export const PAUSE_JITTER_MS = 60_000;
@@ -198,6 +199,57 @@ export function pauseJitterMs(seed: string): number {
 /** When a job held back for a pause runs: the resume time plus its jitter. */
 export function pausedRunAt(resumeAt: number, jobId: string): number {
   return resumeAt + pauseJitterMs(jobId);
+}
+
+/** What a job that meets a pause shows while it waits: "… next try at 14:05 UTC". */
+export function pauseWaitMessage(runAt: number): string {
+  return `Instagram request limit; next try at ${formatPauseTime(runAt)}`;
+}
+
+export interface PauseWait {
+  /** Which wait this is for the job, counting it: 1 for its first. */
+  number: number;
+  /** The copy's id: `<the job's usual id>_pause_<number>`. */
+  jobId: string;
+  /** When the copy runs (epoch ms): pausedRunAt for its id. */
+  runAt: number;
+  /** The job waited MAX_PAUSE_REQUEUES times already: it gets no copy. */
+  capped: boolean;
+}
+
+/**
+ * The next wait of a job that was put back `pauseRequeue` times already, for
+ * a pause that ends at `resumeAt`. Its copy runs under `<baseJobId>_pause_<n>`
+ * (deterministic, so the same job held twice for one pause stays one job),
+ * unless the job is capped.
+ */
+export function nextPauseWait(
+  baseJobId: string,
+  pauseRequeue: number | undefined,
+  resumeAt: number
+): PauseWait {
+  const number = (pauseRequeue ?? 0) + 1;
+  const jobId = `${baseJobId}_pause_${number}`;
+  return {
+    number,
+    jobId,
+    runAt: pausedRunAt(resumeAt, jobId),
+    capped: number > MAX_PAUSE_REQUEUES,
+  };
+}
+
+/**
+ * The Meta request limit behind a failed send, or null: the error itself, or
+ * the refusal of a message whose claim could not be given back
+ * (ClaimReleaseError). The account pauses either way; only the first may be
+ * put back on the queue, as the second's claim is still taken.
+ */
+export function metaLimitOf(error: unknown): RateLimitError | null {
+  if (isMetaThrottle(error)) return error;
+  if (error instanceof ClaimReleaseError && isMetaThrottle(error.refusal)) {
+    return error.refusal;
+  }
+  return null;
 }
 
 /**

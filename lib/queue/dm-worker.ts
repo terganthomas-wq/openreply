@@ -15,8 +15,12 @@ import {
   checkAccountPause,
   formatPauseTime,
   MAX_PAUSE_REQUEUES,
+  metaLimitOf,
+  nextPauseWait,
+  PAUSE_JITTER_MS,
   pauseAccountForLimit,
   pausedRunAt,
+  pauseWaitMessage,
   requeueForPause,
 } from "./account-pause";
 import { afterLinkDelivered } from "./after-delivery";
@@ -24,13 +28,16 @@ import {
   claimPostbackDelivery,
   formatError,
   isTemplateRejection,
+  isUniqueViolation,
   logWorkerEvent,
   sendClaimedPostback,
   sendPostbackOnce,
 } from "./send-helpers";
+import type { Prisma } from "@/app/generated/prisma/client";
+import type { RateLimitError } from "@/lib/meta/client";
 import { isQuestionComment } from "@/lib/automation/question-filter";
 import { ensureContactSafe, type ContactSummary } from "@/lib/contacts/store";
-import { OFFER_PAYLOAD_PREFIX } from "@/lib/offers/schedule";
+import { OFFER_PAYLOAD_PREFIX, withinWindow } from "@/lib/offers/schedule";
 import { processOffer, processOfferTap } from "@/lib/offers/worker";
 import { createHash } from "node:crypto";
 import { UnrecoverableError, Worker, type Job } from "bullmq";
@@ -346,6 +353,108 @@ async function waitForAccountPause(
     data: { status: "FAILED", errorMessage: message },
   });
   throw new AccountPausedError(message, resumeAt);
+}
+
+function pauseWindowClosedMessage(resumeAt: number): string {
+  return `Instagram request limit: the messaging window closes before the account's pause ends (${formatPauseTime(resumeAt)}), so the DM was not sent`;
+}
+
+// The latest of some times (epoch ms), any of which may be missing.
+function latestTime(
+  ...times: (Date | number | null | undefined)[]
+): number | null {
+  let latest: number | null = null;
+  for (const time of times) {
+    if (time === null || time === undefined) continue;
+    const ms = typeof time === "number" ? time : time.getTime();
+    if (latest === null || ms > latest) latest = ms;
+  }
+  return latest;
+}
+
+// What became of a tap, a DM reply or a follow-up that met its account's
+// pause (holdConversation).
+type ConversationHold = "held" | "window-closed" | "capped";
+
+/**
+ * Put a conversation job (a button tap, the reply to a DM, a follow-up) back
+ * for the end of its account's pause: a copy of it runs then, as
+ * `<baseJobId>_pause_<n>` (requeueForPause). Nothing was sent: the pause was
+ * found before Instagram was called, or Instagram refused with a request
+ * limit, which gave the message's claim back as any refusal does.
+ *
+ * The copy is queued only while it can still be sent. Instagram lets the
+ * account message the person for 24 hours after their last tap or DM
+ * (`windowFrom`). When that window is closed by the time the copy would run,
+ * within withinWindow's margin, nothing is queued ("window-closed"), and
+ * after MAX_PAUSE_REQUEUES waits neither ("capped"). The caller handles
+ * these as it handles a closed window and a refused send.
+ *
+ * `beforeQueue` gets what the job shows meanwhile ("Instagram request limit;
+ * next try at …") and runs before the copy is queued, so what the caller
+ * records can never land after the copy's own outcome.
+ */
+async function holdConversation({
+  name,
+  data,
+  baseJobId,
+  instagramAccountId,
+  resumeAt,
+  windowFrom,
+  beforeQueue,
+}: {
+  name: string;
+  data: DmQueueJob;
+  /** The job's usual id, without ":" (BullMQ forbids it in custom ids). */
+  baseJobId: string;
+  instagramAccountId: string;
+  resumeAt: number;
+  windowFrom: number | null;
+  beforeQueue?: (reason: string) => Promise<unknown>;
+}): Promise<ConversationHold> {
+  const wait = nextPauseWait(baseJobId, data.pauseRequeue, resumeAt);
+  if (!withinWindow(windowFrom, wait.runAt)) return "window-closed";
+  if (wait.capped) return "capped";
+  const reason = pauseWaitMessage(wait.runAt);
+  await beforeQueue?.(reason);
+  await requeueForPause({
+    name,
+    data: { ...data, pauseRequeue: wait.number },
+    jobId: wait.jobId,
+    instagramAccountId,
+    resumeAt,
+  });
+  console.log(`[DM Worker] ${baseJobId}: ${reason} (wait ${wait.number})`);
+  return "held";
+}
+
+/**
+ * Show on its DmLog row that a message waits for the account's pause:
+ * PENDING with the time of the next try. A row that says the message went
+ * out keeps saying so: another job sent it meanwhile, or, on a tap's row, an
+ * earlier tap did, which the read fallback must still see.
+ */
+async function markDmLogWaiting(
+  row: Prisma.DmLogUncheckedCreateInput,
+  reason: string
+): Promise<void> {
+  const { count } = await prisma.dmLog.updateMany({
+    where: {
+      automationId: row.automationId,
+      commentId: row.commentId,
+      status: { not: "SENT" },
+    },
+    data: { status: "PENDING", errorMessage: reason },
+  });
+  if (count > 0) return;
+  try {
+    await prisma.dmLog.create({
+      data: { ...row, status: "PENDING", errorMessage: reason },
+    });
+  } catch (error) {
+    // The row is there after all and says the message went out: leave it.
+    if (!isUniqueViolation(error)) throw error;
+  }
 }
 
 async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
@@ -1010,22 +1119,34 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
 // looked at, so the chat does not sit silent while Instagram catches up with
 // the follow. Opt-in through FOLLOW_RECHECK_ACK_MESSAGE, and best-effort: it
 // never holds up the re-check, which is already queued when this runs.
+//
+// While the account is paused for a Meta request limit it is skipped, not
+// held back: the re-check waits for the pause, and an acknowledgement that
+// came after the pause would only arrive next to the link or the prompt.
+// A limit on the acknowledgement itself pauses the account, so the re-check
+// that follows waits as well.
 async function sendFollowRecheckAck({
   context,
   instagramAccountId,
   automationId,
   userId,
   operationId,
+  workspaceId,
+  account,
 }: {
   context: InstagramContext;
   instagramAccountId: string;
   automationId: string;
   userId: string;
   operationId: string | null;
+  workspaceId: string;
+  /** The account's username, for the pause's event. */
+  account: string | null;
 }): Promise<void> {
   const message = process.env.FOLLOW_RECHECK_ACK_MESSAGE?.trim();
   if (!message) return;
   try {
+    if ((await checkAccountPause(instagramAccountId)) !== null) return;
     // One acknowledgement per re-check cycle: a burst of taps collapses into a
     // single re-check (bucketed job id) and should get a single reply too.
     const first = await getRedisConnection().set(
@@ -1047,11 +1168,125 @@ async function sendFollowRecheckAck({
       await send();
     }
   } catch (error) {
+    const limit = metaLimitOf(error);
+    if (limit) {
+      await pauseAccountForLimit({
+        instagramAccountId,
+        workspaceId,
+        account,
+        error: limit,
+      });
+    }
     console.log(
       "[DM Worker] Failed to send follow re-check acknowledgement:",
       formatError(error),
     );
   }
+}
+
+/**
+ * A button tap meets its account's pause, before anything was sent: the pause
+ * was found, or Instagram refused the follow check, the follow prompt or the
+ * link with a request limit (sendClaimedPostback gave the claim back, as for
+ * any refusal). The tap waits for the end of the pause, as
+ * postback_<claim>_pause_<n>, carrying the tap's time and id: the copy takes
+ * the same claim, so it can never deliver this tap twice, and it starts the
+ * same offer. `step` is what the tap was about to send or ask: only a link
+ * that waits shows on the tap's DmLog row (PENDING with the next try); the
+ * row is the link's, a follow request has none.
+ *
+ * A read fallback waits one minute longer than the taps and DM replies held
+ * for the same pause. Whichever of those brings this person the link, the
+ * fallback then finds it and sends nothing.
+ *
+ * A closed window ends the tap here (a link is logged FAILED, nothing else
+ * is logged as sent); "capped" is left to the caller, which fails the tap
+ * as a refused send.
+ */
+async function holdTapForPause({
+  job,
+  automation,
+  contact,
+  commenterName,
+  tapId,
+  operationId,
+  resumeAt,
+  step,
+}: {
+  job: Job<ProcessPostbackJob>;
+  automation: { id: string; workspaceId: string; instagramAccountId: string };
+  contact: ContactSummary | null;
+  commenterName: string | null;
+  tapId: string;
+  operationId: string;
+  resumeAt: number;
+  step: "check" | "prompt" | "link";
+}): Promise<ConversationHold> {
+  const { userId } = job.data;
+  const fallback = Boolean(job.data.fallback);
+  const dedupeId = `reveal:${userId}`;
+  const outcome = await holdConversation({
+    name: POSTBACK_JOB_NAME,
+    data: {
+      ...job.data,
+      ...(fallback ? {} : { tappedAt: tapTime(job) }),
+      tapId,
+    },
+    baseJobId: `postback_${operationId}`,
+    instagramAccountId: job.data.instagramAccountId,
+    resumeAt: fallback ? resumeAt + PAUSE_JITTER_MS : resumeAt,
+    // A read fallback opens no window: only one the person opened counts.
+    windowFrom: latestTime(
+      contact?.lastInteractionAt,
+      fallback ? null : tapTime(job)
+    ),
+    beforeQueue:
+      step === "link" && !fallback
+        ? (reason) =>
+            markDmLogWaiting(
+              {
+                workspaceId: automation.workspaceId,
+                automationId: automation.id,
+                instagramAccountId: automation.instagramAccountId,
+                commenterId: userId,
+                commenterName,
+                commentText: "(button tap)",
+                commentId: dedupeId,
+              },
+              reason
+            )
+        : undefined,
+  });
+  if (outcome !== "window-closed") return outcome;
+
+  if (fallback || step !== "link") {
+    console.log(
+      `[DM Worker] ${fallback ? "Read fallback" : "Tap"} not answered: the messaging window closes before the account's pause ends (${formatPauseTime(resumeAt)})`,
+      job.id
+    );
+    return outcome;
+  }
+  await prisma.dmLog.upsert({
+    where: {
+      automationId_commentId: { automationId: automation.id, commentId: dedupeId },
+    },
+    create: {
+      workspaceId: automation.workspaceId,
+      automationId: automation.id,
+      instagramAccountId: automation.instagramAccountId,
+      commenterId: userId,
+      commenterName,
+      commentText: "(button tap)",
+      commentId: dedupeId,
+      status: "FAILED",
+      errorMessage: pauseWindowClosedMessage(resumeAt),
+    },
+    update: {
+      status: "FAILED",
+      errorMessage: pauseWindowClosedMessage(resumeAt),
+    },
+  });
+  return outcome;
 }
 
 /**
@@ -1113,8 +1348,11 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
         },
       },
     });
+    // PENDING: a tap's link waits for the account's pause (only
+    // holdTapForPause writes it on this row) and goes out after it.
     if (
       existingReveal?.status === "SENT" ||
+      existingReveal?.status === "PENDING" ||
       existingReveal?.dmDeliveryUnconfirmed
     )
       return;
@@ -1122,15 +1360,19 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     // The person may have answered the opening DM by typing the keyword
     // instead of tapping. With the DM trigger on, this campaign answered
     // that DM itself, logged as "dm:<mid>": with the link, or with a follow
-    // prompt whose button brings it. Either way the conversation holds the
-    // campaign's next step already, and a fallback would send the link a
-    // second time.
+    // prompt whose button brings it, or the answer waits for the account's
+    // pause (PENDING). Either way the conversation holds the campaign's next
+    // step already, and a fallback would send the link a second time.
     const answeredByDm = await prisma.dmLog.findFirst({
       where: {
         automationId: automation.id,
         commenterId: userId,
         commentId: { startsWith: "dm:" },
-        OR: [{ status: "SENT" }, { dmDeliveryUnconfirmed: true }],
+        OR: [
+          { status: "SENT" },
+          { status: "PENDING" },
+          { dmDeliveryUnconfirmed: true },
+        ],
       },
       select: { id: true },
     });
@@ -1147,29 +1389,10 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     return;
   }
 
-  // Personalize {username}. The postback carries only the tapper's IGSID.
-  const commenterName = await resolveRecipientName({
-    context: accessToken,
-    workspaceId: automation.workspaceId,
-    recipientId: userId,
-    instagramAccountRowId: automation.instagramAccountId,
-  });
-
-  // The tapper becomes, or stays, a contact. A tap opens Instagram's 24-hour
-  // messaging window, so it stamps the tap's time. A read fallback is no
-  // interaction, and a re-check repeats a tap that was stamped already.
-  const realTap = !fallback && !job.data.followRecheck;
-  const contact = await ensureContactSafe({
-    workspaceId: automation.workspaceId,
-    instagramAccountId: automation.instagramAccountId,
-    igsid: userId,
-    username: commenterName,
-    interactionAt: realTap ? new Date(job.timestamp ?? Date.now()) : null,
-  });
-
   // This tap, by Instagram's message id. A follow re-check carries the mid
-  // of the tap it repeats, and a redelivered webhook the same mid again.
-  const tapId = job.data.mid ?? job.id ?? payload;
+  // of the tap it repeats, a redelivered webhook the same mid again, and a
+  // copy queued for the account's pause the id of the tap it copies.
+  const tapId = job.data.tapId ?? job.data.mid ?? job.id ?? payload;
   const operationId = createHash("sha256")
     .update(JSON.stringify([
       automation.instagramAccountId,
@@ -1178,6 +1401,110 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
       tapId,
     ]))
     .digest("hex");
+
+  // The tapper becomes, or stays, a contact. A tap opens Instagram's 24-hour
+  // messaging window, so it stamps the tap's time. A read fallback is no
+  // interaction, and a re-check repeats a tap that was stamped already. A
+  // copy queued for the account's pause stamps the time of its tap again,
+  // which moves nothing.
+  const realTap = !fallback && !job.data.followRecheck;
+  const interactionAt = realTap ? new Date(tapTime(job)) : null;
+  // Whether the follow gate below asks Instagram before the link.
+  const checksFollow =
+    automation.requireFollow && !retryTap && (isFollowCheck || Boolean(fallback));
+  const pauseScope = {
+    job,
+    automation,
+    tapId,
+    operationId,
+  };
+
+  // Meta refuses this account's calls for a request limit (the account is
+  // paused): nothing is looked up, checked, reserved, claimed or sent. The
+  // tap is recorded on the contact, which is where the window is read from,
+  // and waits for the end of the pause.
+  const pausedUntil = await checkAccountPause(instagramAccountId);
+  if (pausedUntil !== null) {
+    const waiting = await ensureContactSafe({
+      workspaceId: automation.workspaceId,
+      instagramAccountId: automation.instagramAccountId,
+      igsid: userId,
+      interactionAt,
+    });
+    const outcome = await holdTapForPause({
+      ...pauseScope,
+      contact: waiting,
+      commenterName: waiting?.username ?? null,
+      resumeAt: pausedUntil,
+      step: checksFollow ? "check" : "link",
+    });
+    if (outcome !== "capped") return;
+    // It waited MAX_PAUSE_REQUEUES times: it fails like a refused send, and
+    // BullMQ's retries send nothing while the pause lasts.
+    const message = pauseGaveUpMessage(pausedUntil);
+    if (fallback) {
+      console.log("[DM Worker] Read fallback not delivered:", message);
+      return;
+    }
+    if (!checksFollow) {
+      await prisma.dmLog.upsert({
+        where: {
+          automationId_commentId: {
+            automationId: automation.id,
+            commentId: dedupeId,
+          },
+        },
+        create: {
+          workspaceId: automation.workspaceId,
+          automationId: automation.id,
+          instagramAccountId: automation.instagramAccountId,
+          commenterId: userId,
+          commenterName: waiting?.username ?? null,
+          commentText: "(button tap)",
+          commentId: dedupeId,
+          status: "FAILED",
+          errorMessage: message,
+        },
+        update: { status: "FAILED", errorMessage: message },
+      });
+    }
+    throw new AccountPausedError(message, pausedUntil);
+  }
+
+  // Personalize {username}. The postback carries only the tapper's IGSID.
+  const commenterName = await resolveRecipientName({
+    context: accessToken,
+    workspaceId: automation.workspaceId,
+    recipientId: userId,
+    instagramAccountRowId: automation.instagramAccountId,
+  });
+
+  const contact = await ensureContactSafe({
+    workspaceId: automation.workspaceId,
+    instagramAccountId: automation.instagramAccountId,
+    igsid: userId,
+    username: commenterName,
+    interactionAt,
+  });
+  // A request limit on this tap's follow check or follow prompt.
+  const pauseForLimit = async (
+    error: RateLimitError,
+    step: "check" | "prompt"
+  ): Promise<ConversationHold> => {
+    const pause = await pauseAccountForLimit({
+      instagramAccountId,
+      workspaceId: automation.workspaceId,
+      account: automation.instagramAccount.username,
+      error,
+    });
+    return holdTapForPause({
+      ...pauseScope,
+      contact,
+      commenterName,
+      resumeAt: pause.resumeAt,
+      step,
+    });
+  };
 
   // Follow-gate: before revealing the link, verify the user follows. On a
   // `followcheck:` tap a non-follower gets the prompt again (no quota spent);
@@ -1200,10 +1527,27 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
       },
     });
   } else if ((isFollowCheck || fallback) && automation.requireFollow) {
-    const follows = await getUserFollowStatus({
-      context: accessToken,
-      recipientId: userId,
-    });
+    let follows: boolean | null;
+    try {
+      // A request limit is thrown rather than read as unknown: a tap would
+      // then get the link without a check, a read fallback nothing at all.
+      follows = await getUserFollowStatus({
+        context: accessToken,
+        recipientId: userId,
+        throwOnLimit: true,
+      });
+    } catch (error) {
+      if (!isMetaThrottle(error)) throw error;
+      if ((await pauseForLimit(error, "check")) !== "capped") return;
+      if (fallback) {
+        console.log(
+          "[DM Worker] Read fallback not delivered:",
+          formatError(error),
+        );
+        return;
+      }
+      throw error;
+    }
     // A read fallback needs a confirmed follow. Instagram only reports follow
     // status once the person has tapped a button (before that it answers
     // "User consent is required", i.e. null), so failing open here handed the
@@ -1256,6 +1600,8 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
               automationId: automation.id,
               userId,
               operationId,
+              workspaceId: automation.workspaceId,
+              account: automation.instagramAccount.username,
             });
           }
           return;
@@ -1314,11 +1660,53 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
             }),
         });
       } catch (error) {
+        // A request limit: the account pauses, and the prompt goes out
+        // after the pause (its claim is back, as for any refusal). A refused
+        // prompt whose claim could not be given back is not tried again.
+        const limit = metaLimitOf(error);
+        if (isMetaThrottle(error)) {
+          if ((await pauseForLimit(error, "prompt")) !== "capped") return;
+        } else if (limit) {
+          await pauseAccountForLimit({
+            instagramAccountId,
+            workspaceId: automation.workspaceId,
+            account: automation.instagramAccount.username,
+            error: limit,
+          });
+        }
         console.log(
           "[DM Worker] Failed to re-send follow prompt:",
           formatError(error),
         );
       }
+      return;
+    }
+  }
+
+  // A copy queued for the account's pause runs after the pause, and the link
+  // may have reached the person meanwhile: from a read fallback that ran
+  // once the pause was over, or from another of their taps that waited with
+  // this one. A tap answered that way is not answered once more. (Every
+  // other tap re-sends the link, as always.)
+  if (!fallback && job.data.pauseRequeue) {
+    const reveal = await prisma.dmLog.findUnique({
+      where: {
+        automationId_commentId: {
+          automationId: automation.id,
+          commentId: dedupeId,
+        },
+      },
+      select: { status: true, dmSentAt: true },
+    });
+    if (
+      reveal?.status === "SENT" &&
+      reveal.dmSentAt &&
+      reveal.dmSentAt.getTime() >= tapTime(job)
+    ) {
+      console.log(
+        "[DM Worker] Tap already answered while it waited for the pause:",
+        job.id,
+      );
       return;
     }
   }
@@ -1412,6 +1800,35 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
       usage.periodStart,
     );
 
+    // A request limit proves nothing was sent, and the account's next calls
+    // would be refused as well. The account pauses, and the tap waits for
+    // the end of the pause: sendClaimedPostback gave its claim back, and the
+    // reservation went back above, as for any refusal. It is not retried by
+    // BullMQ, whose retries would only run into the limit again. A refusal
+    // whose claim could not be given back only pauses the account: a copy
+    // would find the claim and send nothing.
+    let errorMessage = formatError(error);
+    const limit = metaLimitOf(originalError);
+    if (limit) {
+      const pause = await pauseAccountForLimit({
+        instagramAccountId,
+        workspaceId: automation.workspaceId,
+        account: automation.instagramAccount.username,
+        error: limit,
+      });
+      if (isMetaThrottle(error)) {
+        const outcome = await holdTapForPause({
+          ...pauseScope,
+          contact,
+          commenterName,
+          resumeAt: pause.resumeAt,
+          step: "link",
+        });
+        if (outcome !== "capped") return;
+        errorMessage = `${pauseGaveUpMessage(pause.resumeAt)}. ${errorMessage}`;
+      }
+    }
+
     // The read fallback is speculative: it only runs when the user read the
     // opening DM and never tapped the button, which means they never messaged
     // us, which means the 24-hour window is closed and Meta rejects the send
@@ -1422,7 +1839,7 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     if (fallback && !isDeliveryUnconfirmed(error)) {
       console.log(
         "[DM Worker] Read fallback not delivered (messaging window closed):",
-        formatError(error),
+        errorMessage,
       );
       return;
     }
@@ -1443,12 +1860,12 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
         commentText: "(button tap)",
         commentId: dedupeId,
         status: "FAILED",
-        errorMessage: formatError(error),
+        errorMessage,
         dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
       },
       update: {
         status: "FAILED",
-        errorMessage: formatError(error),
+        errorMessage,
         dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
       },
     });
@@ -1502,6 +1919,13 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
     return;
   }
 
+  // Meta refuses this account's calls for a request limit (the account is
+  // paused): the follow-up waits for the end of the pause instead.
+  const pausedUntil = await checkAccountPause(instagramAccountId);
+  if (pausedUntil !== null) {
+    return holdFollowUpForPause(job, automation, pausedUntil);
+  }
+
   try {
     await sendDirectMessage({
       context: accessToken,
@@ -1513,11 +1937,143 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
       }),
     });
   } catch (error) {
+    // A request limit: nothing was sent. The account pauses, and the
+    // follow-up goes out after the pause.
+    if (isMetaThrottle(error)) {
+      const pause = await pauseAccountForLimit({
+        instagramAccountId,
+        workspaceId: automation.workspaceId,
+        account: automation.instagramAccount.username,
+        error,
+      });
+      return holdFollowUpForPause(job, automation, pause.resumeAt);
+    }
     console.log(
       "[DM Worker] Failed to send follow-up message:",
       formatError(error)
     );
   }
+}
+
+/**
+ * The follow-up meets its account's pause, before anything was sent: it goes
+ * out after the pause, as followup_<campaign>_<person>_pause_<n>, while
+ * Instagram's window from the person's last tap or DM (their contact) is
+ * still open then. Best effort, like the follow-up itself: what keeps it
+ * from waiting is logged, and this job never fails. The follow-up has no
+ * claim, so a BullMQ retry next to a copy that was queued after all could
+ * send it twice.
+ */
+async function holdFollowUpForPause(
+  job: Job<ProcessFollowUpJob>,
+  automation: { id: string; workspaceId: string; instagramAccountId: string },
+  resumeAt: number
+): Promise<void> {
+  try {
+    const contact = await prisma.contact.findUnique({
+      where: {
+        instagramAccountId_igsid: {
+          instagramAccountId: automation.instagramAccountId,
+          igsid: job.data.userId,
+        },
+        workspaceId: automation.workspaceId,
+      },
+      select: { lastInteractionAt: true },
+    });
+    const outcome = await holdConversation({
+      name: FOLLOWUP_JOB_NAME,
+      data: job.data,
+      baseJobId: `followup_${automation.id}_${job.data.userId}`,
+      instagramAccountId: job.data.instagramAccountId,
+      resumeAt,
+      windowFrom: latestTime(contact?.lastInteractionAt),
+    });
+    if (outcome === "window-closed") {
+      console.log(
+        `[DM Worker] Follow-up not sent: the messaging window closes before the account's pause ends (${formatPauseTime(resumeAt)})`,
+        job.id
+      );
+    } else if (outcome === "capped") {
+      console.log(
+        "[DM Worker] Follow-up not sent:",
+        pauseGaveUpMessage(resumeAt),
+        job.id
+      );
+    }
+  } catch (error) {
+    console.error(
+      "[DM Worker] Follow-up not put back for the account's pause:",
+      formatError(error)
+    );
+  }
+}
+
+// When the DM behind a message job arrived (epoch ms): a copy queued for the
+// account's pause carries it, the webhook's own job was queued on arrival.
+function messageTime(job: Job<ProcessMessageJob>): number {
+  return job.data.receivedAt ?? job.timestamp ?? Date.now();
+}
+
+/**
+ * The reply to a DM meets its account's pause, before anything was sent: the
+ * pause was found, or Instagram refused the follow check or the reply with a
+ * request limit (sendClaimedPostback gave the reply's claim back, as for any
+ * refusal). The whole DM waits for the end of the pause, as
+ * message_<account>_<mid>_pause_<n> (the webhook job's id plus the wait): the
+ * copy answers it for every campaign again, and each reply's claim and DmLog
+ * row keep one that went out from going out twice. Meanwhile this campaign's
+ * row shows PENDING with the next try.
+ *
+ * A closed window and "capped" log the reply FAILED: the caller moves on to
+ * the next campaign after the first and fails the job after the second, as
+ * after a refused send.
+ */
+async function holdMessageForPause({
+  job,
+  contact,
+  row,
+  resumeAt,
+  error,
+}: {
+  job: Job<ProcessMessageJob>;
+  contact: ContactSummary | null;
+  /** The reply's DmLog row as this job would create it. */
+  row: Prisma.DmLogUncheckedCreateInput;
+  resumeAt: number;
+  /** What Instagram answered, if it was asked. */
+  error?: unknown;
+}): Promise<ConversationHold> {
+  const { instagramAccountId, messageId } = job.data;
+  const outcome = await holdConversation({
+    name: MESSAGE_JOB_NAME,
+    data: { ...job.data, receivedAt: messageTime(job) },
+    baseJobId: `message_${instagramAccountId}_${Buffer.from(messageId).toString("base64url")}`,
+    instagramAccountId,
+    resumeAt,
+    windowFrom: latestTime(contact?.lastInteractionAt, messageTime(job)),
+    beforeQueue: (reason) => markDmLogWaiting(row, reason),
+  });
+  if (outcome === "held") return outcome;
+
+  const gaveUp = pauseGaveUpMessage(resumeAt);
+  const errorMessage =
+    outcome === "window-closed"
+      ? pauseWindowClosedMessage(resumeAt)
+      : error
+        ? `${gaveUp}. ${formatError(error)}`
+        : gaveUp;
+  const attempts = outcome === "capped" ? { attempts: job.attemptsMade + 1 } : {};
+  await prisma.dmLog.upsert({
+    where: {
+      automationId_commentId: {
+        automationId: row.automationId,
+        commentId: row.commentId,
+      },
+    },
+    create: { ...row, status: "FAILED", errorMessage, ...attempts },
+    update: { status: "FAILED", errorMessage, ...attempts },
+  });
+  return outcome;
 }
 
 /**
@@ -1647,6 +2203,23 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
       continue;
     }
 
+    // Meta refuses this account's calls for a request limit (the account is
+    // paused): nothing is looked up, checked, reserved, claimed or sent. The
+    // DM waits for the end of the pause, and its copy answers it for this
+    // campaign and the ones after it.
+    const pausedUntil = await checkAccountPause(instagramAccountId);
+    if (pausedUntil !== null) {
+      const outcome = await holdMessageForPause({
+        job,
+        contact,
+        row: { ...logBase, commenterName: contactName },
+        resumeAt: pausedUntil,
+      });
+      if (outcome === "held") return;
+      if (outcome === "window-closed") continue;
+      throw new AccountPausedError(pauseGaveUpMessage(pausedUntil), pausedUntil);
+    }
+
     // Personalize {username}. The messages webhook carries only the sender's
     // IGSID, so the handle is recovered from an earlier send or read live.
     const commenterName = await resolveRecipientName({
@@ -1682,10 +2255,34 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
     // anyone whose status the API happens not to resolve.
     let sendFollowPrompt = false;
     if (automation.requireFollow) {
-      const follows = await getUserFollowStatus({
-        context: accessToken,
-        recipientId: senderId,
-      });
+      let follows: boolean | null;
+      try {
+        // A request limit is thrown rather than read as unknown, which would
+        // send the follow prompt to someone who may well follow.
+        follows = await getUserFollowStatus({
+          context: accessToken,
+          recipientId: senderId,
+          throwOnLimit: true,
+        });
+      } catch (error) {
+        if (!isMetaThrottle(error)) throw error;
+        const pause = await pauseAccountForLimit({
+          instagramAccountId,
+          workspaceId: automation.workspaceId,
+          account: automation.instagramAccount.username,
+          error,
+        });
+        const outcome = await holdMessageForPause({
+          job,
+          contact,
+          row: { ...logBase, commenterName },
+          resumeAt: pause.resumeAt,
+          error,
+        });
+        if (outcome === "held") return;
+        if (outcome === "window-closed") continue;
+        throw error;
+      }
       sendFollowPrompt =
         accessToken.provider === "ZERNIO"
           ? follows === false
@@ -1814,6 +2411,31 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
           usage.periodStart
         );
       }
+      // A request limit proves nothing was sent: the account pauses, and the
+      // DM waits for the end of the pause, its claim and reservation back as
+      // for any refusal. A refusal whose claim could not be given back only
+      // pauses the account: a copy would find the claim and send nothing.
+      const limit = metaLimitOf(originalError);
+      if (limit) {
+        const pause = await pauseAccountForLimit({
+          instagramAccountId,
+          workspaceId: automation.workspaceId,
+          account: automation.instagramAccount.username,
+          error: limit,
+        });
+        if (isMetaThrottle(error)) {
+          const outcome = await holdMessageForPause({
+            job,
+            contact,
+            row: { ...logBase, commenterName },
+            resumeAt: pause.resumeAt,
+            error,
+          });
+          if (outcome === "held") return;
+          if (outcome === "window-closed") continue;
+          throw error;
+        }
+      }
       await prisma.dmLog.upsert({
         where: {
           automationId_commentId: {
@@ -1848,7 +2470,7 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
         commenterName,
         contactId: contact?.id ?? null,
         via: "dm",
-        interactionAt: job.timestamp ?? Date.now(),
+        interactionAt: messageTime(job),
         triggerId: messageId,
       });
     }
@@ -1885,7 +2507,7 @@ async function recordMessageSender(
       workspaceId: account.workspaceId,
       instagramAccountId: account.id,
       igsid: senderId,
-      interactionAt: new Date(job.timestamp ?? Date.now()),
+      interactionAt: new Date(messageTime(job)),
     });
   } catch (error) {
     console.error(

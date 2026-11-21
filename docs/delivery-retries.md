@@ -113,10 +113,60 @@ a limit instead of reading it as "not following":
   Meta refuses with a limit ends the whole sweep there, recorded once; the
   next sweep runs as scheduled.
 
-Button taps, DM keyword replies, follow-ups and offer messages do not check
-the pause yet; for them a rate limit is still retried after 5 and 15 minutes
-as described above and below. The internal hourly limiter for private
-replies (750 per hour and account) works as before.
+Every message after a tap or a DM waits for the pause the same way: button
+taps (the follow check, the follow prompt and the second follow request, the
+link), the replies to DM keywords, the follow-up, and every offer message
+(below). Instagram lets the account message a person only for 24 hours after
+their last tap or DM, so these wait only while that window is still open
+when the copy would run, with the same five-minute margin as every offer
+message:
+
+- A pause found before the message, or a message (or a follow check, asked
+  with `throwOnLimit`) that Meta refuses with a limit: the claim and the
+  monthly reservation go back as for any refusal (`sendClaimedPostback`
+  releases the claim of a confirmed rejection), the account pauses, and a
+  copy of the job runs after the pause under a deterministic id: a tap as
+  `postback_<claim>_pause_<n>`, a DM as `message_<account>_<mid>_pause_<n>`
+  (the webhook job's id plus the wait), a follow-up as
+  `followup_<campaign>_<person>_pause_<n>`. The job ends without an error,
+  so BullMQ's own retries do not run into the limit again.
+- The copy carries what the job it copies knew: a tap its time and its id
+  (`tappedAt`, `tapId`), a DM the time it arrived (`receivedAt`). It takes
+  the same claim, stamps the contact with the tap's or the DM's own time and
+  starts the same offer, so a copy can never count as a new tap or DM. A
+  copy, a redelivered webhook and a BullMQ retry racing for the same tap or
+  DM send it once (DB test `conversation-pause.db.test.ts`).
+- Meanwhile the tap's link and the DM's reply show PENDING with
+  "Instagram request limit; next try at HH:MM UTC" on their DmLog row; a row
+  that says the message went out is never set back. A follow check or a
+  follow prompt that waits writes nothing: the tap's row is the link's.
+- A read fallback waits one minute longer than the taps and DM replies held
+  for the same pause, and it now also stands back while a tap's link or the
+  campaign's answer to the person's DM waits (PENDING), so the fallback does
+  not deliver the link next to them. A tap's copy, in turn, sends nothing
+  when the link reached the person after the tap (a read fallback that ran
+  once the pause was over, or another of their taps that waited with it).
+  Every other tap re-sends the link, as before.
+- When the window is closed by the time the copy would run, nothing is
+  queued: the tap's link and the DM's reply are logged FAILED ("Instagram
+  request limit: the messaging window closes before the account's pause ends
+  …") without a retry, a follow prompt, a read fallback and a follow-up are
+  only logged to the console, as their failures always were.
+- After 12 copies the message fails as a refused send: the link or the reply
+  is logged FAILED with "the account was still paused after 12 waits …" and
+  the job is thrown back to BullMQ, as is a tap whose follow check still
+  meets the limit; a follow prompt, a read fallback and a follow-up are only
+  logged.
+- The follow-up has no claim, so its job never fails while it waits: a copy
+  that could not be queued is logged, never retried next to one that was.
+- The follow re-check acknowledgement is best effort: while the account is
+  paused it is skipped, not held, and a limit on it only pauses the account,
+  so the re-check after it waits.
+- A refused message whose claim the database fails to give back only pauses
+  the account: a copy would find the claim and send nothing.
+
+The internal hourly limiter for private replies (750 per hour and account)
+works as before.
 
 Every Meta response also says how much of the app's limit and of the
 account's business use case limit the last hour used (`x-app-usage`,
@@ -160,9 +210,22 @@ completes, and follows one policy:
   again, the reservation goes back and the sequence goes on.
 - An unknown outcome is recorded as a WARNING and never sent again; the claim
   and the reservation stay and the sequence goes on.
-- A rate limit releases the claim and the reservation and is retried by BullMQ
-  after 5 and 15 minutes, still inside the window. On the last attempt the
-  offer stops (RATE_LIMITED, WARNING).
+- While Meta refuses the account's calls for a request limit (the account
+  pause above), nothing is reserved, claimed or sent: the message's job runs
+  again after the pause as `<its id>_pause_<n>` (for example
+  `offer_<row>_card_pause_1`). A message Meta refuses with a limit releases
+  the claim and the reservation, pauses the account and waits the same way;
+  the card's fallbacks included, since the whole chain runs in one claim. A
+  later tap's card waits as a copy of the tap (`offer_<row>_retap_<tap
+  digest>_pause_<n>`), with the tap's time and id. The copy sends the same
+  message under the same claim, so a copy and a retry of the same step send
+  it once, and the sequence goes on from there. It waits only while the
+  window, from the person's last tap or DM, is still open when the copy
+  would run; otherwise the offer stops for the closed window (WINDOW_CLOSED,
+  INFO). After 12 waits it stops with RATE_LIMITED (WARNING), the one stop a
+  Meta request limit still causes. Zernio's own limit (HTTP 429) is retried
+  by BullMQ after 5 and 15 minutes as before and stops the offer with
+  RATE_LIMITED on the last attempt.
 - A closed window stops the offer with an INFO event (WINDOW_CLOSED), any other
   refusal, an expired token included, with a WARNING (REJECTED). Both release
   the claim and the reservation and end the job without a retry, so an expected
@@ -170,9 +233,10 @@ completes, and follows one policy:
 - A refusal whose claim the database fails to give back is still a refusal:
   the reservation goes back, the offer stops for the refusal's reason, and a
   WARNING ("Offer message claim not released after a refusal") names the
-  claim left behind. There is no retry, not even for a rate limit, because a
-  retry would find the claim and take the message for sent. If recording the
-  refusal fails as well, the job ends without a retry.
+  claim left behind. There is no retry and no wait for a pause, not even for
+  a rate limit, because a retry or a copy would find the claim and take the
+  message for sent; a Meta request limit still pauses the account. If
+  recording the refusal fails as well, the job ends without a retry.
 - Once the link reached the person (the card, one of its fallbacks or the
   reminder), a later failure does not mark the offer stopped: the card sent
   again for a later tap, a confirmation or the card after the reminder. It is
@@ -206,7 +270,7 @@ transaction that only an unset `signedUpAt` lets through, so a repeated or
 simultaneous report records nothing twice. Only that first report queues the
 chat confirmation, under a job id per row (`offer_<row>_signup`). The
 confirmation follows the policy above (window check, monthly DMs, claim per
-row, retries for rate limits), with one difference: whatever keeps it from
+row, the wait for an account's pause), with one difference: whatever keeps it from
 going out is logged ("Sign-up confirmation not sent: …", INFO for a closed
 window, an unavailable account or a deleted offer, WARNING otherwise) and
 never marks the offer stopped, since the person got the link long before.

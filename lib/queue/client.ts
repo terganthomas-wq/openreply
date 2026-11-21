@@ -58,11 +58,19 @@ export interface ProcessPostbackJob {
   // How many delayed re-checks have run, counting this one. Absent on jobs
   // queued before re-checks were counted, where `followRecheck` meant one.
   followRecheckAttempt?: number;
-  // On a re-check: when the tap it repeats happened (epoch ms). That tap
-  // opened Instagram's messaging window, while the re-check job itself was
-  // queued by the pass before it. Absent on taps and on re-checks queued
-  // before it was carried, which fall back to the job's own timestamp.
+  // On a re-check, or a copy queued for the account's pause: when the tap it
+  // repeats happened (epoch ms). That tap opened Instagram's messaging
+  // window, while the job itself was queued later. Absent on taps and on
+  // re-checks queued before it was carried, which fall back to the job's own
+  // timestamp.
   tappedAt?: number;
+  // On a copy queued for the account's pause: the id the tap had in the job
+  // it copies (its mid, or that job's id). The tap's claim and its offer
+  // start are keyed on it, so the copy can never count as a new tap.
+  tapId?: string;
+  // How often this tap was put back for the account's pause after a Meta
+  // request limit (lib/queue/account-pause.ts), capped at MAX_PAUSE_REQUEUES.
+  pauseRequeue?: number;
 }
 
 // Scheduled after the link is delivered, to send the appreciation follow-up.
@@ -74,6 +82,8 @@ export interface ProcessFollowUpJob {
   userId: string;
   automationId: string;
   commenterName?: string | null;
+  // How often the follow-up was put back for the account's pause.
+  pauseRequeue?: number;
 }
 
 // An inbound DM from a user. Campaigns with `dmTriggerEnabled` whose keywords
@@ -84,6 +94,12 @@ export interface ProcessMessageJob {
   messageId: string;
   messageText: string;
   senderId: string;
+  // On a copy queued for the account's pause: when the DM arrived (epoch
+  // ms), which opened Instagram's messaging window. The webhook's own job
+  // was queued on arrival, so its timestamp is that time.
+  receivedAt?: number;
+  // How often the DM was put back for the account's pause.
+  pauseRequeue?: number;
 }
 
 // One step of a lead-magnet offer (lib/offers/worker.ts). "start" picks the
@@ -123,6 +139,9 @@ export interface ProcessOfferJob {
   contactOfferId?: string;
   // offer, confirm: the index of the message.
   step?: number;
+  // How often this message was put back for the account's pause after a
+  // Meta request limit, capped at MAX_PAUSE_REQUEUES.
+  pauseRequeue?: number;
 }
 
 export type DmQueueJob =

@@ -86,12 +86,13 @@ Was das Tool daraus macht:
   Anfragen) und 368 (vorübergehend gesperrt). Bei einem Limit wurde nichts
   verschickt, die Nachricht kann also später raus. Vorher galten 32, 613,
   80002 und 80006 als „vielleicht zugestellt“ und wurden nie wiederholt.
-- Lehnt Meta die DM zu einem Kommentar (private Antwort, Eröffnungs-DM,
-  Folgen-Bitte, Link) oder die Prüfung, ob die Person folgt, mit einem Limit
-  ab, pausiert das Tool das Senden für dieses Instagram-Konto: 20 Minuten,
-  bei 368 eine Stunde (einstellbar mit `META_THROTTLE_PAUSE_MINUTES` und
-  `META_BLOCK_PAUSE_MINUTES`, 1 bis 240 Minuten, in worker.env). Eine
-  laufende Pause wird höchstens verlängert, nie verkürzt.
+- Lehnt Meta eine Nachricht (etwa die DM zu einem Kommentar: private
+  Antwort, Eröffnungs-DM, Folgen-Bitte, Link) oder die Prüfung, ob die
+  Person folgt, mit einem Limit ab, pausiert das Tool das Senden für dieses
+  Instagram-Konto: 20 Minuten, bei 368 eine Stunde (einstellbar mit
+  `META_THROTTLE_PAUSE_MINUTES` und `META_BLOCK_PAUSE_MINUTES`, 1 bis 240
+  Minuten, in worker.env). Eine laufende Pause wird höchstens verlängert,
+  nie verkürzt.
 - Während der Pause fragt das Tool für die DMs zu Kommentaren nicht bei Meta
   an. Der Kommentar wartet im DM-Protokoll als „Ausstehend“ und kommt nach
   der Pause von selbst wieder dran, verteilt über die Minute danach, damit
@@ -118,9 +119,24 @@ Was das Tool daraus macht:
   Minuten pro Konto einen Eintrag mit den Prozentwerten.
 - Das eigene Stundenlimit für private Antworten (750 pro Stunde und Konto)
   gilt weiter wie bisher.
-- Button-Klicks, Antworten auf DMs, Folgenachrichten und Angebote kennen die
-  Pause noch nicht: Bei einem Limit gelten für sie noch die bisherigen
-  Wiederholungen nach 5 und 15 Minuten.
+- Genauso warten alle Nachrichten im Chat: nach einem Button-Klick (die
+  Prüfung, ob die Person folgt, die Folgen-Bitte, der Link), die Antworten
+  auf DMs, die Folgenachricht und alle Nachrichten der Angebote, auch Karte,
+  Erinnerung und die Bestätigung nach der Eintragung. Instagram erlaubt
+  Nachrichten nur bis 24 Stunden nach dem letzten Tippen oder der letzten DM
+  der Person. Eine Nachricht wartet deshalb nur, wenn dieses Fenster nach der
+  Pause noch offen ist. Sonst steht der Link oder die DM-Antwort im
+  DM-Protokoll auf „Fehlgeschlagen“, und ein Angebot endet mit
+  „Nachrichtenfenster geschlossen“.
+- Auch im Chat geht dabei nichts doppelt raus: Die wartende Nachricht belegt
+  vor dem Senden denselben Eintrag in der Datenbank wie der erste Versuch,
+  und nur einer kommt durch. Hat die Person den Link nach der Pause schon auf
+  anderem Weg bekommen, schickt ihr wartender Button-Klick ihn nicht noch
+  einmal.
+- Erst nach 12 Pausen hintereinander gibt das Tool auf: Link oder
+  DM-Antwort stehen dann auf „Fehlgeschlagen“, ein Angebot endet mit
+  „Rate-Limit“. Die Warte-Nachricht beim Follow-Gate fällt während einer
+  Pause einfach weg.
 - Über Zernio verbundene Konten bleiben, wie sie sind: Zernios eigenes Limit
   (HTTP 429) löst keine Pause aus.
 
