@@ -80,7 +80,9 @@ export default function SettingsPage() {
   }
 
   async function disconnectInstagram(instagramAccountId: string) {
-    if (!confirm(t("Disconnect Instagram? Campaigns for this account will stop sending DMs."))) {
+    // Disconnecting deletes the account's row and with it its contacts (R18):
+    // after a reconnect everyone can get every offer again.
+    if (!confirm(t("Disconnect Instagram? Campaigns for this account will stop sending DMs. Contacts, tags and offer history of this account are deleted too."))) {
       return;
     }
 

@@ -212,6 +212,10 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
   const [followUpDelayMinutes, setFollowUpDelayMinutes] = useState(0);
   const [deliveryTag, setDeliveryTag] = useState("");
   const deliveryTagId = useId();
+  // The workspace's tags, suggested as the delivery tag is typed: asked for
+  // once, when the field first gets focus. Null until then.
+  const [tagSuggestions, setTagSuggestions] = useState<string[] | null>(null);
+  const tagSuggestionsId = useId();
 
   // Weg 2 (R4, R13): offers after the link, in the workspace's default order
   // from the Offers page or in this campaign's own. The offers are loaded
@@ -561,6 +565,21 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
     setPostUrl(url ?? null);
     setPostThumb(thumb ?? null);
     setPostCaption(caption ?? "");
+  }
+
+  function loadTagSuggestions() {
+    if (tagSuggestions !== null) return;
+    setTagSuggestions([]);
+    fetch("/api/contacts?view=tags", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((payload) => {
+        if (!payload.success) return;
+        setTagSuggestions(
+          (payload.data.tagCounts as { tag: string }[]).map((entry) => entry.tag)
+        );
+      })
+      // Without suggestions the field still takes any tag.
+      .catch(() => {});
   }
 
   function ensureLinkToken() {
@@ -1406,10 +1425,18 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
               id={deliveryTagId}
               value={deliveryTag}
               onChange={(e) => setDeliveryTag(e.target.value)}
+              onFocus={loadTagSuggestions}
+              list={tagSuggestionsId}
               placeholder={t("e.g. [LM] Guide sent")}
               maxLength={100}
               className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none"
             />
+            {/* Tags contacts already have, so one name is not spelled two ways. */}
+            <datalist id={tagSuggestionsId}>
+              {tagSuggestions?.map((tag) => (
+                <option key={tag} value={tag} />
+              ))}
+            </datalist>
             <p className="text-xs text-muted">
               {t("Contacts get this tag when this campaign's link reaches them. Leave it empty for no tag.")}
             </p>

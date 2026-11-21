@@ -21,16 +21,19 @@ const pageTitles: Record<string, StaticMessageKey> = {
   "/automations/new": "New Campaign",
   "/offers": "Offers",
   "/offers/new": "New offer",
+  "/contacts": "Contacts",
   "/logs": "DM Logs",
   "/settings": "Settings",
   "/diagnostics": "Diagnostics",
 };
 
-// Pages with an id in the path: /offers/<id>/edit, /campaigns/<id>[/edit].
+// Pages with an id in the path: /offers/<id>/edit, /campaigns/<id>[/edit],
+// /contacts/<id>.
 function fallbackTitle(pathname: string): StaticMessageKey {
   if (pathname.endsWith("/edit")) {
     return pathname.startsWith("/offers/") ? "Edit offer" : "Edit campaign";
   }
+  if (pathname.startsWith("/contacts/")) return "Contact";
   return pathname.startsWith("/campaigns/") ? "Campaign details" : "Dashboard";
 }
 

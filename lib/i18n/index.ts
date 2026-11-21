@@ -57,6 +57,13 @@ const labels: Record<string, StaticMessageKey> = {
   OWNER: "Owner",
   ADMIN: "Admin",
   MEMBER: "Member",
+  // Why an offer stopped early (ContactOffer.stopReason).
+  WINDOW_CLOSED: "Messaging window closed",
+  REJECTED: "Refused by Instagram",
+  RATE_LIMITED: "Rate limited",
+  PLAN_LIMIT: "Plan limit",
+  OFFER_ARCHIVED: "Offer deleted",
+  ACCOUNT_UNAVAILABLE: "Account unavailable",
   all: "All",
   active: "Active",
   paused: "Paused",
