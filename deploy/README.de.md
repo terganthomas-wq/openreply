@@ -11,6 +11,7 @@ stehen in Frankfurt, soweit der Dienst das anbietet.
 | Redis | Redis Cloud Free | Eviction-Policy `noeviction`. Kein TLS im Gratis-Tarif. |
 | Worker | Oracle Cloud Always Free (Ubuntu 24.04, Node 24, pm2) | Fragt die Datenbank nur alle 30 Minuten ab, damit Neon schlafen kann. |
 | Login-Mails | Resend | Ohne eigene Domain nur an die Adresse des Resend-Kontos. |
+| Kartenbilder der Angebote | Vercel Blob | Optional, siehe unten. Setzt `BLOB_READ_WRITE_TOKEN` selbst. |
 
 ## Meta-App (Unified Login)
 
@@ -75,6 +76,30 @@ node deploy/make-env.mjs <ordner>
   Deutsch, bis jemand im Sprachmenü eine andere Sprache wählt. Fehlt die
   Variable in Vercel (Projekt von vor dieser Änderung), bleibt die Oberfläche
   englisch: ergänzen und neu deployen.
+
+## Kartenbilder hochladen (Vercel Blob)
+
+Das Bild auf der Karte eines Angebots lädst du im Angebots-Editor hoch. Es
+liegt in Vercel Blob und ist öffentlich lesbar, weil Instagram es selbst
+abruft.
+
+- Einmalig in Vercel im Projekt unter *Storage* einen Blob-Store anlegen
+  (Region möglichst Frankfurt) und mit dem Projekt verbinden, mindestens für
+  *Production*. Vercel setzt dabei `BLOB_READ_WRITE_TOKEN` selbst. Die
+  Variable gehört weder in `vercel.env` noch auf den Worker-Server: Der Worker
+  schickt Instagram nur die öffentliche Adresse des Bilds. Danach neu
+  deployen, damit die App die Variable sieht.
+- Ohne die Variable zeigt der Editor wie bisher ein Feld für einen Link auf
+  das Bild, und das Hochladen antwortet mit `503`.
+- Erlaubt sind JPG, PNG und WebP bis 5 MB, am besten quadratisch mit
+  1080 × 1080 Pixeln. Vercel nimmt pro Anfrage höchstens 4,5 MB an und lehnt
+  größere Dateien ab, auch wenn sie unter 5 MB liegen.
+- Die Dateien liegen unter `offers/<Workspace-ID>/`. Ersetzt oder entfernst
+  du ein Bild und speicherst das Angebot, löscht die App die alte Datei,
+  ebenso beim Löschen eines Angebots, das noch niemand bekommen hat.
+  Archivierte Angebote behalten ihr Bild, weil verschickte Karten es weiter
+  zeigen. Hochgeladene, aber nie gespeicherte Bilder bleiben liegen; die
+  kannst du bei Bedarf in Vercel unter *Storage* löschen.
 
 ## Worker-Server einrichten
 

@@ -11,13 +11,18 @@
  * tags, next to a live preview of the DM thread. A new offer starts from the
  * workspace's default texts for offers.
  *
+ * The card image is uploaded where a Vercel Blob store is connected (GET
+ * /api/offers says so): picking a file sends it to /api/offers/image at
+ * once and puts the URL it answers with into the form. Elsewhere the image
+ * is a link typed into a field.
+ *
  * Saving sends the whole offer (lib/offers/editor.ts offerPayload) and never
  * isActive: pausing belongs to the Offers page.
  */
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { CountedInput, Section, Toggle } from "@/components/form-controls";
 import OfferPreview from "@/components/offer-preview";
 import {
@@ -33,12 +38,15 @@ import {
   firstErrorField,
   firstMissingField,
   followTagTemplates,
+  imageFileProblem,
+  imageUploadProblem,
   newOfferEditorState,
   offerDefaultsUpdate,
   offerPayload,
   sentMessages,
   TAG_FIELD,
   TAG_KEYS,
+  type ImageUploadProblem,
   type OfferEditorState,
   type OfferField,
   type OfferRecord,
@@ -48,6 +56,7 @@ import {
 } from "@/lib/offers/editor";
 import {
   OFFER_DELAY_MAX_SECONDS,
+  OFFER_IMAGE_TYPES,
   OFFER_MESSAGE_MAX,
   OFFER_MESSAGES_MAX,
   OFFER_NAME_MAX,
@@ -59,6 +68,20 @@ import {
 import { BUTTON_TEXT_MAX, CARD_TEXT_MAX } from "@/lib/validation/text";
 
 const MESSAGE_DEFAULTS_URL = "/api/workspace/message-defaults";
+const OFFERS_URL = "/api/offers";
+const OFFER_IMAGE_URL = "/api/offers/image";
+
+// Whether card images can be uploaded here, as GET /api/offers says. Without
+// an answer the editor shows the image-URL field, which always works.
+function fetchImageUploadEnabled(): Promise<boolean> {
+  return fetch(OFFERS_URL, { cache: "no-store" })
+    .then((r) => r.json())
+    .then(
+      (payload) =>
+        payload?.success === true && payload.imageUploadEnabled === true
+    )
+    .catch(() => false);
+}
 
 // A new message waits this long after the one before.
 const NEW_MESSAGE_DELAY_SECONDS = 3;
@@ -135,6 +158,13 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
   const [shownImageUrl, setShownImageUrl] = useState("");
   const [failedImageUrl, setFailedImageUrl] = useState<string | null>(null);
 
+  // Card images are uploaded where a Blob store is connected; elsewhere the
+  // image is a link.
+  const [imageUpload, setImageUpload] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
+
   useEffect(() => {
     let active = true;
     fetch("/api/instagram/accounts")
@@ -152,27 +182,29 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
   }, []);
 
   // A new offer opens with the workspace's default texts for offers; an
-  // edit with the stored offer.
+  // edit with the stored offer. Either way the offers API says whether card
+  // images can be uploaded.
   useEffect(() => {
     let active = true;
     if (mode === "new") {
-      fetch(MESSAGE_DEFAULTS_URL, { cache: "no-store" })
-        .then((r) => r.json())
-        .then((payload) => (payload.success ? payload.data : null))
-        // Without them the form opens empty.
-        .catch(() => null)
-        .then((data) => {
-          if (!active) return;
-          const defaults = parseMessageDefaults(data?.defaults)?.offer ?? null;
-          setForm(newOfferEditorState(defaults));
-          setTemplates(
-            (defaults ?? EMPTY_MESSAGE_DEFAULTS.offer).tagTemplates
-          );
-          setCanManageDefaults(data?.canManage === true);
-          setLoading(false);
-        });
+      Promise.all([
+        fetch(MESSAGE_DEFAULTS_URL, { cache: "no-store" })
+          .then((r) => r.json())
+          .then((payload) => (payload.success ? payload.data : null))
+          // Without them the form opens empty.
+          .catch(() => null),
+        fetchImageUploadEnabled(),
+      ]).then(([data, uploadEnabled]) => {
+        if (!active) return;
+        const defaults = parseMessageDefaults(data?.defaults)?.offer ?? null;
+        setForm(newOfferEditorState(defaults));
+        setTemplates((defaults ?? EMPTY_MESSAGE_DEFAULTS.offer).tagTemplates);
+        setCanManageDefaults(data?.canManage === true);
+        setImageUpload(uploadEnabled);
+        setLoading(false);
+      });
     } else {
-      fetch("/api/offers", { cache: "no-store" })
+      fetch(OFFERS_URL, { cache: "no-store" })
         .then((r) => r.json())
         .then((payload) => {
           if (!active) return;
@@ -182,6 +214,7 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
           if (!offer) return setNotFound(true);
           setForm(editorStateFromOffer(offer));
           setIsActive(offer.isActive);
+          setImageUpload(payload.imageUploadEnabled === true);
         })
         .catch(() => {
           if (active) setNotFound(true);
@@ -203,7 +236,11 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
     const timer = window.setTimeout(() => setShownImageUrl(imageCandidate), 400);
     return () => window.clearTimeout(timer);
   }, [imageCandidate]);
-  const imageFailed = shownImageUrl !== "" && failedImageUrl === shownImageUrl;
+  // An uploaded image, or the stored one, shows at once; a typed link once
+  // typing stops.
+  const previewImageUrl = imageUpload ? imageCandidate : shownImageUrl;
+  const imageFailed =
+    previewImageUrl !== "" && failedImageUrl === previewImageUrl;
   // Meta fetches the image itself and takes https only.
   const imageNotHttps =
     typedImageUrl.length >= "https://".length &&
@@ -297,7 +334,7 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
       case "confirmationDelaysSeconds":
         return t("Confirmation messages");
       case "cardImageUrl":
-        return t("Image URL");
+        return imageUpload ? t("Image") : t("Image URL");
       case "cardTitle":
         return t("Title");
       case "cardSubtitle":
@@ -440,6 +477,59 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
     }
   }
 
+  function uploadProblemText(problem: ImageUploadProblem): string {
+    switch (problem) {
+      case "type":
+        return t("Use a JPG, PNG or WebP image.");
+      case "size":
+        return t("This image is too large to upload. Use a smaller file; 1080 × 1080 is enough.");
+      case "forbidden":
+        return t("Only owners and admins can change offers.");
+      case "notSetUp":
+        return t("Image upload is not set up here. Paste a link to the image instead.");
+      default:
+        return t("The image could not be uploaded. Try again.");
+    }
+  }
+
+  // Sends the picked file at once and puts the URL into the form. The old
+  // image stays until the offer is saved with the new one, and is deleted
+  // then.
+  async function uploadImage(file: File) {
+    setUploadError(null);
+    const problem = imageFileProblem(file);
+    if (problem) {
+      setUploadError(uploadProblemText(problem));
+      return;
+    }
+    setUploading(true);
+    try {
+      const body = new FormData();
+      body.append("file", file);
+      const res = await fetch(OFFER_IMAGE_URL, { method: "POST", body });
+      // The platform's own refusals (a 413 on Vercel) carry no JSON.
+      const data = await res.json().catch(() => null);
+      const url: unknown = data?.success ? data.data?.url : null;
+      if (typeof url === "string" && url) {
+        update("cardImageUrl", url, "cardImageUrl");
+        return;
+      }
+      const failure = imageUploadProblem(res.status);
+      // No Blob store after all: the link field still works.
+      if (failure === "notSetUp") setImageUpload(false);
+      setUploadError(uploadProblemText(failure));
+    } catch {
+      setUploadError(uploadProblemText("failed"));
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  function removeImage() {
+    update("cardImageUrl", "", "cardImageUrl");
+    setUploadError(null);
+  }
+
   if (loading) {
     return <div className="panel h-64 rounded" />;
   }
@@ -570,10 +660,11 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
             </span>
           )}
         </div>
+        {/* Not while an image uploads: the save would keep the old one. */}
         <button
           type="button"
           onClick={() => void save()}
-          disabled={saving}
+          disabled={saving || uploading}
           className="ml-auto rounded-lg bg-accent px-5 py-2 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-50"
         >
           {saving
@@ -652,63 +743,161 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
           </Section>
 
           <Section title={t("The card")}>
-            <div className="space-y-1">
-              <label
-                htmlFor={fieldId("cardImageUrl")}
-                className="block text-xs text-muted"
+            {imageUpload ? (
+              <div
+                role="group"
+                aria-labelledby={fieldId("cardImage")}
+                aria-busy={uploading || undefined}
+                className="space-y-2"
               >
-                {t("Image URL")}{" "}
-                <span className="font-normal">{t("(optional)")}</span>
-              </label>
-              <input
-                id={fieldId("cardImageUrl")}
-                type="url"
-                inputMode="url"
-                autoComplete="off"
-                spellCheck={false}
-                value={form.cardImageUrl}
-                onChange={(e) =>
-                  update("cardImageUrl", e.target.value, "cardImageUrl")
-                }
-                placeholder="https://…/cover.jpg"
-                maxLength={OFFER_URL_MAX}
-                aria-invalid={Boolean(errors.cardImageUrl) || undefined}
-                className={inputClass(Boolean(errors.cardImageUrl))}
-              />
-              <FieldError message={errors.cardImageUrl} />
-              {!errors.cardImageUrl && imageNotHttps && (
-                <p className="text-xs text-warning">
-                  {t("The image needs a direct https link.")}
+                <p id={fieldId("cardImage")} className="text-xs text-muted">
+                  {t("Image")}{" "}
+                  <span className="font-normal">{t("(optional)")}</span>
                 </p>
-              )}
-              {shownImageUrl && (
-                <div className="flex items-center gap-3 pt-1">
-                  <img
-                    key={shownImageUrl}
-                    src={shownImageUrl}
-                    alt=""
-                    referrerPolicy="no-referrer"
-                    onError={() => setFailedImageUrl(shownImageUrl)}
-                    onLoad={() =>
-                      setFailedImageUrl((current) =>
-                        current === shownImageUrl ? null : current
-                      )
-                    }
-                    className={`h-16 w-16 shrink-0 rounded border border-border object-cover ${
-                      imageFailed ? "hidden" : ""
-                    }`}
-                  />
-                  {imageFailed && (
-                    <p className="text-xs text-warning">
-                      {t("This image does not load. Google Drive share links are web pages, not images: use a direct link to the image file.")}
-                    </p>
-                  )}
-                </div>
-              )}
-              <p className="text-xs text-muted">
-                {t("A direct https link to the image file. Square images (1080 × 1080) work best.")}
-              </p>
-            </div>
+                {/* Opened by the buttons below; kept rendered (not display:
+                    none) so every browser lets them open it. */}
+                <input
+                  ref={fileInput}
+                  type="file"
+                  accept={OFFER_IMAGE_TYPES.join(",")}
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    // Picking the same file again must fire again.
+                    e.target.value = "";
+                    if (file) void uploadImage(file);
+                  }}
+                  tabIndex={-1}
+                  aria-hidden="true"
+                  className="sr-only"
+                />
+                {previewImageUrl ? (
+                  <div className="flex flex-wrap items-center gap-3">
+                    <img
+                      key={previewImageUrl}
+                      src={previewImageUrl}
+                      alt={t("Card image")}
+                      referrerPolicy="no-referrer"
+                      onError={() => setFailedImageUrl(previewImageUrl)}
+                      onLoad={() =>
+                        setFailedImageUrl((current) =>
+                          current === previewImageUrl ? null : current
+                        )
+                      }
+                      className={`h-20 w-20 shrink-0 rounded-lg border border-border object-cover ${
+                        imageFailed ? "hidden" : ""
+                      }`}
+                    />
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => fileInput.current?.click()}
+                        disabled={uploading}
+                        aria-describedby={fieldId("cardImage-hint")}
+                        className="rounded-lg border border-border px-3 py-2 text-sm font-medium text-foreground hover:bg-surface-hover disabled:opacity-50"
+                      >
+                        {uploading ? t("Uploading…") : t("Replace")}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={removeImage}
+                        disabled={uploading}
+                        className="rounded-lg border border-border px-3 py-2 text-sm font-medium text-muted hover:text-error disabled:opacity-50"
+                      >
+                        {t("Remove")}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => fileInput.current?.click()}
+                    disabled={uploading}
+                    aria-describedby={fieldId("cardImage-hint")}
+                    className="w-full rounded-lg border border-dashed border-border-hover px-3 py-6 text-sm font-medium text-muted hover:bg-surface-hover hover:text-foreground disabled:opacity-50"
+                  >
+                    {uploading ? t("Uploading…") : t("Choose image")}
+                  </button>
+                )}
+                <FieldError message={errors.cardImageUrl} />
+                {imageFailed && (
+                  <p className="text-xs text-warning">
+                    {t("This image does not load. Replace it with a JPG, PNG or WebP file.")}
+                  </p>
+                )}
+                {uploadError && (
+                  <p role="alert" className="text-xs text-error">
+                    {uploadError}
+                  </p>
+                )}
+                <p id={fieldId("cardImage-hint")} className="text-xs text-muted">
+                  {t("JPG, PNG or WebP, up to 5 MB. Square images (1080 × 1080) work best.")}
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-1">
+                <label
+                  htmlFor={fieldId("cardImageUrl")}
+                  className="block text-xs text-muted"
+                >
+                  {t("Image URL")}{" "}
+                  <span className="font-normal">{t("(optional)")}</span>
+                </label>
+                <input
+                  id={fieldId("cardImageUrl")}
+                  type="url"
+                  inputMode="url"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={form.cardImageUrl}
+                  onChange={(e) =>
+                    update("cardImageUrl", e.target.value, "cardImageUrl")
+                  }
+                  placeholder="https://…/cover.jpg"
+                  maxLength={OFFER_URL_MAX}
+                  aria-invalid={Boolean(errors.cardImageUrl) || undefined}
+                  className={inputClass(Boolean(errors.cardImageUrl))}
+                />
+                <FieldError message={errors.cardImageUrl} />
+                {/* Left by an upload that found no Blob store after all. */}
+                {uploadError && (
+                  <p role="alert" className="text-xs text-error">
+                    {uploadError}
+                  </p>
+                )}
+                {!errors.cardImageUrl && imageNotHttps && (
+                  <p className="text-xs text-warning">
+                    {t("The image needs a direct https link.")}
+                  </p>
+                )}
+                {previewImageUrl && (
+                  <div className="flex items-center gap-3 pt-1">
+                    <img
+                      key={previewImageUrl}
+                      src={previewImageUrl}
+                      alt=""
+                      referrerPolicy="no-referrer"
+                      onError={() => setFailedImageUrl(previewImageUrl)}
+                      onLoad={() =>
+                        setFailedImageUrl((current) =>
+                          current === previewImageUrl ? null : current
+                        )
+                      }
+                      className={`h-16 w-16 shrink-0 rounded border border-border object-cover ${
+                        imageFailed ? "hidden" : ""
+                      }`}
+                    />
+                    {imageFailed && (
+                      <p className="text-xs text-warning">
+                        {t("This image does not load. Google Drive share links are web pages, not images: use a direct link to the image file.")}
+                      </p>
+                    )}
+                  </div>
+                )}
+                <p className="text-xs text-muted">
+                  {t("A direct https link to the image file. Square images (1080 × 1080) work best.")}
+                </p>
+              </div>
+            )}
             <div className="space-y-1">
               <label
                 htmlFor={fieldId("cardTitle")}
@@ -954,7 +1143,9 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
               offerMessages={sentMessages(form.offerMessages)}
               offerButtonLabel={form.offerButtonLabel}
               confirmationMessages={sentMessages(form.confirmationMessages)}
-              cardImageUrl={shownImageUrl && !imageFailed ? shownImageUrl : null}
+              cardImageUrl={
+                previewImageUrl && !imageFailed ? previewImageUrl : null
+              }
               cardTitle={form.cardTitle}
               cardSubtitle={form.cardSubtitle}
               cardButtonLabel={form.cardButtonLabel}

@@ -7,14 +7,15 @@
  * (offers-api, offer-redirect) prove which statements the routes send; only a
  * database shows that Postgres runs them as meant, so the routes run here on
  * real tables. Skipped without TEST_DATABASE_URL; each run builds its own
- * throwaway schema from prisma/migrations and drops it at the end.
+ * throwaway schema from prisma/migrations and drops it at the end. Vercel
+ * Blob is mocked: a deleted card image is only recorded.
  */
 import { randomBytes } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { Client } from "pg";
 import { PrismaPg } from "@prisma/adapter-pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 import { PrismaClient } from "../app/generated/prisma/client";
 
@@ -22,6 +23,7 @@ const state = vi.hoisted(() => ({
   db: undefined as unknown as import("../app/generated/prisma/client").PrismaClient,
   context: null as { workspaceId: string; role: "OWNER" | "ADMIN" | "MEMBER" } | null,
   afterCallbacks: [] as (() => unknown)[],
+  deletedImages: [] as string[],
 }));
 
 vi.mock("@/lib/db/client", () => ({
@@ -36,6 +38,14 @@ vi.mock("@/lib/auth", () => ({
 vi.mock("@/lib/workspace-access", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../lib/workspace-access")>()),
   getCurrentWorkspaceContext: async () => state.context,
+}));
+vi.mock("@vercel/blob", () => ({
+  put: async () => {
+    throw new Error("no uploads in this suite");
+  },
+  del: async (url: string) => {
+    state.deletedImages.push(url);
+  },
 }));
 vi.mock("next/server", async (importOriginal) => ({
   ...(await importOriginal<typeof import("next/server")>()),
@@ -180,10 +190,17 @@ describe.skipIf(!databaseUrl)("offers API on a real Postgres", () => {
   beforeEach(async () => {
     state.context = { workspaceId: WORKSPACE, role: "OWNER" };
     state.afterCallbacks.length = 0;
+    state.deletedImages.length = 0;
+    // No Blob store unless a test connects one.
+    vi.stubEnv("BLOB_READ_WRITE_TOKEN", "");
     // Each test starts without offers; their ContactOffer rows cascade.
     await db.offer.deleteMany({});
     await db.contactTag.deleteMany({});
     await db.automation.updateMany({ data: { offerIds: [] } });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   afterAll(async () => {
@@ -496,5 +513,54 @@ describe.skipIf(!databaseUrl)("offers API on a real Postgres", () => {
 
     const row = await db.offer.findUniqueOrThrow({ where: { id: offer.id } });
     expect(row).toMatchObject({ isActive: true, archivedAt: null, position: 0 });
+  });
+
+  // Spec D2: an uploaded card image goes once no offer of the workspace
+  // shows it. An archived offer counts: the cards already sent show it.
+  it("deletes a replaced or deleted upload only once no offer of the workspace shows it, archived ones included", async () => {
+    vi.stubEnv("BLOB_READ_WRITE_TOKEN", "vercel_blob_rw_teststore_localtestvalue");
+    const store = `https://teststore.public.blob.vercel-storage.com/offers/${WORKSPACE}`;
+    const shared = `${store}/cover-Shared111.jpg`;
+    const own = `${store}/cover-Own222.png`;
+    const next = `${store}/cover-Next333.webp`;
+    const runAfterCallbacks = async () => {
+      for (const callback of state.afterCallbacks.splice(0)) await callback();
+    };
+
+    const current = await createOffer("Current");
+    const old = await createOffer("Old");
+    await db.offer.update({ where: { id: current.id }, data: { cardImageUrl: shared } });
+    // Deleted after it was offered: archived, and its cards still show the image.
+    await db.offer.update({
+      where: { id: old.id },
+      data: { cardImageUrl: shared, firstOfferedAt: new Date() },
+    });
+    const archived = await DELETE(apiRequest("DELETE", `?id=${old.id}`));
+    expect((await archived.json()).data).toMatchObject({ archived: true });
+    await runAfterCallbacks();
+
+    // The current offer moves on to its own image; the archived one keeps the shared one.
+    const replaced = await PATCH(
+      apiRequest("PATCH", `?id=${current.id}`, { ...offerBody("Current"), cardImageUrl: own })
+    );
+    expect(replaced.status).toBe(200);
+    await runAfterCallbacks();
+    expect(state.deletedImages).toEqual([]);
+
+    // Nobody else shows its own image: replaced, it goes.
+    await PATCH(
+      apiRequest("PATCH", `?id=${current.id}`, { ...offerBody("Current"), cardImageUrl: next })
+    );
+    await runAfterCallbacks();
+    expect(state.deletedImages).toEqual([own]);
+
+    // Deleted for good (nobody got it), its image goes too.
+    const deleted = await DELETE(apiRequest("DELETE", `?id=${current.id}`));
+    expect((await deleted.json()).data).toMatchObject({ archived: false });
+    await runAfterCallbacks();
+    expect(state.deletedImages).toEqual([own, next]);
+    expect(
+      await db.offer.findUniqueOrThrow({ where: { id: old.id }, select: { cardImageUrl: true } })
+    ).toEqual({ cardImageUrl: shared });
   });
 });

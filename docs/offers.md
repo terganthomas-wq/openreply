@@ -64,18 +64,38 @@ messages.
 
 ## The card image
 
-Instagram downloads the card's image itself. It needs a direct `https` link
-to the image file (JPG or PNG; square, 1080 × 1080, works best). A Google
-Drive share link is a web page, not an image: the editor shows a warning when
-the image does not load, and Instagram cannot show it either. If Instagram
-refuses a card, its title and subtitle go out as a message with the button
-instead (Diagnostics notes "Offer card fell back to a button message"). The
-link behind the card's button may be any web page, Google Drive and Docs
-share links included. Clicks go through a tracked link (`/o/<slug>`) that
-forwards to it and records the click.
+Instagram downloads the card's image itself, from a public `https` link.
 
-Uploading the image in the editor is not available yet; use a link to an
-image you host elsewhere.
+**Upload.** Where a Vercel Blob store is connected to the project (it sets
+`BLOB_READ_WRITE_TOKEN`, see `deploy/README.de.md`), the editor uploads the
+image: **Choose image** takes a JPG, PNG or WebP file of up to 5 MB (square,
+1080 × 1080, works best; JPG and PNG are the safest choice for Instagram),
+shows it and offers **Replace** and **Remove**. The server tells what the
+file is from its first bytes, whatever its name says, and stores it publicly
+under `offers/<workspace id>/` with a random suffix; saving the offer makes
+its URL the card image. Only owners and admins upload. On Vercel a request
+carries at most 4.5 MB, so a file between 4.5 and 5 MB is refused there as
+too large.
+
+Saving the offer with another image or none deletes the old upload, and so
+does deleting an offer nobody got yet. An archived offer keeps its image,
+because the cards already sent still show it, and so does any other offer of
+the workspace that shows the same file. Deleting is best effort: if it fails,
+the file stays behind, as does an upload that was never saved with an offer
+(replaced again before saving, or the editor left without saving). Images
+hosted anywhere else are never deleted.
+
+**Link.** Without a Blob store the editor shows the **Image URL** field
+instead. It needs a direct `https` link to the image file (JPG or PNG;
+square, 1080 × 1080, works best). A Google Drive share link is a web page,
+not an image: the editor shows a warning when the image does not load, and
+Instagram cannot show it either.
+
+If Instagram refuses a card, its title and subtitle go out as a message with
+the button instead (Diagnostics notes "Offer card fell back to a button
+message"). The link behind the card's button may be any web page, Google
+Drive and Docs share links included. Clicks go through a tracked link
+(`/o/<slug>`) that forwards to it and records the click.
 
 ## Pause or delete
 

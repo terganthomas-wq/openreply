@@ -5,13 +5,23 @@
  * Offers belong to the workspace, never to a campaign, and every query here
  * names the workspace (R18): an id from another workspace is a 404 like a
  * missing one. Every member may read them; owners and admins change them.
+ *
+ * A card image uploaded in the editor (app/api/offers/image) is deleted
+ * once an edit replaces or removes it, or the offer is deleted for good,
+ * after the response and best effort (lib/offers/image.ts). An archived
+ * offer keeps its image: the cards already sent may still show it.
  */
 
-import { NextRequest, NextResponse } from "next/server";
+import { after, NextRequest, NextResponse } from "next/server";
 import type { z } from "zod";
 import type { Offer } from "@/app/generated/prisma/client";
 import { getCurrentWorkspaceId } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
+import {
+  deleteUnusedOfferImage,
+  isOfferImageUploadEnabled,
+  isUploadedOfferImage,
+} from "@/lib/offers/image";
 import { OFFER_ORDER } from "@/lib/offers/schedule";
 import {
   offerInputSchema,
@@ -88,8 +98,21 @@ async function writableWorkspace(): Promise<
 function findCurrentOffer(workspaceId: string, id: string) {
   return prisma.offer.findFirst({
     where: { id, workspaceId, archivedAt: null },
-    select: { id: true },
+    select: { id: true, cardImageUrl: true },
   });
+}
+
+/**
+ * After the response: deletes the card image an offer no longer shows, if
+ * this workspace uploaded it and no other offer shows it. Links to images
+ * hosted elsewhere are left alone, and nothing is deleted while no Blob
+ * store is set up.
+ */
+function deleteImageLater(workspaceId: string, url: string | null | undefined) {
+  if (!isOfferImageUploadEnabled() || !isUploadedOfferImage(url, workspaceId)) {
+    return;
+  }
+  after(() => deleteUnusedOfferImage(workspaceId, url));
 }
 
 export async function GET(request: NextRequest) {
@@ -138,6 +161,9 @@ export async function GET(request: NextRequest) {
         ...withLink(offer),
         funnel: funnels.get(offer.id) ?? EMPTY_FUNNEL,
       })),
+      // Whether the editor can upload card images (a Vercel Blob store is
+      // connected); without it the editor shows the image-URL field.
+      imageUploadEnabled: isOfferImageUploadEnabled(),
     },
     { headers: { "Cache-Control": "no-store" } }
   );
@@ -205,6 +231,15 @@ export async function PATCH(request: NextRequest) {
     data: parsed.data,
   });
 
+  // A whole offer names its image (null for none); the pause switch keeps
+  // it. Another image, or none, replaced the stored one.
+  if (
+    "cardImageUrl" in parsed.data &&
+    parsed.data.cardImageUrl !== existing.cardImageUrl
+  ) {
+    deleteImageLater(workspaceId, existing.cardImageUrl);
+  }
+
   return NextResponse.json({ success: true, data: withLink(offer) });
 }
 
@@ -256,7 +291,7 @@ export async function DELETE(request: NextRequest) {
 
   const existing = await prisma.offer.findFirst({
     where: { id, workspaceId, archivedAt: null },
-    select: { id: true, firstOfferedAt: true },
+    select: { id: true, firstOfferedAt: true, cardImageUrl: true },
   });
   if (!existing) return fail(404, "Offer not found");
 
@@ -296,6 +331,10 @@ export async function DELETE(request: NextRequest) {
     // workspace.
     prisma.$executeRaw`UPDATE "Automation" SET "offerIds" = array_remove("offerIds", ${id}) WHERE "workspaceId" = ${workspaceId} AND ${id} = ANY("offerIds")`,
   ]);
+
+  // Gone for good, so its image goes too. An archived offer keeps it: the
+  // cards already sent may still show it.
+  if (!used) deleteImageLater(workspaceId, existing.cardImageUrl);
 
   return NextResponse.json({
     success: true,

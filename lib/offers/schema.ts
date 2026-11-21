@@ -35,6 +35,15 @@ export const OFFER_TAG_MAX = 100;
 /** The card's image and the link behind its button. */
 export const OFFER_URL_MAX = 2000;
 
+/**
+ * A card image uploaded in the editor (POST /api/offers/image): at most
+ * 5 MB, and a JPEG, PNG or WebP file. The server tells the type from the
+ * file's first bytes; the editor checks the declared type and the size
+ * before sending, so most wrong files never leave the browser.
+ */
+export const OFFER_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+export const OFFER_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp"] as const;
+
 // A required text: trimmed, then not empty.
 const line = (max: number) => z.string().trim().min(1).max(max);
 

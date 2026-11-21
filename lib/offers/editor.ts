@@ -2,7 +2,8 @@
  * The offer editor's form and the steps between it and the Offers API (R3,
  * R13): the body the editor saves, the tag names a new offer takes from the
  * workspace's tag templates, a funnel stage's share of everyone offered,
- * moving an entry up or down, and cleaning up a campaign's own offer order.
+ * moving an entry up or down, cleaning up a campaign's own offer order and
+ * what went wrong with a card image upload.
  *
  * Kept apart from the pages so it can be unit-tested
  * (__tests__/offers-editor.test.ts). Client-safe: no database, queue or
@@ -17,6 +18,8 @@ import {
 } from "@/lib/campaigns/message-defaults";
 import {
   OFFER_DELAY_MAX_SECONDS,
+  OFFER_IMAGE_MAX_BYTES,
+  OFFER_IMAGE_TYPES,
   REMINDER_DELAY_MAX_HOURS,
 } from "@/lib/offers/schema";
 
@@ -426,6 +429,57 @@ export function moveItem<T>(
   }
   [next[index], next[target]] = [next[target], next[index]];
   return next;
+}
+
+/**
+ * Why a card image could not be uploaded: not a JPEG, PNG or WebP file, too
+ * large, no right to change offers, no Blob store set up (the editor then
+ * shows the image-URL field), or anything else.
+ */
+export type ImageUploadProblem =
+  | "type"
+  | "size"
+  | "forbidden"
+  | "notSetUp"
+  | "failed";
+
+/**
+ * What is wrong with a picked file before it is sent, or null. The browser
+ * names a type for most files; one it cannot name goes to the server, which
+ * tells the type from the content anyway. An empty file is no image.
+ */
+export function imageFileProblem(file: {
+  type: string;
+  size: number;
+}): ImageUploadProblem | null {
+  if (
+    file.size === 0 ||
+    (file.type !== "" &&
+      !(OFFER_IMAGE_TYPES as readonly string[]).includes(file.type))
+  ) {
+    return "type";
+  }
+  if (file.size > OFFER_IMAGE_MAX_BYTES) return "size";
+  return null;
+}
+
+/**
+ * Why POST /api/offers/image failed, from the status alone: on Vercel a body
+ * over 4.5 MB is refused by the platform with a 413 that has no JSON.
+ */
+export function imageUploadProblem(status: number): ImageUploadProblem {
+  switch (status) {
+    case 413:
+      return "size";
+    case 415:
+      return "type";
+    case 403:
+      return "forbidden";
+    case 503:
+      return "notSetUp";
+    default:
+      return "failed";
+  }
 }
 
 /**

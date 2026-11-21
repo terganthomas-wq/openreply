@@ -16,6 +16,8 @@ import {
   firstErrorField,
   firstMissingField,
   followTagTemplates,
+  imageFileProblem,
+  imageUploadProblem,
   moveItem,
   newOfferEditorState,
   offerDefaultsUpdate,
@@ -27,6 +29,7 @@ import {
   type OfferRecord,
 } from "../lib/offers/editor";
 import {
+  OFFER_IMAGE_MAX_BYTES,
   offerFieldsSchema,
   offerInputSchema,
   offerPatchSchema,
@@ -416,5 +419,43 @@ describe("offerDefaultsUpdate", () => {
     expect(merged.success).toBe(true);
     expect(merged.data?.offer.tagTemplates).toEqual(GERMAN.tagTemplates);
     expect(merged.data?.offer.reminderDelayHours).toBe(6);
+  });
+});
+
+describe("card image upload in the editor", () => {
+  it("lets JPEG, PNG and WebP files of up to 5 MB go to the server", () => {
+    for (const type of ["image/jpeg", "image/png", "image/webp"]) {
+      expect(imageFileProblem({ type, size: 300_000 })).toBeNull();
+    }
+    expect(imageFileProblem({ type: "image/png", size: OFFER_IMAGE_MAX_BYTES })).toBeNull();
+    // A type the browser cannot name: the server reads the content.
+    expect(imageFileProblem({ type: "", size: 300_000 })).toBeNull();
+  });
+
+  it("stops other types, empty files and files over 5 MB before they are sent", () => {
+    for (const type of ["image/gif", "image/svg+xml", "image/heic", "text/html", "application/pdf"]) {
+      expect(imageFileProblem({ type, size: 300_000 })).toBe("type");
+    }
+    expect(imageFileProblem({ type: "image/jpeg", size: 0 })).toBe("type");
+    expect(imageFileProblem({ type: "image/jpeg", size: OFFER_IMAGE_MAX_BYTES + 1 })).toBe("size");
+  });
+
+  it("reads what went wrong from the upload's status alone", () => {
+    // 413 also comes from the platform, without JSON (4.5 MB on Vercel).
+    expect(imageUploadProblem(413)).toBe("size");
+    expect(imageUploadProblem(415)).toBe("type");
+    expect(imageUploadProblem(403)).toBe("forbidden");
+    expect(imageUploadProblem(503)).toBe("notSetUp");
+    for (const status of [400, 401, 500, 502]) {
+      expect(imageUploadProblem(status)).toBe("failed");
+    }
+  });
+
+  it("saves an uploaded image's URL as the card image, and a removed one as none", () => {
+    const uploaded =
+      "https://teststore.public.blob.vercel-storage.com/offers/workspace_123/cover-AbC123xYz.jpg";
+
+    expect(offerInputSchema.parse(offerPayload({ ...typedGermanOffer(), cardImageUrl: uploaded })).cardImageUrl).toBe(uploaded);
+    expect(offerInputSchema.parse(offerPayload({ ...typedGermanOffer(), cardImageUrl: "" })).cardImageUrl).toBeNull();
   });
 });

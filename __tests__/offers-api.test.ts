@@ -1,11 +1,12 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 
-const { mockPrisma, mockWorkspaceId, mockContext } = vi.hoisted(() => {
+const { mockPrisma, mockWorkspaceId, mockContext, mockDel, afterCallbacks } = vi.hoisted(() => {
   const mockPrisma = {
     offer: {
       findMany: vi.fn(),
       findFirst: vi.fn(),
+      count: vi.fn(),
       aggregate: vi.fn(),
       create: vi.fn(),
       update: vi.fn(),
@@ -22,7 +23,13 @@ const { mockPrisma, mockWorkspaceId, mockContext } = vi.hoisted(() => {
     $transaction: vi.fn(),
     $executeRaw: vi.fn(),
   };
-  return { mockPrisma, mockWorkspaceId: vi.fn(), mockContext: vi.fn() };
+  return {
+    mockPrisma,
+    mockWorkspaceId: vi.fn(),
+    mockContext: vi.fn(),
+    mockDel: vi.fn(),
+    afterCallbacks: [] as (() => unknown)[],
+  };
 });
 
 vi.mock("@/lib/db/client", () => ({
@@ -38,6 +45,19 @@ vi.mock("@/lib/auth", () => ({
 vi.mock("@/lib/workspace-access", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../lib/workspace-access")>()),
   getCurrentWorkspaceContext: mockContext,
+}));
+
+// Card images uploaded in the editor live in Vercel Blob; nothing here
+// reaches a store.
+vi.mock("@vercel/blob", () => ({ put: vi.fn(), del: mockDel }));
+
+// after() runs its callback once the response is out. Collected here, so a
+// test sees what the response did before it and runs the callbacks itself.
+vi.mock("next/server", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("next/server")>()),
+  after: (callback: () => unknown) => {
+    afterCallbacks.push(callback);
+  },
 }));
 
 import { DELETE, GET, PATCH, POST, PUT } from "../app/api/offers/route";
@@ -159,12 +179,22 @@ function expectOrderCleanup(offerId: string) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  afterCallbacks.length = 0;
+  // No Blob store, whatever the shell running the tests has set.
+  vi.stubEnv("BLOB_READ_WRITE_TOKEN", "");
   mockWorkspaceId.mockResolvedValue(WORKSPACE);
   mockContext.mockResolvedValue({ workspaceId: WORKSPACE, role: "OWNER" });
   mockPrisma.offer.findMany.mockResolvedValue([{ id: "offer_1" }]);
-  // As the lookup selects it: PATCH reads the id, DELETE also the mark the
-  // worker sets once the offer was first started for someone.
-  mockPrisma.offer.findFirst.mockResolvedValue({ id: "offer_1", firstOfferedAt: null });
+  // As the lookup selects it: PATCH reads the id and the card image, DELETE
+  // also the mark the worker sets once the offer was first started for
+  // someone.
+  mockPrisma.offer.findFirst.mockResolvedValue({
+    id: "offer_1",
+    firstOfferedAt: null,
+    cardImageUrl: null,
+  });
+  mockPrisma.offer.count.mockResolvedValue(0);
+  mockDel.mockResolvedValue(undefined);
   mockPrisma.offer.aggregate.mockResolvedValue({ _max: { position: null } });
   mockPrisma.offer.create.mockImplementation(
     async ({ data }: { data: Record<string, unknown> }) =>
@@ -183,6 +213,10 @@ beforeEach(() => {
   mockPrisma.$transaction.mockImplementation(async (operations: unknown) =>
     Array.isArray(operations) ? Promise.all(operations) : operations
   );
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 
 describe("access to /api/offers", () => {
@@ -496,7 +530,7 @@ describe("PATCH /api/offers", () => {
     expect(response.status).toBe(200);
     expect(mockPrisma.offer.findFirst).toHaveBeenCalledWith({
       where: { id: "offer_1", workspaceId: WORKSPACE, archivedAt: null },
-      select: { id: true },
+      select: { id: true, cardImageUrl: true },
     });
     expect(mockPrisma.offer.update).toHaveBeenCalledWith({
       where: { id: "offer_1", workspaceId: WORKSPACE },
@@ -588,7 +622,7 @@ describe("PATCH /api/offers", () => {
       });
       expect(mockPrisma.offer.findFirst).toHaveBeenCalledWith({
         where: { id: "offer_1", workspaceId: WORKSPACE, archivedAt: null },
-        select: { id: true },
+        select: { id: true, cardImageUrl: true },
       });
       expect(mockPrisma.offer.update).not.toHaveBeenCalled();
     }
@@ -780,7 +814,7 @@ describe("DELETE /api/offers", () => {
       expect(response.status).toBe(404);
       expect(mockPrisma.offer.findFirst).toHaveBeenCalledWith({
         where: { id: "offer_1", workspaceId: WORKSPACE, archivedAt: null },
-        select: { id: true, firstOfferedAt: true },
+        select: { id: true, firstOfferedAt: true, cardImageUrl: true },
       });
       expect(mockPrisma.contactOffer.count).not.toHaveBeenCalled();
       expectNoWrites();
@@ -792,5 +826,137 @@ describe("DELETE /api/offers", () => {
 
     expect(response.status).toBe(400);
     expectNoWrites();
+  });
+});
+
+// Spec D2: an image uploaded in the editor goes once no offer shows it, an
+// image hosted anywhere else never. The upload itself and the rules for a
+// URL are in offers-image.test.ts.
+describe("card images uploaded in the editor", () => {
+  // Shaped like a read-write token; a local test value, never a real one.
+  const TOKEN = "vercel_blob_rw_teststore_localtestvalue";
+  const STORE = "https://teststore.public.blob.vercel-storage.com";
+  const UPLOADED = `${STORE}/offers/${WORKSPACE}/cover-AbC123xYz.jpg`;
+  const NEW_UPLOAD = `${STORE}/offers/${WORKSPACE}/cover-NeW456qRs.png`;
+
+  async function runAfterCallbacks() {
+    for (const callback of afterCallbacks.splice(0)) await callback();
+  }
+
+  beforeEach(() => {
+    vi.stubEnv("BLOB_READ_WRITE_TOKEN", TOKEN);
+    mockPrisma.offer.findFirst.mockResolvedValue({
+      id: "offer_1",
+      firstOfferedAt: null,
+      cardImageUrl: UPLOADED,
+    });
+  });
+
+  it("tells the editor whether images can be uploaded", async () => {
+    mockPrisma.offer.findMany.mockResolvedValue([]);
+
+    const withStore = await (await GET(apiRequest("GET"))).json();
+    vi.stubEnv("BLOB_READ_WRITE_TOKEN", "");
+    const withoutStore = await (await GET(apiRequest("GET"))).json();
+
+    expect(withStore).toMatchObject({ success: true, imageUploadEnabled: true });
+    expect(withoutStore).toMatchObject({ success: true, imageUploadEnabled: false });
+  });
+
+  it.each([
+    ["replaced by another upload", NEW_UPLOAD],
+    ["replaced by a link", "https://cdn.example.com/guide-cover.jpg"],
+    ["removed", ""],
+  ])("deletes the stored upload once it is %s, after the response", async (_case, cardImageUrl) => {
+    const response = await patch({ ...validOffer, cardImageUrl });
+
+    expect(response.status).toBe(200);
+    expect(mockDel).not.toHaveBeenCalled();
+    await runAfterCallbacks();
+    // Archived offers count too: no archivedAt in the lookup.
+    expect(mockPrisma.offer.count).toHaveBeenCalledWith({
+      where: { workspaceId: WORKSPACE, cardImageUrl: UPLOADED },
+    });
+    expect(mockDel).toHaveBeenCalledTimes(1);
+    expect(mockDel).toHaveBeenCalledWith(UPLOADED, { token: TOKEN });
+  });
+
+  it("keeps an upload another offer of the workspace still shows", async () => {
+    mockPrisma.offer.count.mockResolvedValue(1);
+
+    await patch({ ...validOffer, cardImageUrl: NEW_UPLOAD });
+    await runAfterCallbacks();
+
+    expect(mockDel).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["the pause switch", { isActive: false }],
+    ["an edit that keeps the image", { ...validOffer, cardImageUrl: UPLOADED }],
+  ])("keeps the image on %s", async (_case, body) => {
+    const response = await patch(body);
+
+    expect(response.status).toBe(200);
+    expect(afterCallbacks).toHaveLength(0);
+    expect(mockDel).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["an image hosted elsewhere", "https://cdn.example.com/guide-cover.jpg"],
+    ["another workspace's upload", `${STORE}/offers/workspace_other/cover-AbC123xYz.jpg`],
+    ["a file outside the offers folder", `${STORE}/avatars/${WORKSPACE}/cover.jpg`],
+  ])("never deletes %s, on an edit or a deletion", async (_case, stored) => {
+    mockPrisma.offer.findFirst.mockResolvedValue({
+      id: "offer_1",
+      firstOfferedAt: null,
+      cardImageUrl: stored,
+    });
+
+    expect((await patch({ ...validOffer, cardImageUrl: NEW_UPLOAD })).status).toBe(200);
+    expect((await remove()).status).toBe(200);
+    await runAfterCallbacks();
+
+    expect(mockPrisma.offer.count).not.toHaveBeenCalled();
+    expect(mockDel).not.toHaveBeenCalled();
+  });
+
+  it("deletes nothing while no Blob store is connected", async () => {
+    vi.stubEnv("BLOB_READ_WRITE_TOKEN", "");
+
+    await patch({ ...validOffer, cardImageUrl: NEW_UPLOAD });
+    await remove();
+
+    expect(afterCallbacks).toHaveLength(0);
+    expect(mockDel).not.toHaveBeenCalled();
+  });
+
+  it("deletes the image of an offer deleted for good, after the response", async () => {
+    const response = await remove();
+
+    expect(await response.json()).toMatchObject({ data: { archived: false } });
+    expect(mockDel).not.toHaveBeenCalled();
+    await runAfterCallbacks();
+    expect(mockDel).toHaveBeenCalledWith(UPLOADED, { token: TOKEN });
+  });
+
+  it("keeps the image of an archived offer: the cards already sent still show it", async () => {
+    mockPrisma.contactOffer.count.mockResolvedValue(2);
+
+    const response = await remove();
+
+    expect(await response.json()).toMatchObject({ data: { archived: true } });
+    expect(afterCallbacks).toHaveLength(0);
+    expect(mockDel).not.toHaveBeenCalled();
+  });
+
+  it("deletes nothing when the edit is refused", async () => {
+    const refused = await patch({ ...validOffer, cardImageUrl: NEW_UPLOAD, cardTitle: "" });
+    mockPrisma.offer.findFirst.mockResolvedValue(null);
+    const missing = await patch({ ...validOffer, cardImageUrl: NEW_UPLOAD });
+
+    expect(refused.status).toBe(400);
+    expect(missing.status).toBe(404);
+    expect(afterCallbacks).toHaveLength(0);
+    expect(mockDel).not.toHaveBeenCalled();
   });
 });

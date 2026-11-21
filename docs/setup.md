@@ -107,6 +107,7 @@ Copy `.env.example` to `.env` for local work, or set these in Vercel and Railway
 | `EMAIL_FROM` | A sender on a domain you verified in Resend. The placeholder will not deliver. |
 | `ALLOWED_EMAILS` | Optional. Comma-separated allowlist of addresses that may sign in, case insensitive. Unset, anyone who reaches your public URL can request a magic link and gets their own workspace, which is worth closing on an instance you run for yourself. |
 | `EMAIL_SERVER` | Optional. An SMTP URL, for example `smtps://login%40example.com:password@mail.example.com:465`. Set it to send magic links through your own mail server instead of Resend; then `RESEND_API_KEY` is not needed. URL-encode special characters in the user and password (`@` becomes `%40`). Port 465 with `smtps://` is implicit TLS, port 587 with `smtp://` is STARTTLS. |
+| `BLOB_READ_WRITE_TOKEN` | Optional, web app only. Lets the offer editor upload card images to Vercel Blob. A Blob store connected to the Vercel project sets it; redeploy afterwards. Unset, the editor asks for a link to the image instead. See [docs/offers.md](offers.md#the-card-image). |
 
 **Direct Meta only.** Leave these unset if all accounts use Zernio:
 
