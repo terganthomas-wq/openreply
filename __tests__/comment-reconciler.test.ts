@@ -7,7 +7,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mockPrisma, queueAdd, readComments } = vi.hoisted(() => ({
+const { mockPrisma, queueAdd, readComments, readMedia } = vi.hoisted(() => ({
   mockPrisma: {
     $queryRaw: vi.fn(),
     automation: { findMany: vi.fn() },
@@ -16,6 +16,7 @@ const { mockPrisma, queueAdd, readComments } = vi.hoisted(() => ({
   },
   queueAdd: vi.fn(),
   readComments: vi.fn(),
+  readMedia: vi.fn(),
 }));
 vi.mock("@/lib/queue/client", () => ({
   getDMQueue: () => ({ add: queueAdd }),
@@ -28,6 +29,7 @@ vi.mock("@/lib/instagram/provider", async (importOriginal) => ({
     accessToken: "local-test",
   }),
   getRecentMediaComments: readComments,
+  getUserMedia: readMedia,
 }));
 
 vi.mock("@/lib/db/client", () => ({ prisma: mockPrisma }));
@@ -235,5 +237,110 @@ describe("comments the worker leaves alone are not swept again", () => {
     await reconcileComments();
 
     expect(enqueuedComments()).toEqual(["question"]);
+  });
+});
+
+describe("campaigns of one account share the sweep's reads", () => {
+  const account = {
+    id: "connection",
+    instagramId: "owner",
+    provider: "META",
+    accessToken: "test",
+  };
+  const anyPost = (id: string, keyword: string) => ({
+    id,
+    name: id,
+    workspaceId: "workspace",
+    postId: null,
+    matchAnyPost: true,
+    matchAnyWord: false,
+    keywords: [keyword],
+    wholeWordMatch: true,
+    ignoreQuestionComments: true,
+    publicReplyEnabled: true,
+    instagramAccount: account,
+  });
+  const comment = (id: string, text: string) => ({
+    id,
+    text,
+    from: { id: `reader-${id}` },
+    timestamp: new Date().toISOString(),
+  });
+
+  beforeEach(() => {
+    queueAdd.mockReset();
+    readMedia.mockReset();
+    readComments.mockReset();
+    mockPrisma.automation.findMany.mockReset();
+    mockPrisma.operationalEvent.create.mockReset();
+    mockPrisma.operationalEvent.create.mockResolvedValue({});
+    mockPrisma.$queryRaw.mockResolvedValue([]);
+    mockPrisma.dmLog.findMany.mockResolvedValue([]);
+    readMedia.mockResolvedValue([{ id: "m1" }, { id: "m2" }]);
+    readComments.mockImplementation(async ({ mediaId }: { mediaId: string }) =>
+      mediaId === "m1"
+        ? [comment("c1", "SCHIMMEL"), comment("c2", "HEIZUNG")]
+        : [comment("c3", "Heizung bitte")]
+    );
+  });
+
+  it("reads the feed once and every post's comments once, however many campaigns", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      anyPost("schimmel", "SCHIMMEL"),
+      anyPost("heizung", "HEIZUNG"),
+      anyPost("kalt", "KALT"),
+    ]);
+
+    await reconcileComments();
+
+    expect(readMedia).toHaveBeenCalledTimes(1);
+    expect(
+      readComments.mock.calls.map(([args]) => args.mediaId).sort()
+    ).toEqual(["m1", "m2"]);
+    // Each campaign still acts on its own matches.
+    expect(
+      queueAdd.mock.calls.map(([, data]) => data.commentId).sort()
+    ).toEqual(["c1", "c2", "c3"]);
+  });
+
+  it("shares a post's comments between its own campaign and an any-post campaign", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      { ...anyPost("post", "HEIZUNG"), postId: "m1", matchAnyPost: false },
+      anyPost("schimmel", "SCHIMMEL"),
+    ]);
+
+    await reconcileComments();
+
+    expect(
+      readComments.mock.calls.map(([args]) => args.mediaId).sort()
+    ).toEqual(["m1", "m2"]);
+  });
+
+  it("reads again in the next sweep", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      anyPost("schimmel", "SCHIMMEL"),
+    ]);
+
+    await reconcileComments();
+    await reconcileComments();
+
+    expect(readMedia).toHaveBeenCalledTimes(2);
+    expect(readComments).toHaveBeenCalledTimes(4);
+  });
+
+  it("shares a failed read without retrying it for every campaign", async () => {
+    readMedia.mockRejectedValue(new Error("Application request limit reached"));
+    mockPrisma.automation.findMany.mockResolvedValue([
+      anyPost("schimmel", "SCHIMMEL"),
+      anyPost("heizung", "HEIZUNG"),
+    ]);
+
+    await reconcileComments();
+
+    expect(readMedia).toHaveBeenCalledTimes(1);
+    expect(readComments).not.toHaveBeenCalled();
+    expect(queueAdd).not.toHaveBeenCalled();
+    // Each campaign records the failure in its own sweep event.
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledTimes(2);
   });
 });
