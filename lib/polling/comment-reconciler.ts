@@ -99,12 +99,14 @@ export async function reconcileComments(): Promise<void> {
 
   const sinceMs = Date.now() - LOOKBACK_HOURS * 60 * 60 * 1000;
   const tokenCache = new Map<string, InstagramContext | null>();
+  const reads: SweepReads = { media: new Map(), comments: new Map() };
 
   for (const automation of automations) {
     const stat = await sweepCampaign({
       automation: automation,
       sinceMs: sinceMs,
       tokenCache: tokenCache,
+      reads: reads,
     }).catch(
       (error): SweepStat => ({
         campaign: automation.name,
@@ -119,10 +121,57 @@ export async function reconcileComments(): Promise<void> {
   }
 }
 
+/**
+ * Reads shared by every campaign in one sweep.
+ *
+ * Campaigns of one account look at the same feed and the same comments. With a
+ * dozen "any post" campaigns, reading them per campaign meant a dozen identical
+ * reads of the media list and of every post's comments in each sweep: enough to
+ * run into Meta's app request limit (error 4), which then also refused DMs. Each
+ * read is made once per sweep and its result, or its failure, is shared. The
+ * lookback is the same for the whole sweep, so it is not part of the key.
+ */
+interface SweepReads {
+  media: Map<string, Promise<string[]>>;
+  comments: Map<string, Promise<InstagramComment[]>>;
+}
+
+function recentMediaIds(
+  reads: SweepReads,
+  accountId: string,
+  context: InstagramContext
+): Promise<string[]> {
+  let media = reads.media.get(accountId);
+  if (!media) {
+    media = getUserMedia({ context, limit: RECENT_MEDIA_LIMIT }).then((rows) =>
+      rows.map((m) => m.id)
+    );
+    reads.media.set(accountId, media);
+  }
+  return media;
+}
+
+function recentComments(
+  reads: SweepReads,
+  accountId: string,
+  context: InstagramContext,
+  mediaId: string,
+  sinceMs: number
+): Promise<InstagramComment[]> {
+  const key = `${accountId}:${mediaId}`;
+  let comments = reads.comments.get(key);
+  if (!comments) {
+    comments = getRecentMediaComments({ context, mediaId, sinceMs });
+    reads.comments.set(key, comments);
+  }
+  return comments;
+}
+
 async function sweepCampaign({
   automation,
   sinceMs,
   tokenCache,
+  reads,
 }: {
   automation: {
     id: string;
@@ -147,6 +196,7 @@ async function sweepCampaign({
   };
   sinceMs: number;
   tokenCache: Map<string, InstagramContext | null>;
+  reads: SweepReads;
 }): Promise<SweepStat> {
   const account = automation.instagramAccount;
   const stat: SweepStat = {
@@ -183,11 +233,7 @@ async function sweepCampaign({
     mediaIds.push(...(await adMediaFor(automation.postId)));
   } else if (automation.matchAnyPost) {
     try {
-      const media = await getUserMedia({
-        context: accessToken,
-        limit: RECENT_MEDIA_LIMIT,
-      });
-      mediaIds.push(...media.map((m) => m.id));
+      mediaIds.push(...(await recentMediaIds(reads, account.id, accessToken)));
     } catch (error) {
       stat.errors.push(`Media list: ${errMessage(error)}`);
     }
@@ -199,11 +245,13 @@ async function sweepCampaign({
   for (const mediaId of mediaIds) {
     let comments: InstagramComment[];
     try {
-      comments = await getRecentMediaComments({
-        context: accessToken,
-        mediaId: mediaId,
-        sinceMs: sinceMs,
-      });
+      comments = await recentComments(
+        reads,
+        account.id,
+        accessToken,
+        mediaId,
+        sinceMs
+      );
     } catch (error) {
       stat.errors.push(`Comments ${mediaId}: ${errMessage(error)}`);
       continue;
