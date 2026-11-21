@@ -124,7 +124,10 @@ curl -X POST https://YOUR-DOMAIN/api/v1/campaigns \
 - **Link.** `trackedDestinationUrl` becomes the DM's tracked link button. As
   the editor does, a `dmMessage` without `{link}` gets ` {link}` appended:
   that is where the link goes when Instagram refuses the button and the text
-  is sent alone (the button DM itself never shows the token).
+  is sent alone (the button DM itself never shows the token). Links
+  (`trackedDestinationUrl`, `secondaryDestinationUrl`, `postUrl`) must be
+  full `http://` or `https://` addresses; `javascript:`, `data:`, `mailto:`
+  and every other scheme are refused with a `400`.
 - **Trigger.** `postId` (an Instagram media id), `"matchAnyPost": true` or
   `"pendingNextReel": true`; words with `keywords`, or `"matchAnyWord": true`.
 - **Account.** `instagramAccountId` names one of the workspace's connected

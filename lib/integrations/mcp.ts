@@ -22,7 +22,7 @@ const fieldHints: Record<string, string> = {
   matchAnyPost: "Answer comments on every post.",
   keywords: "Words that trigger the campaign, spelling variants included.",
   dmMessage: "Text of the DM with the link button.",
-  trackedDestinationUrl: "Where the link button leads, e.g. a Google Drive share link. Clicks are tracked.",
+  trackedDestinationUrl: "Where the link button leads: an http:// or https:// address, e.g. a Google Drive share link. Clicks are tracked.",
   isActive: "true starts answering comments at once. Default: false, the campaign is created paused.",
   offersEnabled: "Offer the workspace's lead magnets after the link (needs the opening DM).",
   offerIds: "Custom offer order. Empty: the workspace's default order.",

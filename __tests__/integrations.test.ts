@@ -18,6 +18,8 @@ import { checkOrigin, readJson } from "../lib/integrations/http";
 import { getCampaign } from "../lib/integrations/campaigns";
 import { callTool, listTools } from "../lib/integrations/mcp";
 import { builtInMessageDefaults, type MessageDefaults } from "../lib/campaigns/message-defaults";
+import { WEB_LINK_MESSAGE } from "../lib/campaigns/schema";
+import { keyAccess } from "../lib/integrations/scopes";
 import { GET as listKeys, POST as createKey, DELETE as revokeKey } from "../app/api/integrations/keys/route";
 import { POST as mcp } from "../app/api/mcp/route";
 import { GET as rest, POST as restCreate } from "../app/api/v1/campaigns/route";
@@ -113,6 +115,15 @@ describe("key management", () => {
   it.each([[["campaigns:delete"]], [["campaigns:read", "contacts:read"]], [[]], [["campaigns:read", "campaigns:write", "campaigns:read"]]])("rejects the scopes %j", async scopes => {
     expect((await createKey(request({ name: "Reel publisher", scopes }))).status).toBe(400);
     expect(state.keys.create).not.toHaveBeenCalled();
+  });
+  it("names a stored key by its scopes as the form does, in any order", () => {
+    expect(keyAccess(["campaigns:read"])).toBe("read");
+    expect(keyAccess(["campaigns:read", "campaigns:write"])).toBe("write");
+    expect(keyAccess(["campaigns:write", "campaigns:read"])).toBe("write");
+    expect(keyAccess(["campaigns:write"])).toBe("createOnly");
+    for (const scopes of [[], ["campaigns:delete"], ["campaigns:read", "contacts:read"]]) {
+      expect(keyAccess(scopes), scopes.join(" ")).toBeNull();
+    }
   });
   it("lists safe workspace metadata and revokes only workspace keys", async () => {
     expect((await listKeys()).status).toBe(200);
@@ -370,6 +381,34 @@ describe("creating campaigns (campaigns:write)", () => {
     expect(misspelt.result.isError).toBe(true);
     expect(misspelt.result.content[0].text).toContain('Unrecognized key: "colour"');
     expect(state.campaigns.create).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["trackedDestinationUrl", "javascript:alert(document.cookie)"],
+    ["trackedDestinationUrl", "data:text/html,<script>alert(1)</script>"],
+    ["trackedDestinationUrl", "mailto:someone@example.com"],
+    ["secondaryDestinationUrl", "vbscript:msgbox(1)"],
+    ["secondaryDestinationUrl", "file:///etc/passwd"],
+    ["postUrl", "javascript:alert(1)"],
+  ])("refuses a %s of %j over REST and MCP and stores nothing", async (field, link) => {
+    const body = { ...reel, [field]: link };
+    const error = `Invalid campaign: ${field}: ${WEB_LINK_MESSAGE}`;
+    const response = await restCreate(post(body));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error });
+    const called = await (await mcp(callCreate(7, body))).json();
+    expect(called.result).toEqual({ isError: true, content: [{ type: "text", text: error }] });
+    expect(state.campaigns.create).not.toHaveBeenCalled();
+  });
+
+  it("creates with http links and tells MCP clients which links it takes", async () => {
+    const body = { ...reel, trackedDestinationUrl: "http://example.com/guide", secondaryDestinationUrl: "https://example.com/second" };
+    expect((await restCreate(post(body))).status).toBe(201);
+    expect(created().trackedLinks.create.map((link: { destinationUrl: string }) => link.destinationUrl))
+      .toEqual(["http://example.com/guide", "https://example.com/second"]);
+    const listed = await (await mcp(request({ jsonrpc: "2.0", id: 8, method: "tools/list" }))).json();
+    const tool = listed.result.tools.find((entry: { name: string }) => entry.name === "create_campaign");
+    expect(tool.inputSchema.properties.trackedDestinationUrl.description).toContain("http:// or https://");
   });
 
   it("answers a create-only key with its campaign but lets it read nothing else", async () => {

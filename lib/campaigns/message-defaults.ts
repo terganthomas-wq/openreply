@@ -237,7 +237,10 @@ export const EMPTY_MESSAGE_DEFAULTS: MessageDefaults = {
  * The built-in sets, by interface language. German follows the user's
  * ManyChat templates (spec, "German default texts"), with the informal "du".
  * The spec's second offer text named the user's own niche; here it is
- * neutral, as is everything else.
+ * neutral, as is everything else. The last offer message does not say the
+ * guide is free because the person follows: after the second follow request
+ * the link goes out without another check (R9b), so that may not be true.
+ * Workspaces seeded before keep the texts they have.
  */
 export const BUILT_IN_MESSAGE_DEFAULTS: Partial<
   Record<Locale, MessageDefaults>
@@ -273,7 +276,7 @@ export const BUILT_IN_MESSAGE_DEFAULTS: Partial<
       offerMessages: [
         "Ich hab übrigens noch einen ausführlichen Guide geschrieben.",
         "Er hilft dir, noch mehr aus dem Thema herauszuholen.",
-        "Soll ich ihn dir schicken? Da du mir folgst, ist er für dich kostenlos :)",
+        "Soll ich ihn dir schicken? Er ist für dich kostenlos :)",
       ],
       offerDelaysSeconds: [5, 3, 2],
       offerButtonLabel: "Ja, gerne! 🙌",

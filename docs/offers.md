@@ -34,8 +34,9 @@ and the offer's name, for example "Guide angeboten" and "[LM] Guide
 gesendet"; you can change them under **Tags** in the editor. The funnel on
 the Offers page counts the same stages, each as a share of everyone offered:
 a reminder counts as sent without any interest, so the stages are not
-nested. "Stopped early" counts offers that ended before the person got the
-link, for example because the messaging window closed.
+nested, and sent and clicked can be higher than interested (the page then
+says why under the tiles). "Stopped early" counts offers that ended before
+the person got the link, for example because the messaging window closed.
 
 ## Which offer a campaign uses
 

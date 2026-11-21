@@ -201,6 +201,26 @@ describe("GET", () => {
     expect(mockI18n).not.toHaveBeenCalled();
   });
 
+  it("keeps a workspace seeded with an earlier built-in offer text as it was", async () => {
+    // The built-in third offer message used to say the guide is free
+    // "because you follow me". Workspaces seeded with it keep it: only the
+    // workspace's owners and admins change their texts.
+    const seededEarlier: MessageDefaults = {
+      ...german,
+      offer: {
+        ...german.offer,
+        offerMessages: [
+          ...german.offer.offerMessages.slice(0, 2),
+          "Soll ich ihn dir schicken? Da du mir folgst, ist er für dich kostenlos :)",
+        ],
+      },
+    };
+    signIn("OWNER", seededEarlier);
+
+    expect((await (await GET()).json()).data.defaults).toEqual(seededEarlier);
+    expectNoWrites();
+  });
+
   it("returns what a concurrent save wrote when the seed found the column taken", async () => {
     mockPrisma.workspace.updateMany.mockResolvedValue({ count: 0 });
     mockPrisma.workspace.findUnique.mockResolvedValue({ messageDefaults: saved });

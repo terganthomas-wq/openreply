@@ -38,13 +38,35 @@ export function offerRuleViolated(campaign: {
 // Offer ids are cuids; the caps only bound the request.
 const offerIdList = z.array(z.string().min(1).max(40)).max(20);
 
+export const WEB_LINK_MESSAGE =
+  "Must be a full web address that starts with http:// or https://";
+
+/**
+ * A link a campaign sends or shows: where its DM buttons lead (behind the
+ * tracked /r/ redirect) and its post's link on the campaigns page. http: and
+ * https: only: z.url() alone also takes javascript:, data:, mailto: and every
+ * other scheme the URL parser knows. With zod's own http(s) pattern the "//"
+ * is needed too ("https:example.com" is refused). Unlike z.httpUrl() any host
+ * name passes, so a link a campaign already has (an IDN domain such as .рф, a
+ * host with an underscore) still saves.
+ */
+export const webLink = z.url({
+  protocol: z.regexes.httpProtocol,
+  error: WEB_LINK_MESSAGE,
+});
+
+/** Whether a typed link passes webLink, for the editor's own check. */
+export function isWebLink(value: string): boolean {
+  return webLink.safeParse(value).success;
+}
+
 export const createAutomationSchema = z
   .object({
     name: z.string().min(1).max(100),
     goal: z.string().min(1).max(120).optional().nullable(),
     instagramAccountId: z.string().min(1).optional().nullable(),
     postId: z.string().min(1).optional().nullable(),
-    postUrl: z.string().url().optional().nullable(),
+    postUrl: webLink.optional().nullable(),
     pendingNextReel: z.boolean().optional().default(false),
     matchAnyPost: z.boolean().optional().default(false),
     keywords: z.array(z.string().min(1).max(50)).max(10).optional().default([]),
@@ -72,12 +94,12 @@ export const createAutomationSchema = z
       .default([]),
     // Empty string means "no tracked link"; a URL sets one.
     trackedDestinationUrl: z
-      .union([z.string().url(), z.literal("")])
+      .union([webLink, z.literal("")])
       .optional()
       .nullable(),
     // Optional second tracked link, rendered as a second DM button.
     secondaryDestinationUrl: z
-      .union([z.string().url(), z.literal("")])
+      .union([webLink, z.literal("")])
       .optional()
       .nullable(),
     secondaryButtonLabel: utf16Max(BUTTON_LABEL_MAX).optional().nullable(),
@@ -131,7 +153,7 @@ export const updateAutomationSchema = z.object({
   goal: z.string().min(1).max(120).optional().nullable(),
   instagramAccountId: z.string().min(1).optional(),
   postId: z.string().min(1).optional().nullable(),
-  postUrl: z.string().url().optional().nullable(),
+  postUrl: webLink.optional().nullable(),
   pendingNextReel: z.boolean().optional(),
   matchAnyPost: z.boolean().optional(),
   keywords: z.array(z.string().min(1).max(50)).max(10).optional(),
@@ -157,12 +179,12 @@ export const updateAutomationSchema = z.object({
   // Empty string clears the tracked link; a URL updates/creates it; undefined
   // leaves it unchanged.
   trackedDestinationUrl: z
-    .union([z.string().url(), z.literal("")])
+    .union([webLink, z.literal("")])
     .optional()
     .nullable(),
   // Same semantics for the optional second tracked link / DM button.
   secondaryDestinationUrl: z
-    .union([z.string().url(), z.literal("")])
+    .union([webLink, z.literal("")])
     .optional()
     .nullable(),
   secondaryButtonLabel: utf16Max(BUTTON_LABEL_MAX).optional().nullable(),

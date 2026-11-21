@@ -38,7 +38,7 @@ import {
   builtInMessageDefaults,
   type MessageDefaults,
 } from "../lib/campaigns/message-defaults";
-import { createAutomationSchema } from "../lib/campaigns/schema";
+import { createAutomationSchema, isWebLink } from "../lib/campaigns/schema";
 
 const german = builtInMessageDefaults("de") as MessageDefaults;
 
@@ -386,5 +386,32 @@ describe("campaignDefaultsFor", () => {
 
     expect(await campaignDefaultsFor("workspace_gone")).toEqual({});
     expect(mockPrisma.workspace.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+// The campaign editor checks its links with this before it saves, as the
+// API's schemas do.
+describe("isWebLink", () => {
+  it.each([
+    "https://drive.google.com/file/d/abc/view?usp=sharing",
+    "http://example.com/guide",
+    "HTTPS://Example.com/guide",
+    // Host names z.httpUrl() refuses: links campaigns may already store.
+    "https://пример.рф/guide",
+    "https://my_site.example.com/guide",
+  ])("takes %j", (link) => {
+    expect(isWebLink(link)).toBe(true);
+  });
+
+  it.each([
+    "javascript:alert(1)",
+    "data:text/html,<script>alert(1)</script>",
+    "mailto:someone@example.com",
+    "ftp://example.com/guide",
+    "https:example.com/guide",
+    "example.com/guide",
+    "",
+  ])("refuses %j", (link) => {
+    expect(isWebLink(link)).toBe(false);
   });
 });

@@ -44,7 +44,28 @@ vi.mock("@/lib/campaigns/links", async (importOriginal) => ({
 }));
 
 import { PATCH, POST } from "../app/api/automations/route";
-import { OFFER_RULE_MESSAGE } from "../lib/campaigns/schema";
+import { OFFER_RULE_MESSAGE, WEB_LINK_MESSAGE } from "../lib/campaigns/schema";
+
+// Links that are no web links. Each would end up behind a DM button (the
+// tracked /r/ redirect) or as the post's link on the campaigns page.
+const NOT_WEB_LINKS = [
+  "javascript:alert(document.cookie)",
+  "JavaScript:alert(1)",
+  "data:text/html,<script>alert(1)</script>",
+  "vbscript:msgbox(1)",
+  "file:///etc/passwd",
+  "mailto:someone@example.com",
+  "ftp://example.com/guide.pdf",
+  "https:example.com/guide",
+];
+const LINK_FIELDS = [
+  "trackedDestinationUrl",
+  "secondaryDestinationUrl",
+  "postUrl",
+] as const;
+const BAD_LINKS = LINK_FIELDS.flatMap((field) =>
+  NOT_WEB_LINKS.map((link) => [field, link] as const)
+);
 
 // 11 units of text plus five emoji of two units each: 21 UTF-16 units but
 // only 16 code points, so zod's own .max(20) would let it through.
@@ -355,6 +376,36 @@ describe("POST /api/automations", () => {
 
     expect(createData().deliveryTag).toBeNull();
   });
+
+  it.each(BAD_LINKS)("refuses a %s of %j and stores nothing", async (field, link) => {
+    const response = await POST(postRequest({ ...newCampaign, [field]: link }));
+
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.details.fieldErrors[field]).toEqual([WEB_LINK_MESSAGE]);
+    expect(mockPrisma.automation.create).not.toHaveBeenCalled();
+  });
+
+  it("stores http and https links", async () => {
+    const response = await POST(
+      postRequest({
+        ...newCampaign,
+        matchAnyPost: false,
+        postId: "media_1",
+        postUrl: "https://www.instagram.com/reel/abc/",
+        trackedDestinationUrl: " http://example.com/guide ",
+        secondaryDestinationUrl: "HTTPS://Example.com/second",
+      })
+    );
+
+    expect(response.status).toBe(201);
+    expect(createData().postUrl).toBe("https://www.instagram.com/reel/abc/");
+    expect(
+      createData().trackedLinks.create.map(
+        (link: { destinationUrl: string }) => link.destinationUrl
+      )
+    ).toEqual(["http://example.com/guide", "HTTPS://Example.com/second"]);
+  });
 });
 
 describe("PATCH /api/automations", () => {
@@ -567,5 +618,39 @@ describe("PATCH /api/automations", () => {
     expect(response.status).toBe(200);
     expect(updateData()).toEqual({ offerIds: [] });
     expect(mockPrisma.offer.count).not.toHaveBeenCalled();
+  });
+
+  it.each(BAD_LINKS)("refuses a %s of %j and changes nothing", async (field, link) => {
+    const response = await PATCH(patchRequest({ [field]: link }));
+
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.details.fieldErrors[field]).toEqual([WEB_LINK_MESSAGE]);
+    expect(mockPrisma.automation.update).not.toHaveBeenCalled();
+    expect(mockSyncCampaignLinks).not.toHaveBeenCalled();
+  });
+
+  it("saves an https link and an http second link, and clears a link with an empty string", async () => {
+    const saved = await PATCH(
+      patchRequest({
+        trackedDestinationUrl: "https://drive.google.com/file/d/abc/view?usp=sharing",
+        secondaryDestinationUrl: "http://example.com/second",
+      })
+    );
+    expect(saved.status).toBe(200);
+    expect(mockSyncCampaignLinks).toHaveBeenCalledWith(mockPrisma, {
+      workspaceId: "workspace_123",
+      automationId: "automation_123",
+      primaryUrl: "https://drive.google.com/file/d/abc/view?usp=sharing",
+      secondaryUrl: "http://example.com/second",
+      secondaryLabel: undefined,
+    });
+
+    const cleared = await PATCH(patchRequest({ secondaryDestinationUrl: "" }));
+    expect(cleared.status).toBe(200);
+    expect(mockSyncCampaignLinks).toHaveBeenLastCalledWith(
+      mockPrisma,
+      expect.objectContaining({ primaryUrl: undefined, secondaryUrl: "" })
+    );
   });
 });

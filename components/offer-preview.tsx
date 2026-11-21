@@ -6,10 +6,10 @@
  * Offer Preview
  *
  * An offer's DM thread on the campaign preview's phone: the offer messages
- * with the pauses before them, the button and a tap on it, the
- * confirmations, the card, and the reminder that goes out instead when
- * nobody taps. The thread scrolls inside the phone, which is shorter than a
- * whole offer.
+ * with the pauses before them and the button, then the two ways it goes on:
+ * a tap on it with the confirmations and the card, and, as its own branch,
+ * the reminder that goes out instead when nobody taps. The thread scrolls
+ * inside the phone, which is shorter than a whole offer.
  */
 
 import {
@@ -51,6 +51,17 @@ function render(text: string) {
 
 function Note({ children }: { children: React.ReactNode }) {
   return <p className="py-1 text-center text-[11px] text-zinc-500">{children}</p>;
+}
+
+// Where the thread splits after the offer: a line with the branch's name.
+function BranchLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex items-center gap-2 py-1 text-[11px] font-medium text-zinc-400">
+      <span className="h-px flex-1 bg-zinc-700" />
+      <span className="max-w-[80%] text-center">{children}</span>
+      <span className="h-px flex-1 bg-zinc-700" />
+    </div>
+  );
 }
 
 function Pause({ seconds }: { seconds: number }) {
@@ -130,6 +141,12 @@ export default function OfferPreview(props: OfferPreviewProps) {
               />
             </div>
           ))}
+
+          {/* Two branches from here: a tap gets the confirmations and the
+              card, no tap gets the reminder instead. Shown one after the
+              other, each under its own label, so the reminder never reads
+              as a message that follows the card. */}
+          {props.reminderEnabled && <BranchLabel>{t("If they tap")}</BranchLabel>}
           <TapBubble label={offerButton} />
 
           {props.confirmationMessages.map((message, i) => (
@@ -171,11 +188,15 @@ export default function OfferPreview(props: OfferPreviewProps) {
 
           {props.reminderEnabled && (
             <>
-              <Note>
-                {t("{hours} h later if they don't tap", {
-                  hours: props.reminderDelayHours,
-                })}
-              </Note>
+              {/* Counted from the offer's last message, not from the card. */}
+              <BranchLabel>
+                {t(
+                  props.reminderDelayHours === 1
+                    ? "If they don't tap: after {hours} hour"
+                    : "If they don't tap: after {hours} hours",
+                  { hours: props.reminderDelayHours }
+                )}
+              </BranchLabel>
               <BotBubble
                 avatarUrl={avatarUrl}
                 text={

@@ -45,7 +45,7 @@ import {
   withImportRow,
   type CampaignDefaults,
 } from "@/lib/campaigns/message-defaults";
-import { offerRuleViolated } from "@/lib/campaigns/schema";
+import { isWebLink, offerRuleViolated } from "@/lib/campaigns/schema";
 import { cleanCustomOrder } from "@/lib/offers/editor";
 
 type TriggerScope = "specific" | "any" | "next";
@@ -680,6 +680,14 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
       return setError(t("Offers need the opening DM: Instagram only allows them after the person taps a button."));
     if (offersEnabled && offerOrderMode === "custom" && customOfferIds.length === 0)
       return setError(t("Add at least one offer to the custom order, or use the default order."));
+    // The API takes http(s) links only (webLink); said here in the
+    // interface language instead of the API's English.
+    if (
+      [trackedDestinationUrl, secondaryDestinationUrl].some(
+        (link) => link.trim() !== "" && !isWebLink(link.trim())
+      )
+    )
+      return setError(t("Enter the full link, starting with https://."));
 
     setSaving(true);
 

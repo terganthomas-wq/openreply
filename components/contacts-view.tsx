@@ -303,16 +303,29 @@ export default function ContactsView({
           aria-busy={loading}
         >
           {/* Five columns don't fit a phone: the table keeps its width and
-              scrolls inside the panel. */}
+              scrolls inside the panel. Wider, it takes the panel's width and
+              no more: the columns are fixed (table-fixed), so a long handle,
+              account name or tag is cut with "…" (the whole text in its
+              tooltip) instead of widening the table past a 1280 px screen.
+              The two times keep a width that holds them on one line in each
+              interface language (zh-TW and pt-BR are the longest). */}
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[880px] text-sm">
+            <table className="w-full min-w-[880px] table-fixed text-sm">
+              <colgroup>
+                <col className="w-[20%]" />
+                <col className="w-[14%]" />
+                {/* Tags: what is left. */}
+                <col />
+                <col className="w-50" />
+                <col className="w-50" />
+              </colgroup>
               <thead>
                 <tr className="border-b border-border text-left">
-                  <th className="px-4 py-4 text-xs font-semibold uppercase tracking-wider text-muted sm:px-6">{t("Contact")}</th>
-                  <th className="px-4 py-4 text-xs font-semibold uppercase tracking-wider text-muted sm:px-6">{t("Account")}</th>
-                  <th className="px-4 py-4 text-xs font-semibold uppercase tracking-wider text-muted sm:px-6">{t("Tags")}</th>
-                  <th className="px-4 py-4 text-xs font-semibold uppercase tracking-wider text-muted sm:px-6">{t("Last tap or DM")}</th>
-                  <th className="px-4 py-4 text-xs font-semibold uppercase tracking-wider text-muted sm:px-6">{t("Last seen")}</th>
+                  <th className="px-4 py-4 text-xs font-semibold uppercase tracking-wider text-muted">{t("Contact")}</th>
+                  <th className="px-4 py-4 text-xs font-semibold uppercase tracking-wider text-muted">{t("Account")}</th>
+                  <th className="px-4 py-4 text-xs font-semibold uppercase tracking-wider text-muted">{t("Tags")}</th>
+                  <th className="px-4 py-4 text-xs font-semibold uppercase tracking-wider text-muted">{t("Last tap or DM")}</th>
+                  <th className="px-4 py-4 text-xs font-semibold uppercase tracking-wider text-muted">{t("Last seen")}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-border">
@@ -325,43 +338,50 @@ export default function ContactsView({
                     : contact.tags;
                   const shown = tags.slice(0, TAGS_PER_ROW);
                   const more = tags.length - shown.length;
+                  const handle = contact.username
+                    ? `@${contact.username}`
+                    : contact.igsid;
+                  const account = `@${contact.instagramAccount.username}`;
                   return (
                     <tr key={contact.id} className="hover:bg-surface-hover/50">
-                      <td className="px-4 py-3 sm:px-6">
+                      <td className="px-4 py-3">
                         <Link
                           href={`/contacts/${contact.id}`}
                           prefetch={false}
-                          className="font-medium text-foreground hover:text-accent"
+                          title={handle}
+                          className="block truncate font-medium text-foreground hover:text-accent"
                         >
                           {contact.username ? (
-                            `@${contact.username}`
+                            handle
                           ) : (
-                            <span className="font-mono text-xs">{contact.igsid}</span>
+                            <span className="font-mono text-xs">{handle}</span>
                           )}
                         </Link>
                       </td>
-                      <td className="px-4 py-3 text-muted sm:px-6">
-                        @{contact.instagramAccount.username}
+                      <td title={account} className="truncate px-4 py-3 text-muted">
+                        {account}
                       </td>
-                      <td className="px-4 py-3 sm:px-6">
+                      <td className="px-4 py-3">
                         {shown.length === 0 ? (
                           <span className="text-muted">—</span>
                         ) : (
-                          // Chips keep their width (up to 12rem), so the
-                          // column grows instead of cutting every tag short.
-                          <div className="flex max-w-sm flex-wrap gap-1">
+                          // A chip is at most as wide as the column; a
+                          // longer tag is cut, whole in its tooltip.
+                          <div className="flex flex-wrap gap-1">
                             {shown.map((entry) => (
                               <span
                                 key={entry.tag}
                                 title={entry.tag}
-                                className="max-w-[12rem] shrink-0 truncate rounded-md border border-accent/10 bg-accent/10 px-2 py-0.5 text-xs font-medium text-accent"
+                                className="max-w-full truncate rounded-md border border-accent/10 bg-accent/10 px-2 py-0.5 text-xs font-medium text-accent"
                               >
                                 {entry.tag}
                               </span>
                             ))}
                             {more > 0 && (
                               <span
-                                title={t("{count} more tags", { count: more })}
+                                title={t(more === 1 ? "{count} more tag" : "{count} more tags", {
+                                  count: more,
+                                })}
                                 className="rounded-md border border-border px-2 py-0.5 text-xs text-muted"
                               >
                                 +{more}
@@ -370,12 +390,12 @@ export default function ContactsView({
                           </div>
                         )}
                       </td>
-                      <td className="whitespace-nowrap px-4 py-3 text-muted sm:px-6">
+                      <td className="whitespace-nowrap px-4 py-3 text-muted">
                         {contact.lastInteractionAt
                           ? formatTime(contact.lastInteractionAt)
                           : "—"}
                       </td>
-                      <td className="whitespace-nowrap px-4 py-3 text-muted sm:px-6">
+                      <td className="whitespace-nowrap px-4 py-3 text-muted">
                         {formatTime(contact.updatedAt)}
                       </td>
                     </tr>
@@ -386,7 +406,7 @@ export default function ContactsView({
           </div>
 
           {pagination.totalPages > 1 && (
-            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-4 py-4 sm:px-6">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-4 py-4">
               <p className="text-xs text-muted">
                 {t("Showing {start}–{end} of {total}", {
                   start: (pagination.page - 1) * pagination.limit + 1,

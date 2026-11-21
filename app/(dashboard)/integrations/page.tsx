@@ -2,17 +2,19 @@
 
 import { useEffect, useState } from "react";
 import { useI18n } from "@/lib/i18n/provider";
-import type { SERVICE_SCOPES } from "@/lib/integrations/scopes";
+import { ACCESS_SCOPES, keyAccess, type KeyAccess } from "@/lib/integrations/scopes";
 
 type Key = { id: string; name: string; scopes: string[]; expiresAt: string; revokedAt: string | null };
-type Access = "read" | "write";
+// The two kinds of key the form creates.
+type Access = Exclude<KeyAccess, "createOnly">;
 
-// A key that creates campaigns reads them too: get_campaign is how a client
-// checks what it made.
-const ACCESS_SCOPES: Record<Access, (typeof SERVICE_SCOPES)[number][]> = {
-  read: ["campaigns:read"],
-  write: ["campaigns:read", "campaigns:write"],
-};
+// The form's words for each kind, also in the key list, which names a key by
+// its scopes. A key with campaigns:write alone comes only from the API.
+const ACCESS_LABELS = {
+  read: "Read only",
+  write: "Read and write",
+  createOnly: "Write only",
+} as const satisfies Record<KeyAccess, string>;
 
 export default function IntegrationsPage() {
   const { t, locale } = useI18n();
@@ -71,8 +73,8 @@ export default function IntegrationsPage() {
     <section className="space-y-3 rounded border border-border p-4">
       <label className="block">{t("Key name")}<input maxLength={100} disabled={busy} className="w-full rounded border border-border p-2" value={name} onChange={e => setName(e.target.value)} /></label>
       <label className="block">{t("Access")}<select disabled={busy} value={access} onChange={e => setAccess(e.target.value as Access)} className="ml-3 rounded border border-border p-2">
-        <option value="read">{t("Read only")}</option>
-        <option value="write">{t("Read and write")}</option>
+        <option value="read">{t(ACCESS_LABELS.read)}</option>
+        <option value="write">{t(ACCESS_LABELS.write)}</option>
       </select></label>
       <label className="block">{t("Key lifetime")}<select disabled={busy} value={days} onChange={e => setDays(Number(e.target.value))} className="ml-3 rounded border border-border p-2">
         {[30, 60, 90].map(value => <option key={value} value={value}>{t("{days} days", { days: value })}</option>)}
@@ -86,11 +88,15 @@ export default function IntegrationsPage() {
         <button className="ml-4" onClick={() => setToken("")}>{t("Hide key")}</button>
       </div>}
     </section>
-    <section className="space-y-3">{keys.map(key => <div key={key.id} className="rounded border border-border p-4">
-      <strong className="break-words">{key.name}</strong>
-      <p className="text-sm">{key.scopes.join(" + ")} · {t("Expires: {date}", { date: new Date(key.expiresAt).toLocaleDateString(locale) })}</p>
-      {key.revokedAt ? <span>{t("Revoked")}</span> : <button disabled={busy} onClick={() => revoke(key)} className="text-red-500">{t("Revoke key")}</button>}
-    </div>)}</section>
+    <section className="space-y-3">{keys.map(key => {
+      // Scopes that are no kind (the keys route stores none) show as stored.
+      const access = keyAccess(key.scopes);
+      return <div key={key.id} className="rounded border border-border p-4">
+        <strong className="break-words">{key.name}</strong>
+        <p className="text-sm">{access ? t(ACCESS_LABELS[access]) : key.scopes.join(" + ")} · {t("Expires: {date}", { date: new Date(key.expiresAt).toLocaleDateString(locale) })}</p>
+        {key.revokedAt ? <span>{t("Revoked")}</span> : <button disabled={busy} onClick={() => revoke(key)} className="text-red-500">{t("Revoke key")}</button>}
+      </div>;
+    })}</section>
     <section className="space-y-2 text-sm">
       <h2 className="font-semibold">{t("Connection")}</h2>
       <p>MCP: <code>/api/mcp</code> · REST: <code>/api/v1/campaigns</code></p>

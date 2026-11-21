@@ -34,7 +34,7 @@ vi.mock("@/lib/workspace-access", () => ({
 
 import { POST as importCampaigns } from "../app/api/automations/import/route";
 import { POST as createCampaign } from "../app/api/automations/route";
-import { OFFER_RULE_MESSAGE } from "../lib/campaigns/schema";
+import { OFFER_RULE_MESSAGE, WEB_LINK_MESSAGE } from "../lib/campaigns/schema";
 
 // A row as the CSV-era import took it.
 const olderRow = {
@@ -256,6 +256,24 @@ describe("POST /api/automations/import", () => {
       fields: { offersEnabled: true },
       field: "offersEnabled",
       message: OFFER_RULE_MESSAGE,
+    },
+    {
+      label: "a javascript: link",
+      fields: { trackedDestinationUrl: "javascript:alert(document.cookie)" },
+      field: "trackedDestinationUrl",
+      message: WEB_LINK_MESSAGE,
+    },
+    {
+      label: "a data: second link",
+      fields: { secondaryDestinationUrl: "data:text/html,<script>alert(1)</script>" },
+      field: "secondaryDestinationUrl",
+      message: WEB_LINK_MESSAGE,
+    },
+    {
+      label: "a javascript: post link",
+      fields: { postUrl: "javascript:alert(1)" },
+      field: "postUrl",
+      message: WEB_LINK_MESSAGE,
     },
   ])(
     "imports nothing when a row has $label, and names the row",

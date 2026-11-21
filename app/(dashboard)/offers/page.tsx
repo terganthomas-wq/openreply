@@ -211,27 +211,48 @@ export default function OffersPage() {
         </div>
       </div>
 
-      {error && (
-        <div
-          role="alert"
-          className="rounded border border-error/20 bg-error/10 p-3 text-sm text-error"
-        >
-          {error}
-        </div>
-      )}
-      {notice && (
-        <div
-          role="status"
-          className="flex items-start justify-between gap-3 rounded border border-warning/30 bg-warning/10 p-3 text-sm text-foreground"
-        >
-          <span className="min-w-0 break-words">{notice}</span>
-          <button
-            type="button"
-            onClick={() => setNotice(null)}
-            className="shrink-0 text-xs text-muted hover:text-foreground"
-          >
-            {t("Close")}
-          </button>
+      {/* What a pause, move or delete did, fixed to the bottom of the
+          screen: above the list it was out of view on a phone whenever the
+          offer acted on was further down. */}
+      {(error || notice) && (
+        <div className="fixed bottom-4 left-4 right-4 z-30 space-y-2 sm:bottom-6 sm:left-auto sm:right-6 sm:w-[26rem]">
+          {error && (
+            <div
+              role="alert"
+              className="overflow-hidden rounded border border-error/20 bg-background shadow-lg"
+            >
+              <div className="flex items-start justify-between gap-3 bg-error/10 p-3 text-sm text-error">
+                <span className="min-w-0 break-words">{error}</span>
+                <button
+                  type="button"
+                  onClick={() => setError(null)}
+                  className="shrink-0 text-xs text-muted hover:text-foreground"
+                >
+                  {t("Close")}
+                </button>
+              </div>
+            </div>
+          )}
+          {notice && (
+            <div
+              role="status"
+              className="overflow-hidden rounded border border-warning/30 bg-background shadow-lg"
+            >
+              <div className="flex items-start justify-between gap-3 bg-warning/10 p-3 text-sm text-foreground">
+                {/* A long list of campaign names scrolls; Close stays. */}
+                <span className="max-h-[40dvh] min-w-0 overflow-y-auto break-words">
+                  {notice}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setNotice(null)}
+                  className="shrink-0 text-xs text-muted hover:text-foreground"
+                >
+                  {t("Close")}
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -394,6 +415,16 @@ export default function OffersPage() {
                   </Link>
                 ))}
               </div>
+              {/* The stages are not steps one after the other: the reminder
+                  sends the link without a tap. Said once the numbers show
+                  it, so a higher count after Interested is not taken for an
+                  error. */}
+              {(funnel.sent > funnel.interested ||
+                funnel.clicked > funnel.interested) && (
+                <p className="mt-2 text-xs text-muted">
+                  {t("“Sent” and “Clicked” also count people who got the link from the reminder without tapping the button, so these numbers can be higher than “Interested”.")}
+                </p>
+              )}
               {funnel.stopped > 0 && (
                 <p className="mt-2 text-xs text-muted">
                   {t("{count} stopped early", { count: funnel.stopped })}

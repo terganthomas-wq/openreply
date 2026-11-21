@@ -134,7 +134,7 @@ describe("the built-in German defaults", () => {
       offerMessages: [
         "Ich hab übrigens noch einen ausführlichen Guide geschrieben.",
         "Er hilft dir, noch mehr aus dem Thema herauszuholen.",
-        "Soll ich ihn dir schicken? Da du mir folgst, ist er für dich kostenlos :)",
+        "Soll ich ihn dir schicken? Er ist für dich kostenlos :)",
       ],
       offerDelaysSeconds: [5, 3, 2],
       offerButtonLabel: "Ja, gerne! 🙌",

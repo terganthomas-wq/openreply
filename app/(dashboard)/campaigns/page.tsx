@@ -232,11 +232,13 @@ export default function CampaignsPage() {
   }
 
   // Contacts and their tags do not belong to a campaign (R16): deleting it
-  // keeps them, and pausing it keeps everything.
+  // keeps them, and pausing it keeps everything. What does belong to it goes
+  // with it for good (the DM log, link clicks and tracked links cascade), so
+  // links it already sent stop working.
   async function deleteAutomation(id: string) {
     if (
       !confirm(
-        t("Delete this campaign? Contacts and tags are kept. To stop it for now, pause it instead.")
+        t("Delete this campaign? This cannot be undone: its DM log, click statistics and tracked links are deleted too, and links it already sent stop working. Contacts and tags are kept. To stop it for now, pause it instead.")
       )
     )
       return;
