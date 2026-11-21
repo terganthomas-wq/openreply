@@ -18,7 +18,10 @@ import {
   type CampaignDefaults,
   type MessageDefaults,
 } from "@/lib/campaigns/message-defaults";
-import type { CreateAutomationInput } from "@/lib/campaigns/schema";
+import {
+  offerRuleViolated,
+  type CreateAutomationInput,
+} from "@/lib/campaigns/schema";
 import { resolveLocale } from "@/lib/i18n";
 import { generateReportShareSlug } from "@/lib/reports/share";
 
@@ -242,8 +245,11 @@ async function workspaceMessageDefaults(
  * What a campaign created without the editor starts from (R14): the campaign
  * section of the workspace's message defaults, the texts and switches a new
  * campaign opens with in the editor. Empty when the workspace has none. As in
- * the editor, the defaults switch offers on only while the workspace has an
- * active offer; until then the campaign has nothing to offer.
+ * the editor, the defaults switch offers on only where that can work: while
+ * the workspace has an active offer (until then the campaign has nothing to
+ * offer), and only with the opening DM the defaults bring along (R11). The
+ * defaults do not enforce that rule themselves, so without this a minimal
+ * create would fail on defaults that switch the opening DM off.
  */
 export async function campaignDefaultsFor(
   workspaceId: string
@@ -252,11 +258,15 @@ export async function campaignDefaultsFor(
   if (!defaults) return {};
   const campaign = { ...defaults.campaign };
   if (campaign.offersEnabled) {
-    const activeOffer = await prisma.offer.findFirst({
-      where: { workspaceId, isActive: true, archivedAt: null },
-      select: { id: true },
-    });
-    campaign.offersEnabled = activeOffer !== null;
+    if (offerRuleViolated(campaign)) {
+      campaign.offersEnabled = false;
+    } else {
+      const activeOffer = await prisma.offer.findFirst({
+        where: { workspaceId, isActive: true, archivedAt: null },
+        select: { id: true },
+      });
+      campaign.offersEnabled = activeOffer !== null;
+    }
   }
   return campaign;
 }

@@ -264,6 +264,18 @@ export async function GET(request: NextRequest) {
  * and are rewritten. Offer jobs still queued for the person find no row and
  * end. A comment whose DM is still being retried (failed, attempts left) can
  * still be answered, which records the person anew.
+ *
+ * What Diagnostics keeps of the person goes as well. The worker's events
+ * (OperationalEvent) name them by IGSID (userId) and handle (commenterName),
+ * and failed jobs by job ids that hold the IGSID: those keys are removed and
+ * the IGSID in a job id or message becomes "deleted", while what the event
+ * says about the campaign or offer stays; a payload that would still name
+ * them is dropped. The workspace's events are matched by the IGSID, which
+ * Instagram gives per account, so it names this person. The raw webhook
+ * payloads (WebhookEvent) hold their comments and DMs word for word: those
+ * of this account that name the IGSID are emptied, the rows (status, error,
+ * time) stay. Meta stores button taps and read receipts without a
+ * workspace, so those count when they name the account.
  */
 export async function DELETE(request: NextRequest) {
   const context = await getCurrentWorkspaceContext();
@@ -283,22 +295,47 @@ export async function DELETE(request: NextRequest) {
       instagramAccountId: true,
       igsid: true,
       recipientHash: true,
+      instagramAccount: { select: { instagramId: true } },
     },
   });
   if (!contact) return fail(404, "Contact not found");
 
+  const { igsid } = contact;
+  // Ids appear in webhook JSON as quoted strings ("id": "1784…").
+  const quotedIgsid = JSON.stringify(igsid);
+  const quotedAccountId = JSON.stringify(contact.instagramAccount.instagramId);
+
   // One transaction: a half-done deletion would leave the person findable.
-  const [anonymisedLogs, deletedClicks] = await prisma.$transaction([
-    prisma.$executeRaw`UPDATE "DmLog" SET "commenterId" = 'deleted', "commenterName" = NULL, "commentText" = '', "commentId" = CASE WHEN "commentId" LIKE 'reveal:%' THEN 'deleted:' || "id" ELSE "commentId" END WHERE "workspaceId" = ${workspaceId} AND "instagramAccountId" = ${contact.instagramAccountId} AND "commenterId" = ${contact.igsid}`,
-    prisma.linkClick.deleteMany({
-      where: { workspaceId, recipientHash: contact.recipientHash },
-    }),
-    prisma.contact.delete({ where: { id: contact.id, workspaceId } }),
-  ]);
+  const [anonymisedLogs, deletedClicks, anonymisedEvents, clearedWebhookEvents] =
+    await prisma.$transaction([
+      prisma.$executeRaw`UPDATE "DmLog" SET "commenterId" = 'deleted', "commenterName" = NULL, "commentText" = '', "commentId" = CASE WHEN "commentId" LIKE 'reveal:%' THEN 'deleted:' || "id" ELSE "commentId" END WHERE "workspaceId" = ${workspaceId} AND "instagramAccountId" = ${contact.instagramAccountId} AND "commenterId" = ${igsid}`,
+      prisma.linkClick.deleteMany({
+        where: { workspaceId, recipientHash: contact.recipientHash },
+      }),
+      // A payload that does not name them stays; one that is no object, or
+      // that still names them once the keys and the job id are gone, goes.
+      prisma.$executeRaw`UPDATE "OperationalEvent"
+        SET "message" = replace("message", ${igsid}, 'deleted'),
+          "payload" = CASE
+            WHEN strpos(COALESCE("payload"::text, ''), ${igsid}) = 0 THEN "payload"
+            WHEN jsonb_typeof("payload") <> 'object' THEN NULL
+            WHEN strpos(("payload" - 'userId' - 'commenterName' - 'commenterId' - 'jobId')::text, ${igsid}) > 0 THEN NULL
+            ELSE ("payload" - 'userId' - 'commenterName' - 'commenterId')
+              || CASE WHEN jsonb_typeof("payload" -> 'jobId') = 'string'
+                THEN jsonb_build_object('jobId', replace("payload" ->> 'jobId', ${igsid}, 'deleted'))
+                ELSE '{}'::jsonb END
+          END
+        WHERE "workspaceId" = ${workspaceId}
+          AND (strpos("message", ${igsid}) > 0 OR strpos(COALESCE("payload"::text, ''), ${igsid}) > 0)`,
+      prisma.$executeRaw`UPDATE "WebhookEvent" SET "payload" = '{}'::jsonb WHERE ("workspaceId" = ${workspaceId} OR "workspaceId" IS NULL) AND strpos("payload"::text, ${quotedAccountId}) > 0 AND strpos("payload"::text, ${quotedIgsid}) > 0`,
+      prisma.contact.delete({ where: { id: contact.id, workspaceId } }),
+    ]);
 
   return respond({
     deleted: true,
     anonymisedLogs,
     deletedClicks: deletedClicks.count,
+    anonymisedEvents,
+    clearedWebhookEvents,
   });
 }

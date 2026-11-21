@@ -47,16 +47,23 @@ person asks for their data to be deleted. In one transaction:
 - their DM log entries stay, anonymised: no Instagram id, no name and no
   comment or DM text. The campaigns' counts keep them, and a comment that
   was answered stays marked as answered, so the reconciler never answers it
-  again. Button-tap entries, whose id contains the Instagram id, get a new id.
+  again. Button-tap entries, whose id contains the Instagram id, get a new id;
+- the worker's events in Diagnostics lose the person's Instagram id and
+  handle; where a failed job's id or a message contains the Instagram id, it
+  reads "deleted". What an event says about the campaign or offer stays. An
+  event whose details would still name the person loses its details. The
+  workspace's events are matched by the Instagram id, which Instagram gives
+  per account;
+- the raw webhook payloads that name the person on this account (their
+  comments and DMs word for word, their button taps) are emptied. The entries
+  themselves stay, with their status and error, for Diagnostics.
 
 This cannot be undone. If the person comments, taps or writes again, they are
 recorded as a new contact and can be offered everything again. A comment whose
 DM was still being retried when the contact was deleted can still be answered,
 which records them anew.
 
-Not touched by the deletion: raw webhook payloads kept for Diagnostics and the
-worker's event details, both of which can contain the Instagram id, and jobs
-already queued for the person.
+Not touched by the deletion: jobs already queued for the person.
 
 Contacts are personal data: the service API and the MCP server do not expose
 them.

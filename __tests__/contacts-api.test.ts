@@ -74,10 +74,41 @@ const CONTACT = {
 // transaction got.
 const ANONYMISE = { statement: "anonymise DmLog" };
 const DELETE_CLICKS = { statement: "delete LinkClick" };
+const ANONYMISE_EVENTS = { statement: "anonymise OperationalEvent" };
+const CLEAR_WEBHOOKS = { statement: "clear WebhookEvent payloads" };
 const DELETE_CONTACT = { statement: "delete Contact" };
 
 const ANONYMISE_SQL =
   'UPDATE "DmLog" SET "commenterId" = \'deleted\', "commenterName" = NULL, "commentText" = \'\', "commentId" = CASE WHEN "commentId" LIKE \'reveal:%\' THEN \'deleted:\' || "id" ELSE "commentId" END WHERE "workspaceId" = ? AND "instagramAccountId" = ? AND "commenterId" = ?';
+
+// The contact as the deletion loads it: with its account's Instagram id,
+// which the raw webhook payloads name.
+const CONTACT_TO_DELETE = {
+  id: CONTACT.id,
+  instagramAccountId: CONTACT.instagramAccountId,
+  igsid: CONTACT.igsid,
+  recipientHash: CONTACT.recipientHash,
+  instagramAccount: { instagramId: "17841499999999999" },
+};
+
+// Each raw statement by its table; the SQL itself runs in contacts-api.db.
+function rawStatement(strings: TemplateStringsArray) {
+  const sql = strings.join("?");
+  if (sql.startsWith('UPDATE "DmLog"')) return ANONYMISE;
+  if (sql.startsWith('UPDATE "OperationalEvent"')) return ANONYMISE_EVENTS;
+  if (sql.startsWith('UPDATE "WebhookEvent"')) return CLEAR_WEBHOOKS;
+  return { statement: `unexpected: ${sql}` };
+}
+
+// The raw statement that went to a table, as SQL with ? and its values.
+function rawCall(table: string) {
+  const call = mockPrisma.$executeRaw.mock.calls.find(([strings]) =>
+    (strings as string[]).join("?").startsWith(`UPDATE "${table}"`)
+  );
+  expect(call, table).toBeDefined();
+  const [strings, ...values] = call!;
+  return { sql: (strings as string[]).join("?"), values };
+}
 
 function apiRequest(method: string, query = "") {
   return new NextRequest(`https://app.example.com/api/contacts${query}`, {
@@ -125,10 +156,10 @@ beforeEach(() => {
   mockPrisma.contactOffer.findMany.mockResolvedValue([]);
   mockPrisma.dmLog.findMany.mockResolvedValue([]);
   mockPrisma.linkClick.findMany.mockResolvedValue([]);
-  mockPrisma.$executeRaw.mockReturnValue(ANONYMISE);
+  mockPrisma.$executeRaw.mockImplementation(rawStatement);
   mockPrisma.linkClick.deleteMany.mockReturnValue(DELETE_CLICKS);
   mockPrisma.contact.delete.mockReturnValue(DELETE_CONTACT);
-  mockPrisma.$transaction.mockResolvedValue([2, { count: 3 }, { id: CONTACT.id }]);
+  mockPrisma.$transaction.mockResolvedValue([2, { count: 3 }, 4, 1, { id: CONTACT.id }]);
 });
 
 describe("access to /api/contacts", () => {
@@ -567,24 +598,50 @@ describe("DELETE /api/contacts?id= (data deletion)", () => {
   });
 
   it.each(["OWNER", "ADMIN"] as const)(
-    "lets an %s anonymise the DM log rows, delete the clicks and delete the contact in one transaction",
+    "lets an %s anonymise the DM log rows and Diagnostics, delete the clicks and delete the contact in one transaction",
     async (role) => {
       mockContext.mockResolvedValue({ workspaceId: WORKSPACE, role });
+      mockPrisma.contact.findFirst.mockResolvedValue(CONTACT_TO_DELETE);
 
       const response = await remove();
 
       expect(response.status).toBe(200);
       expect(await response.json()).toEqual({
         success: true,
-        data: { deleted: true, anonymisedLogs: 2, deletedClicks: 3 },
+        data: {
+          deleted: true,
+          anonymisedLogs: 2,
+          deletedClicks: 3,
+          anonymisedEvents: 4,
+          clearedWebhookEvents: 1,
+        },
       });
 
       // The person's DM log rows lose their IGSID, name and text; button-tap
       // ids, which hold the IGSID, are rewritten.
-      expect(mockPrisma.$executeRaw).toHaveBeenCalledTimes(1);
-      const [sql, ...values] = mockPrisma.$executeRaw.mock.calls[0];
-      expect((sql as string[]).join("?")).toBe(ANONYMISE_SQL);
-      expect(values).toEqual([WORKSPACE, CONTACT.instagramAccountId, CONTACT.igsid]);
+      expect(mockPrisma.$executeRaw).toHaveBeenCalledTimes(3);
+      const logs = rawCall("DmLog");
+      expect(logs.sql).toBe(ANONYMISE_SQL);
+      expect(logs.values).toEqual([WORKSPACE, CONTACT.instagramAccountId, CONTACT.igsid]);
+
+      // The worker's events of this workspace that name the IGSID: the keys
+      // that hold the person go, and so does the IGSID in messages and job ids.
+      const events = rawCall("OperationalEvent");
+      expect(events.sql).toContain(`"payload" - 'userId' - 'commenterName' - 'commenterId'`);
+      expect(events.sql).toMatch(/WHERE "workspaceId" = \?\s+AND/);
+      expect(events.values.filter((value) => value !== CONTACT.igsid)).toEqual([WORKSPACE]);
+
+      // The raw webhooks of this workspace, or stored without one, that name
+      // both this account and the IGSID, as quoted JSON strings.
+      const webhooks = rawCall("WebhookEvent");
+      expect(webhooks.sql).toBe(
+        `UPDATE "WebhookEvent" SET "payload" = '{}'::jsonb WHERE ("workspaceId" = ? OR "workspaceId" IS NULL) AND strpos("payload"::text, ?) > 0 AND strpos("payload"::text, ?) > 0`
+      );
+      expect(webhooks.values).toEqual([
+        WORKSPACE,
+        '"17841499999999999"',
+        `"${CONTACT.igsid}"`,
+      ]);
 
       expect(mockPrisma.linkClick.deleteMany).toHaveBeenCalledWith({
         where: { workspaceId: WORKSPACE, recipientHash: CONTACT.recipientHash },
@@ -594,17 +651,27 @@ describe("DELETE /api/contacts?id= (data deletion)", () => {
         where: { id: CONTACT.id, workspaceId: WORKSPACE },
       });
 
-      // All three in one transaction, in this order.
+      // All five in one transaction, in this order.
       expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
       const operations = mockPrisma.$transaction.mock.calls[0][0];
-      expect(operations).toHaveLength(3);
+      expect(operations).toEqual([
+        ANONYMISE,
+        DELETE_CLICKS,
+        ANONYMISE_EVENTS,
+        CLEAR_WEBHOOKS,
+        DELETE_CONTACT,
+      ]);
       expect(operations[0]).toBe(ANONYMISE);
       expect(operations[1]).toBe(DELETE_CLICKS);
-      expect(operations[2]).toBe(DELETE_CONTACT);
+      expect(operations[2]).toBe(ANONYMISE_EVENTS);
+      expect(operations[3]).toBe(CLEAR_WEBHOOKS);
+      expect(operations[4]).toBe(DELETE_CONTACT);
     }
   );
 
   it("looks the contact up within the workspace before deleting", async () => {
+    mockPrisma.contact.findFirst.mockResolvedValue(CONTACT_TO_DELETE);
+
     await remove();
 
     expect(mockPrisma.contact.findFirst).toHaveBeenCalledWith({
@@ -614,6 +681,7 @@ describe("DELETE /api/contacts?id= (data deletion)", () => {
         instagramAccountId: true,
         igsid: true,
         recipientHash: true,
+        instagramAccount: { select: { instagramId: true } },
       },
     });
   });

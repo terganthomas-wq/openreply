@@ -20,6 +20,7 @@ import { z } from "zod";
 import type { Locale } from "@/lib/i18n";
 import type { ImportRow } from "@/lib/import-queue";
 import {
+  LAST_OFFER_MESSAGE_RULE,
   OFFER_DELAY_MAX_SECONDS,
   OFFER_MESSAGES_MAX,
   REMINDER_DELAY_MAX_HOURS,
@@ -62,8 +63,10 @@ const tagTemplate = z.string().trim().min(1).max(TAG_MAX);
  * What a new campaign opens with. Only texts and switches: keywords, post and
  * links belong to each campaign. Combinations the campaign API refuses (an
  * opening DM switched on without its text, offers without the opening DM) are
- * not refused here: these only prefill the editor, which checks them, like
- * any campaign, when it is saved.
+ * not refused here, so saving the texts never fails on a switch. Whoever
+ * applies the defaults switches offers on only where the rule holds (R11):
+ * the editor (applyCampaignFields) and the service API (campaignDefaultsFor
+ * in lib/campaigns/create.ts).
  */
 export const campaignDefaultsSchema = z.object({
   openingDmEnabled: z.boolean(),
@@ -133,6 +136,7 @@ export const offerDefaultsSchema = offerDefaultsFields.superRefine(
         code: "custom",
         path: ["offerMessages", last],
         message: `The last offer message carries the button: at most ${BUTTON_TEXT_MAX} characters (emoji count as 2)`,
+        params: { maximum: BUTTON_TEXT_MAX, rule: LAST_OFFER_MESSAGE_RULE },
       });
     }
   }
@@ -297,6 +301,52 @@ export const BUILT_IN_MESSAGE_DEFAULTS: Partial<
 export function builtInMessageDefaults(locale: Locale): MessageDefaults | null {
   const defaults = BUILT_IN_MESSAGE_DEFAULTS[locale];
   return defaults ? structuredClone(defaults) : null;
+}
+
+/** The two parts of the defaults; each one can be reset on its own. */
+export type MessageDefaultsSection = "campaign" | "offer";
+
+export function isMessageDefaultsSection(
+  value: unknown
+): value is MessageDefaultsSection {
+  return value === "campaign" || value === "offer";
+}
+
+// Whether two sets of defaults hold the same texts and switches. Both are
+// parsed, so the order of their keys does not matter.
+function sameDefaults(a: MessageDefaults, b: MessageDefaults): boolean {
+  const left = messageDefaultsSchema.safeParse(a);
+  const right = messageDefaultsSchema.safeParse(b);
+  return (
+    left.success &&
+    right.success &&
+    JSON.stringify(left.data) === JSON.stringify(right.data)
+  );
+}
+
+/**
+ * The saved defaults after one section went back to the built-in set of the
+ * reader's language (`builtIn`), or to empty defaults in a language without
+ * one. The other section stays as saved: the campaign editor's reset must
+ * not take the offers' texts with it, nor the other way round.
+ *
+ * Null when nothing of what was saved is left to keep: nothing readable was
+ * saved, or what is left is that built-in (or empty) set itself. The column
+ * then goes back to SQL NULL, as on a full reset, and the next read seeds the
+ * reader's language again.
+ */
+export function resetMessageDefaultsSection(
+  stored: MessageDefaults | null,
+  section: MessageDefaultsSection,
+  builtIn: MessageDefaults | null
+): MessageDefaults | null {
+  if (!stored) return null;
+  const base = builtIn ?? EMPTY_MESSAGE_DEFAULTS;
+  const next: MessageDefaults =
+    section === "campaign"
+      ? { ...stored, campaign: structuredClone(base.campaign) }
+      : { ...stored, offer: structuredClone(base.offer) };
+  return sameDefaults(next, base) ? null : next;
 }
 
 /**

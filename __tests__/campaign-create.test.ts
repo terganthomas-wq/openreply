@@ -290,6 +290,44 @@ describe("campaignDefaultsFor", () => {
     expect(mockPrisma.offer.findFirst).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["switch the opening DM off", { openingDmEnabled: false }],
+    ["leave the opening DM without a text", { openingDmMessage: "" }],
+    ["leave the opening DM without a button", { openingDmButtonLabel: "" }],
+  ])("switches offers off when the defaults %s (R11)", async (_case, opening) => {
+    const saved = { ...german, campaign: { ...german.campaign, ...opening } };
+    mockPrisma.workspace.findUnique.mockResolvedValue({ messageDefaults: saved });
+    mockPrisma.offer.findFirst.mockResolvedValue({ id: "offer_1" });
+
+    expect(await campaignDefaultsFor("workspace_123")).toEqual({
+      ...saved.campaign,
+      offersEnabled: false,
+    });
+    // The rule decides before any offer is looked up.
+    expect(mockPrisma.offer.findFirst).not.toHaveBeenCalled();
+  });
+
+  it("gives defaults without the opening DM that a minimal create accepts", async () => {
+    // Saved by "Save these texts as defaults" with the opening DM off, while
+    // the German seed's offer switch stayed on.
+    const saved = { ...german, campaign: { ...german.campaign, openingDmEnabled: false } };
+    mockPrisma.workspace.findUnique.mockResolvedValue({ messageDefaults: saved });
+    mockPrisma.offer.findFirst.mockResolvedValue({ id: "offer_1" });
+
+    const minimal = {
+      ...(await campaignDefaultsFor("workspace_123")),
+      isActive: false,
+      name: "Prompt reel",
+      keywords: ["Prompt"],
+      postId: "media_1",
+      trackedDestinationUrl: "https://drive.google.com/file/d/abc/view",
+    };
+    const parsed = createAutomationSchema.strict().safeParse(minimal);
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.data).toMatchObject({ openingDmEnabled: false, offersEnabled: false });
+  });
+
   it("seeds the installation language's built-in set once into an empty column", async () => {
     vi.stubEnv("DEFAULT_LOCALE", "de");
     mockPrisma.workspace.findUnique.mockResolvedValue({ messageDefaults: null });

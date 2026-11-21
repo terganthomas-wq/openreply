@@ -3,11 +3,13 @@ import {
   BUILT_IN_MESSAGE_DEFAULTS,
   builtInMessageDefaults,
   EMPTY_MESSAGE_DEFAULTS,
+  isMessageDefaultsSection,
   mergeMessageDefaults,
   messageDefaultsSchema,
   messageDefaultsUpdateSchema,
   parseMessageDefaults,
   renderTagTemplate,
+  resetMessageDefaultsSection,
   withImportRow,
   type MessageDefaults,
 } from "../lib/campaigns/message-defaults";
@@ -319,6 +321,60 @@ describe("messageDefaultsUpdateSchema and mergeMessageDefaults", () => {
     // Three messages over two pauses only fail once merged.
     const update = messageDefaultsUpdateSchema.parse({ offer: { offerDelaysSeconds: [1, 2] } });
     expect(messageDefaultsSchema.safeParse(mergeMessageDefaults(german, update)).success).toBe(false);
+  });
+});
+
+describe("resetMessageDefaultsSection", () => {
+  // Saved by an admin: their own texts for campaigns and for offers.
+  const ownCampaign = { ...german.campaign, openingDmMessage: "Willst du die Checkliste?" };
+  const ownOffer = {
+    ...german.offer,
+    offerMessages: ["Mein eigenes Angebot"],
+    offerDelaysSeconds: [1],
+    offerButtonLabel: "Klar!",
+  };
+  const saved: MessageDefaults = { ...german, campaign: ownCampaign, offer: ownOffer };
+
+  it("puts the campaign section back to the built-in set and keeps the offer's texts", () => {
+    const reset = resetMessageDefaultsSection(saved, "campaign", german);
+    expect(reset).toEqual({ ...german, campaign: german.campaign, offer: ownOffer });
+    expect(messageDefaultsSchema.safeParse(reset).success).toBe(true);
+    // A copy: changing it leaves the built-in set alone.
+    reset!.campaign.publicReplyMessages.push("Noch eine");
+    expect(german.campaign.publicReplyMessages).toHaveLength(5);
+  });
+
+  it("puts the offer section back and keeps the campaign's texts", () => {
+    expect(resetMessageDefaultsSection(saved, "offer", german)).toEqual({
+      ...german,
+      campaign: ownCampaign,
+      offer: german.offer,
+    });
+  });
+
+  it("empties the section in a language without a built-in set", () => {
+    expect(resetMessageDefaultsSection(saved, "campaign", null)).toEqual({
+      ...EMPTY_MESSAGE_DEFAULTS,
+      offer: ownOffer,
+    });
+  });
+
+  it("gives null when nothing saved is left to keep, so the column goes back to NULL", () => {
+    // Only the campaign texts were the admin's own.
+    expect(resetMessageDefaultsSection({ ...german, campaign: ownCampaign }, "campaign", german)).toBeNull();
+    expect(
+      resetMessageDefaultsSection({ ...EMPTY_MESSAGE_DEFAULTS, campaign: ownCampaign }, "campaign", null)
+    ).toBeNull();
+    // Nothing readable was saved.
+    expect(resetMessageDefaultsSection(null, "offer", german)).toBeNull();
+  });
+
+  it("knows the two sections and nothing else", () => {
+    expect(isMessageDefaultsSection("campaign")).toBe(true);
+    expect(isMessageDefaultsSection("offer")).toBe(true);
+    for (const value of ["campaigns", "", "version", null, undefined, 1]) {
+      expect(isMessageDefaultsSection(value)).toBe(false);
+    }
   });
 });
 

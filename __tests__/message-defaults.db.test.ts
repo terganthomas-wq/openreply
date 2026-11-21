@@ -52,7 +52,11 @@ vi.mock("@/lib/i18n/server", () => ({
 }));
 
 import { DELETE, GET, PUT } from "../app/api/workspace/message-defaults/route";
-import { BUILT_IN_MESSAGE_DEFAULTS, type MessageDefaults } from "../lib/campaigns/message-defaults";
+import {
+  BUILT_IN_MESSAGE_DEFAULTS,
+  EMPTY_MESSAGE_DEFAULTS,
+  type MessageDefaults,
+} from "../lib/campaigns/message-defaults";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const schema = `message_defaults_${randomBytes(4).toString("hex")}`;
@@ -77,6 +81,22 @@ async function save(body: unknown) {
     })
   );
 }
+
+// A reset; "?section=campaign" is the campaign editor's.
+async function reset(query = "") {
+  return DELETE(
+    new NextRequest(`https://app.example.test/api/workspace/message-defaults${query}`, {
+      method: "DELETE",
+    })
+  );
+}
+
+// Offer texts an admin saved from the offer editor.
+const OWN_OFFER = {
+  offerMessages: ["Mein eigenes Angebot"],
+  offerDelaysSeconds: [1],
+  offerButtonLabel: "Klar!",
+};
 
 // What the column holds, as SQL sees it: SQL NULL and JSON null differ.
 async function column(workspaceId: string) {
@@ -194,7 +214,7 @@ describe.skipIf(!databaseUrl)("message defaults on a real Postgres", () => {
       data: { messageDefaults: german },
     });
 
-    const response = await DELETE();
+    const response = await reset();
     expect(response.status).toBe(200);
     expect((await response.json()).data.defaults).toEqual(german);
     expect((await column(WORKSPACE)).isNull).toBe(true);
@@ -205,11 +225,50 @@ describe.skipIf(!databaseUrl)("message defaults on a real Postgres", () => {
     expect((await column(WORKSPACE)).value).toEqual(german);
   });
 
+  it("keeps the offer's texts when the campaign editor resets the campaign's", async () => {
+    // The first read seeds the German set; the offer editor saves its texts,
+    // the campaign editor its own.
+    expect(await read()).toEqual(german);
+    expect((await save({ offer: OWN_OFFER })).status).toBe(200);
+    expect((await save({ campaign: { dmMessage: "Eigener Text" } })).status).toBe(200);
+
+    const response = await reset("?section=campaign");
+    expect(response.status).toBe(200);
+    const expected = { ...german, offer: { ...german.offer, ...OWN_OFFER } };
+    expect((await response.json()).data.defaults).toEqual(expected);
+    expect((await column(WORKSPACE)).value).toEqual(expected);
+    expect(await read()).toEqual(expected);
+    expect((await column(OTHER_WORKSPACE)).isNull).toBe(true);
+  });
+
+  it("keeps saved offer texts through a campaign reset in a language without a built-in set", async () => {
+    state.locale = "en";
+    expect(await read()).toBeNull();
+    expect((await save({ offer: OWN_OFFER })).status).toBe(200);
+
+    expect((await reset("?section=campaign")).status).toBe(200);
+    const expected = {
+      ...EMPTY_MESSAGE_DEFAULTS,
+      offer: { ...EMPTY_MESSAGE_DEFAULTS.offer, ...OWN_OFFER },
+    };
+    expect((await column(WORKSPACE)).value).toEqual(expected);
+    expect(await read()).toEqual(expected);
+  });
+
+  it("goes back to SQL NULL when a campaign reset leaves only built-in texts", async () => {
+    await save({ campaign: { dmMessage: "Eigener Text" } });
+
+    expect((await reset("?section=campaign")).status).toBe(200);
+    expect((await column(WORKSPACE)).isNull).toBe(true);
+    expect(await read()).toEqual(german);
+  });
+
   it("leaves the column alone for a member", async () => {
     state.context = { workspaceId: WORKSPACE, role: "MEMBER" };
 
     expect((await save({ campaign: { dmMessage: "Nein" } })).status).toBe(403);
-    expect((await DELETE()).status).toBe(403);
+    expect((await reset()).status).toBe(403);
+    expect((await reset("?section=campaign")).status).toBe(403);
     expect((await column(WORKSPACE)).isNull).toBe(true);
   });
 });

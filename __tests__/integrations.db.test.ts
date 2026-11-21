@@ -137,4 +137,24 @@ describe.skipIf(!databaseUrl)("read-only integrations on real PostgreSQL", () =>
       vi.unstubAllEnvs();
     }
   });
+  it("creates from name, keywords, post and link when the saved defaults switch the opening DM off", async () => {
+    // What "Save these texts as defaults" stored with the opening DM off: the
+    // German seed's offer switch stayed on, and the workspace has an active
+    // offer. Offers need the opening DM (R11), so they stay off.
+    const german = builtInMessageDefaults("de")!;
+    await state.db.workspace.create({ data: { id: "no_opening", name: "no_opening", ownerId: "owner",
+      messageDefaults: { ...german, campaign: { ...german.campaign, openingDmEnabled: false } } } });
+    await state.db.instagramAccount.create({ data: { id: "account_no_opening", workspaceId: "no_opening", instagramId: "no_opening", username: "no_opening", accessToken: "local-only-secret" } });
+    await state.db.offer.create({ data: { workspaceId: "no_opening", name: "Guide", offerMessages: ["Want it?"], offerDelaysSeconds: [0],
+      offerButtonLabel: "Ja, gerne!", cardTitle: "Guide", cardButtonLabel: "Holen", destinationUrl: "https://example.test/guide",
+      linkSlug: "no-opening-guide", tagOffered: "o", tagInterested: "i", tagSent: "s", tagClicked: "c" } });
+    const writer = { workspaceId: "no_opening", keyId: "no-opening-key", scopes: ["campaigns:write"] };
+    const reel = { name: "Prompt reel", keywords: ["Prompt"], postId: "media_no_opening", trackedDestinationUrl: "https://drive.google.com/file/d/abc123/view?usp=sharing" };
+
+    expect(await createServiceCampaign(writer, reel)).toMatchObject({
+      name: "Prompt reel", isActive: false, openingDmEnabled: false, openingDmMessage: null, offersEnabled: false,
+      dmMessage: `${german.campaign.dmMessage} {link}`,
+    });
+    expect(await state.db.automation.count({ where: { workspaceId: "no_opening" } })).toBe(1);
+  });
 });

@@ -25,6 +25,7 @@ import CampaignOffersSection, {
 } from "@/components/campaign-offers-section";
 import {
   CountedInput,
+  LengthCounter,
   Radio,
   Section,
   Toggle,
@@ -36,18 +37,25 @@ import {
   type ImportRow,
 } from "@/lib/import-queue";
 import { BUTTON_TEXT_MAX } from "@/lib/validation/text";
+import { issueMessage } from "@/lib/validation/messages";
 import {
   EMPTY_MESSAGE_DEFAULTS,
+  messageDefaultsUpdateSchema,
   parseMessageDefaults,
   withImportRow,
   type CampaignDefaults,
 } from "@/lib/campaigns/message-defaults";
+import { offerRuleViolated } from "@/lib/campaigns/schema";
 import { cleanCustomOrder } from "@/lib/offers/editor";
 
 type TriggerScope = "specific" | "any" | "next";
 type MatchMode = "specific" | "any";
 
 const MESSAGE_DEFAULTS_URL = "/api/workspace/message-defaults";
+
+// What the campaign API takes for a DM's text. Instagram keeps only
+// BUTTON_TEXT_MAX of a message that goes out with a button.
+const DM_TEXT_MAX = 1000;
 
 // The editor's own starting point, for a workspace without default texts:
 // nothing switched on but the question-mark filter, and the English button
@@ -58,14 +66,21 @@ const BLANK_CAMPAIGN_TEXTS: CampaignDefaults = {
   linkButtonLabel: "Open link",
 };
 
-// The message of the first field the API refused, as "field: message", or
-// null. The defaults route names nested fields by their whole path.
-function firstFieldError(details: unknown): string | null {
+// The first field the defaults route refused, by the field's own name (the
+// route names it by its whole path, "campaign.openingDmMessage"), with the
+// route's message.
+function firstFieldError(
+  details: unknown
+): { field: string; message: string } | null {
   const fieldErrors = (details as { fieldErrors?: Record<string, string[]> })
     ?.fieldErrors;
-  const field = fieldErrors && Object.keys(fieldErrors)[0];
-  if (!field) return null;
-  return `${field.split(".").pop()}: ${fieldErrors[field][0]}`;
+  for (const [path, messages] of Object.entries(fieldErrors ?? {})) {
+    const [section, field] = path.split(".");
+    if (section === "campaign" && field && typeof messages?.[0] === "string") {
+      return { field, message: messages[0] };
+    }
+  }
+  return null;
 }
 
 interface LoadedCampaign {
@@ -399,14 +414,27 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
 
   // Put default texts and switches into the form; a field left out stays as
   // it is. The offer switch is only turned on while the workspace has an
-  // active offer: until then a new campaign has nothing to offer, and can
-  // switch offers on later.
+  // active offer (until then a new campaign has nothing to offer, and can
+  // switch offers on later) and with a complete opening DM: offers need it
+  // (R11), and defaults that switch it off would leave a campaign that
+  // cannot be saved until fixed by hand.
   function applyCampaignFields(
     fields: Partial<CampaignDefaults>,
     offers: OfferOption[] | null
   ) {
     if (fields.offersEnabled !== undefined) {
-      setOffersEnabled(fields.offersEnabled && hasActiveOffer(offers));
+      const openingDm = {
+        offersEnabled: true,
+        openingDmEnabled: fields.openingDmEnabled ?? openingDmEnabled,
+        openingDmMessage: fields.openingDmMessage ?? openingDmMessage,
+        openingDmButtonLabel:
+          fields.openingDmButtonLabel ?? openingDmButtonLabel,
+      };
+      setOffersEnabled(
+        fields.offersEnabled &&
+          hasActiveOffer(offers) &&
+          !offerRuleViolated(openingDm)
+      );
       setOpeningDmSwitchedOn(false);
     }
     if (fields.openingDmEnabled !== undefined)
@@ -554,6 +582,10 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
 
   const username =
     accounts.find((a) => a.id === selectedAccountId)?.username ?? "yourbrand";
+
+  // With a link the DM goes out with its button, and Instagram keeps 640
+  // units of the text; without one it is a plain message.
+  const dmTextMax = trackedDestinationUrl.trim() ? BUTTON_TEXT_MAX : DM_TEXT_MAX;
 
   function handlePostSelect(
     id: string,
@@ -804,7 +836,8 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
 
   // The texts and switches new campaigns take from the defaults, as this
   // form has them. A text is kept while its switch is off, so a campaign
-  // that turns the switch on gets the default text back.
+  // that turns the switch on gets the default text back. The offer switch
+  // has its own rules (offersSwitchForDefaults).
   function currentCampaignTexts(): Omit<CampaignDefaults, "offersEnabled"> {
     return {
       openingDmEnabled,
@@ -825,8 +858,49 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
     };
   }
 
-  // Owners and admins: new campaigns of the workspace open with these texts.
-  // The offer switch is not sent, so it keeps its saved value.
+  // The offer switch new campaigns open with, as this form has it. Offers
+  // need the opening DM (R11), so without one they are saved off. While the
+  // workspace has no active offer (or its offers could not be loaded) the
+  // form shows them off whatever the defaults say; the saved value stays.
+  function offersSwitchForDefaults(): Partial<
+    Pick<CampaignDefaults, "offersEnabled">
+  > {
+    if (!openingDmEnabled) return { offersEnabled: false };
+    if (offersEnabled || hasActiveOffer(offerOptions)) return { offersEnabled };
+    return {};
+  }
+
+  // A field of the default texts, named as this form shows it.
+  function campaignFieldLabel(field: PropertyKey | undefined): string {
+    switch (field) {
+      case "openingDmEnabled":
+      case "openingDmMessage":
+      case "openingDmButtonLabel":
+        return t("an opening DM");
+      case "requireFollow":
+      case "followPromptMessage":
+      case "followPromptButtonLabel":
+        return t("a follow requirement first");
+      case "followPromptRetryMessage":
+      case "followPromptRetryButtonLabel":
+        return t("If they still don't follow after tapping");
+      case "dmMessage":
+      case "linkButtonLabel":
+        return t("a DM with a link");
+      case "publicReplyEnabled":
+      case "publicReplyMessages":
+        return t("reply to their comments under the post");
+      case "ignoreQuestionComments":
+        return t("Ignore comments with a question mark");
+      case "offersEnabled":
+        return t("Then offer a lead magnet");
+      default:
+        return t("Default texts");
+    }
+  }
+
+  // Owners and admins: new campaigns of the workspace open with these texts
+  // and switches, the offer switch included (offersSwitchForDefaults).
   async function saveTextsAsDefaults() {
     setDefaultsStatus(null);
     if (
@@ -838,12 +912,29 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
         text: t("Your opening DM needs a message and a button label."),
       });
     }
+    if (offersEnabled && !openingDmEnabled) {
+      return setDefaultsStatus({
+        tone: "error",
+        text: t("Offers need the opening DM: Instagram only allows them after the person taps a button."),
+      });
+    }
+    const campaign = { ...currentCampaignTexts(), ...offersSwitchForDefaults() };
+    // The route's own rules first, worded in the interface language: the
+    // texts that go out with a button keep 640 characters there.
+    const checked = messageDefaultsUpdateSchema.safeParse({ campaign });
+    if (!checked.success) {
+      const [issue] = checked.error.issues;
+      return setDefaultsStatus({
+        tone: "error",
+        text: `${campaignFieldLabel(issue.path[1])}: ${issueMessage(t, issue)}`,
+      });
+    }
     setDefaultsBusy("save");
     try {
       const res = await fetch(MESSAGE_DEFAULTS_URL, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ campaign: currentCampaignTexts() }),
+        body: JSON.stringify({ campaign }),
       });
       const data = await res.json();
       if (data.success) {
@@ -855,12 +946,12 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
           text: t("Saved. New campaigns now open with these texts."),
         });
       } else {
+        const refused = firstFieldError(data.details);
         setDefaultsStatus({
           tone: "error",
-          text:
-            firstFieldError(data.details) ??
-            data.error ??
-            t("Could not save the default texts."),
+          text: refused
+            ? `${campaignFieldLabel(refused.field)}: ${refused.message}`
+            : data.error ?? t("Could not save the default texts."),
         });
       }
     } catch {
@@ -874,8 +965,9 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
   }
 
   // Owners and admins: back to the built-in texts of the interface language
-  // (none for some languages: then new campaigns open blank). The form shows
-  // what new campaigns open with from now on.
+  // (none for some languages: then new campaigns open blank). Only the
+  // campaigns' texts: the offers' default texts live in the same record and
+  // stay as saved. The form shows what new campaigns open with from now on.
   async function resetDefaults() {
     if (
       !window.confirm(
@@ -886,7 +978,9 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
     setDefaultsStatus(null);
     setDefaultsBusy("reset");
     try {
-      const res = await fetch(MESSAGE_DEFAULTS_URL, { method: "DELETE" });
+      const res = await fetch(`${MESSAGE_DEFAULTS_URL}?section=campaign`, {
+        method: "DELETE",
+      });
       const data = await res.json();
       if (!data.success) {
         setDefaultsStatus({
@@ -1221,14 +1315,18 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
             </div>
             {openingDmEnabled && (
               <div className="mt-3 space-y-2">
+                {/* It goes out with its button, so Instagram keeps 640
+                    units of it. Older campaigns may hold more: the counter
+                    turns red. */}
                 <textarea
                   value={openingDmMessage}
                   onChange={(e) => setOpeningDmMessage(e.target.value)}
                   placeholder={t("Hey there! I'm so happy you're here 😊")}
                   rows={3}
                   className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none resize-none"
-                  maxLength={1000}
+                  maxLength={BUTTON_TEXT_MAX}
                 />
+                <LengthCounter value={openingDmMessage} max={BUTTON_TEXT_MAX} />
                 <CountedInput
                   value={openingDmButtonLabel}
                   onChange={setOpeningDmButtonLabel}
@@ -1256,8 +1354,9 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                   placeholder={t("quick favor before i send your link. i don't make any money from this, it's free. if you want to support me, just don't unfollow after, and star the repo on github if it helps you. tap the button once you're following and i'll send it over")}
                   rows={3}
                   className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none resize-none"
-                  maxLength={1000}
+                  maxLength={BUTTON_TEXT_MAX}
                 />
+                <LengthCounter value={followPromptMessage} max={BUTTON_TEXT_MAX} />
                 <CountedInput
                   value={followPromptButtonLabel}
                   onChange={setFollowPromptButtonLabel}
@@ -1286,6 +1385,10 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                     className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none resize-none"
                     maxLength={BUTTON_TEXT_MAX}
                   />
+                  <LengthCounter
+                    value={followPromptRetryMessage}
+                    max={BUTTON_TEXT_MAX}
+                  />
                   <CountedInput
                     value={followPromptRetryButtonLabel}
                     onChange={setFollowPromptRetryButtonLabel}
@@ -1309,8 +1412,9 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
               placeholder={t("Write a message")}
               rows={3}
               className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none resize-none"
-              maxLength={1000}
+              maxLength={dmTextMax}
             />
+            <LengthCounter value={dmMessage} max={dmTextMax} />
             {linkOpen ? (
               <div className="space-y-2">
                 <input
@@ -1462,7 +1566,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
           <Section title={t("Default texts")}>
             <div className="space-y-3 rounded-lg border border-border p-3">
               <p className="text-xs text-muted">
-                {t("Saves the opening DM, both follow requests, the link DM text and button, the public replies and which of them are on, and the question-mark filter. Everything else, like keywords, post and link, is set per campaign.")}
+                {t("Saves the opening DM, both follow requests, the link DM text and button, the public replies and which of them are on, the question-mark filter and whether a lead magnet is offered after the link. Everything else, like keywords, post and link, is set per campaign.")}
               </p>
               <button
                 type="button"

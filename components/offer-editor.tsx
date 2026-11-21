@@ -27,6 +27,7 @@ import { CountedInput, Section, Toggle } from "@/components/form-controls";
 import OfferPreview from "@/components/offer-preview";
 import {
   EMPTY_MESSAGE_DEFAULTS,
+  offerDefaultsSchema,
   parseMessageDefaults,
 } from "@/lib/campaigns/message-defaults";
 import { useI18n } from "@/lib/i18n/provider";
@@ -42,6 +43,8 @@ import {
   imageUploadProblem,
   newOfferEditorState,
   offerDefaultsUpdate,
+  offerFieldErrors,
+  offerFieldOfPath,
   offerPayload,
   sentMessages,
   TAG_FIELD,
@@ -95,14 +98,20 @@ function inputClass(invalid: boolean, extra = "") {
   return `${INPUT_CLASS} ${invalid ? "border-error/60" : "border-border"} ${extra}`;
 }
 
-// The message of the first field the defaults route refused, as
-// "field: message". That route names fields by their whole path.
-function firstDefaultsError(details: unknown): string | null {
+// The first form field the defaults route refused, with the route's message.
+// The route names fields by their whole path ("offer.offerMessages.1").
+function firstDefaultsError(
+  details: unknown
+): { field: OfferField; message: string } | null {
   const fieldErrors = (details as { fieldErrors?: Record<string, string[]> })
     ?.fieldErrors;
-  const field = fieldErrors && Object.keys(fieldErrors)[0];
-  if (!field) return null;
-  return `${field.split(".").pop()}: ${fieldErrors[field][0]}`;
+  for (const [path, messages] of Object.entries(fieldErrors ?? {})) {
+    const field = offerFieldOfPath(path.split("."));
+    if (field && typeof messages?.[0] === "string") {
+      return { field, message: messages[0] };
+    }
+  }
+  return null;
 }
 
 function FieldError({ message }: { message?: string }) {
@@ -373,8 +382,9 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
     }
   }
 
-  // Field errors from the schema or the API: the two link fields get a
-  // message in the interface language, the length limits keep the API's.
+  // Field errors from the editor's own check, already in the interface
+  // language (offerFieldErrors), or from the API, which the editor's check
+  // leaves little to find. The two link fields get their own message.
   function showErrors(fieldErrors: Partial<Record<OfferField, string>>) {
     const shown = { ...fieldErrors };
     if (shown.cardImageUrl) shown.cardImageUrl = t("The image needs a direct https link.");
@@ -399,10 +409,11 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
     const missing = firstMissingField(form);
     if (missing) return showErrors({ [missing]: missingMessage(missing) });
     const payload = offerPayload(form);
-    // The API's own rules first: limits, links, one pause per message.
+    // The API's own rules first (limits, links, one pause per message),
+    // worded in the interface language.
     const checked = offerInputSchema.safeParse(payload);
     if (!checked.success) {
-      return showErrors(fieldErrorsFromDetails(checked.error.flatten()));
+      return showErrors(offerFieldErrors(checked.error.issues, t));
     }
 
     setSaving(true);
@@ -443,12 +454,31 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
   // Owners and admins: new offers of the workspace start with these texts.
   async function saveTextsAsDefaults() {
     setDefaultsStatus(null);
+    const update = offerDefaultsUpdate(form);
+    // The route's own rules first, worded in the interface language. It
+    // checks these texts with the saved tag templates, which the editor
+    // holds as well.
+    const checked = offerDefaultsSchema.safeParse({
+      ...update.offer,
+      tagTemplates: templates,
+    });
+    if (!checked.success) {
+      const fieldErrors = offerFieldErrors(checked.error.issues, t);
+      const first = firstErrorField(fieldErrors);
+      setDefaultsStatus({
+        tone: "error",
+        text: first
+          ? `${fieldLabel(first)}: ${fieldErrors[first]}`
+          : t("Could not save the default texts."),
+      });
+      return;
+    }
     setDefaultsBusy(true);
     try {
       const res = await fetch(MESSAGE_DEFAULTS_URL, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(offerDefaultsUpdate(form)),
+        body: JSON.stringify(update),
       });
       const data = await res.json();
       if (data.success) {
@@ -459,12 +489,12 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
           text: t("Saved. New offers now start with these texts."),
         });
       } else {
+        const refused = firstDefaultsError(data.details);
         setDefaultsStatus({
           tone: "error",
-          text:
-            firstDefaultsError(data.details) ??
-            data.error ??
-            t("Could not save the default texts."),
+          text: refused
+            ? `${fieldLabel(refused.field)}: ${refused.message}`
+            : data.error ?? t("Could not save the default texts."),
         });
       }
     } catch {

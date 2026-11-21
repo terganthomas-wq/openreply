@@ -79,6 +79,15 @@ function put(body: unknown) {
   );
 }
 
+// A reset; "?section=campaign" is the campaign editor's.
+function remove(query = "") {
+  return DELETE(
+    new NextRequest(`https://app.example.com/api/workspace/message-defaults${query}`, {
+      method: "DELETE",
+    })
+  );
+}
+
 function savedData() {
   expect(mockPrisma.workspace.update).toHaveBeenCalledTimes(1);
   const [{ where, data }] = mockPrisma.workspace.update.mock.calls[0];
@@ -109,7 +118,8 @@ describe("access to /api/workspace/message-defaults", () => {
   it.each([
     ["GET", () => GET()],
     ["PUT", () => put({ campaign: { dmMessage: "Hier" } })],
-    ["DELETE", () => DELETE()],
+    ["DELETE", () => remove()],
+    ["DELETE ?section=campaign", () => remove("?section=campaign")],
   ])("answers 401 to %s without a workspace", async (_method, call) => {
     mockContext.mockResolvedValue(null);
 
@@ -147,7 +157,8 @@ describe("access to /api/workspace/message-defaults", () => {
   it("answers 403 to a DELETE by a member and resets nothing", async () => {
     signIn("MEMBER", saved);
 
-    expect((await DELETE()).status).toBe(403);
+    expect((await remove()).status).toBe(403);
+    expect((await remove("?section=campaign")).status).toBe(403);
     expectNoWrites();
   });
 });
@@ -313,7 +324,7 @@ describe("DELETE", () => {
   it("resets to DbNull and returns the built-in set the next read seeds", async () => {
     signIn("ADMIN", saved);
 
-    const response = await DELETE();
+    const response = await remove();
 
     expect(response.status).toBe(200);
     expect(mockPrisma.workspace.update).toHaveBeenCalledExactlyOnceWith({
@@ -331,7 +342,89 @@ describe("DELETE", () => {
     signIn("OWNER", saved);
     mockI18n.mockResolvedValue({ locale: "en" });
 
-    expect((await (await DELETE()).json()).data.defaults).toBeNull();
+    expect((await (await remove()).json()).data.defaults).toBeNull();
     expect(mockPrisma.workspace.update).toHaveBeenCalledTimes(1);
   });
+
+  it("resets the campaign texts alone with ?section=campaign and keeps the offer's", async () => {
+    signIn("ADMIN", saved);
+
+    const response = await remove("?section=campaign");
+
+    expect(response.status).toBe(200);
+    // The campaign editor's reset never takes the offers' texts along.
+    const expected = { ...saved, campaign: german.campaign };
+    expect(savedData()).toEqual(expected);
+    expect(savedData().offer).toEqual(saved.offer);
+    expect(await response.json()).toEqual({
+      success: true,
+      data: { defaults: expected, canManage: true },
+    });
+    expect(mockPrisma.workspace.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("resets the offer texts alone with ?section=offer", async () => {
+    signIn("OWNER", saved);
+
+    await remove("?section=offer");
+
+    expect(savedData()).toEqual({ ...saved, offer: german.offer });
+  });
+
+  it("empties the section in a language without a built-in set and keeps the other", async () => {
+    const ownOffer = {
+      ...EMPTY_MESSAGE_DEFAULTS.offer,
+      offerMessages: ["My own offer"],
+      offerDelaysSeconds: [1],
+      offerButtonLabel: "Sure!",
+    };
+    signIn("OWNER", {
+      ...EMPTY_MESSAGE_DEFAULTS,
+      campaign: { ...EMPTY_MESSAGE_DEFAULTS.campaign, dmMessage: "Here you go" },
+      offer: ownOffer,
+    });
+    mockI18n.mockResolvedValue({ locale: "en" });
+
+    const response = await remove("?section=campaign");
+
+    expect(savedData()).toEqual({ ...EMPTY_MESSAGE_DEFAULTS, offer: ownOffer });
+    expect((await response.json()).data.defaults).toEqual({
+      ...EMPTY_MESSAGE_DEFAULTS,
+      offer: ownOffer,
+    });
+  });
+
+  it("goes back to DbNull when nothing saved is left to keep", async () => {
+    // Only the campaign texts were the admin's own.
+    for (const stored of [
+      { ...german, campaign: saved.campaign },
+      null,
+      { version: 2, campaign: {} },
+    ]) {
+      vi.clearAllMocks();
+      signIn("ADMIN", stored);
+
+      const response = await remove("?section=campaign");
+
+      expect(mockPrisma.workspace.update).toHaveBeenCalledExactlyOnceWith({
+        where: { id: WORKSPACE },
+        data: { messageDefaults: Prisma.DbNull },
+      });
+      expect(mockPrisma.workspace.update.mock.calls[0][0].data.messageDefaults).toBe(Prisma.DbNull);
+      expect((await response.json()).data.defaults).toEqual(german);
+    }
+  });
+
+  it.each(["?section=campaigns", "?section=", "?section=version"])(
+    "answers 400 to %s and resets nothing",
+    async (query) => {
+      signIn("OWNER", saved);
+
+      const response = await remove(query);
+
+      expect(response.status).toBe(400);
+      expect((await response.json()).success).toBe(false);
+      expectNoWrites();
+    }
+  );
 });

@@ -242,6 +242,24 @@ describe("creating campaigns (campaigns:write)", () => {
     expect(state.campaigns.findFirst.mock.calls[1][0].select).toEqual(select);
   });
 
+  it("creates from name, keywords, post and link when the defaults switch the opening DM off", async () => {
+    // "Save these texts as defaults" with the opening DM off kept the German
+    // seed's offer switch on. Offers need the opening DM (R11), so the
+    // defaults leave them off instead of failing every minimal create.
+    state.workspaces.findUnique.mockResolvedValue({
+      id: "workspace",
+      messageDefaults: { ...german, campaign: { ...german.campaign, openingDmEnabled: false } },
+    });
+    expect((await restCreate(post(reel))).status).toBe(201);
+    const called = await (await mcp(callCreate(3, reel))).json();
+    expect(called.result.isError).toBeUndefined();
+    expect(state.campaigns.create).toHaveBeenCalledTimes(2);
+    for (const call of [0, 1]) {
+      expect(created(call)).toMatchObject({ openingDmEnabled: false, openingDmMessage: null, offersEnabled: false, isActive: false });
+    }
+    expect(state.offers.findFirst).not.toHaveBeenCalled();
+  });
+
   it("leaves offers off without an active offer and starts a campaign only when isActive is sent", async () => {
     state.offers.findFirst.mockResolvedValue(null);
     expect((await restCreate(post(reel))).status).toBe(201);

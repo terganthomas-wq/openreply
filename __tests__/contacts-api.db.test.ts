@@ -2,8 +2,9 @@
  * The Contacts API against a real Postgres.
  *
  * The list searches handles case-insensitively and filters by tag through a
- * relation, and the data deletion anonymises DM log rows with raw SQL (a
- * CASE on the comment id, string concatenation). The mocked suite
+ * relation, and the data deletion anonymises DM log rows and what
+ * Diagnostics keeps with raw SQL (a CASE on the comment id, string
+ * concatenation, JSONB key removal and text search). The mocked suite
  * (contacts-api) proves which statements the route sends; only a database
  * shows that Postgres runs them as meant and that the cascades take the
  * tags and offer rows along. Skipped without TEST_DATABASE_URL; each run
@@ -290,6 +291,9 @@ describe.skipIf(!databaseUrl)("contacts API on a real Postgres", () => {
       deleted: true,
       anonymisedLogs: 3,
       deletedClicks: 2,
+      // Nothing in Diagnostics names them yet (see the next test).
+      anonymisedEvents: 0,
+      clearedWebhookEvents: 0,
     });
 
     // The contact goes, and its tags and offer rows with it.
@@ -346,6 +350,90 @@ describe.skipIf(!databaseUrl)("contacts API on a real Postgres", () => {
 
     // Gone is gone.
     expect((await DELETE(apiRequest("DELETE", "?id=anna"))).status).toBe(404);
+  });
+
+  it("anonymises what Diagnostics keeps of the person and leaves everyone else's", async () => {
+    const jobId = `postback_ig_account_${ANNA}_mid_1`;
+    await db.operationalEvent.createMany({
+      data: [
+        // The worker's events about Anna on the first account.
+        { id: "ev_gate", workspaceId: WORKSPACE, source: "WORKER", message: "Follow gate rejected a button tap",
+          payload: { automationId: "campaign_account", automationName: "Campaign account", userId: ANNA, commenterName: "anna.k" } },
+        { id: "ev_offer", workspaceId: WORKSPACE, source: "WORKER", level: "WARNING", message: "Offer stopped: messaging window closed",
+          payload: { contactOfferId: "anna_offer", offerId: "offer", offerName: "Guide", automationId: "campaign_account", userId: ANNA, reason: "WINDOW_CLOSED" } },
+        { id: "ev_job", workspaceId: WORKSPACE, source: "WORKER", level: "ERROR", message: `DM worker job ${jobId} failed: boom`,
+          payload: { jobId, attemptsMade: 3, instagramAccountId: "ig_account", commentId: null } },
+        // Named once more where no key says so: the payload goes.
+        { id: "ev_nested", workspaceId: WORKSPACE, source: "WORKER", message: "Offer message delivery unconfirmed",
+          payload: { userId: ANNA, error: `Unknown recipient ${ANNA}` } },
+        // Everyone else's.
+        { id: "ev_ben", workspaceId: WORKSPACE, source: "WORKER", message: "Follow gate rejected a button tap",
+          payload: { automationId: "campaign_account", userId: BEN, commenterName: "ben_m" } },
+        { id: "ev_sweep", workspaceId: WORKSPACE, source: "SYSTEM", message: 'Comment sweep "Campaign account" [PROMPT]: 1 enqueued',
+          payload: { campaign: "Campaign account", enqueued: 1 } },
+        { id: "ev_other", workspaceId: OTHER_WORKSPACE, source: "WORKER", message: "Follow gate rejected a button tap",
+          payload: { userId: ANNA, commenterName: "anna.k" } },
+      ],
+    });
+    const comment = (account: string, from: string, text: string) => ({
+      object: "instagram",
+      entry: [{ id: `ig_${account}`, time: 1, changes: [{ field: "comments", value: { id: `c_${from}`, text, from: { id: from, username: "someone" }, media: { id: "media_1" } } }] }],
+    });
+    const tap = (account: string, from: string) => ({
+      object: "instagram",
+      entry: [{ id: `ig_${account}`, time: 1, messaging: [{ sender: { id: from }, recipient: { id: `ig_${account}` }, postback: { mid: "mid_1", title: "Ja, schick sie mir", payload: "reveal:campaign_account" } }] }],
+    });
+    await db.webhookEvent.createMany({
+      data: [
+        { id: "wh_comment", workspaceId: WORKSPACE, object: "instagram", status: "PROCESSED", payload: comment("account", ANNA, "Prompt bitte") },
+        // Meta's button taps are stored without a workspace.
+        { id: "wh_tap", object: "instagram", status: "FAILED", errorMessage: "Redis down", payload: tap("account", ANNA) },
+        { id: "wh_ben", workspaceId: WORKSPACE, object: "instagram", payload: comment("account", BEN, "Prompt") },
+        { id: "wh_anna_b", workspaceId: WORKSPACE, object: "instagram", payload: comment("account_b", ANNA, "Prompt") },
+        { id: "wh_other", workspaceId: OTHER_WORKSPACE, object: "instagram", payload: comment("account_other", ANNA, "Prompt") },
+        { id: "wh_tap_other", object: "instagram", payload: tap("account_other", ANNA) },
+      ],
+    });
+
+    const response = await DELETE(apiRequest("DELETE", "?id=anna"));
+    expect(response.status).toBe(200);
+    expect((await response.json()).data).toMatchObject({ anonymisedEvents: 4, clearedWebhookEvents: 2 });
+
+    const events = Object.fromEntries(
+      (await db.operationalEvent.findMany({ select: { id: true, message: true, payload: true, level: true } })).map(
+        ({ id, ...event }) => [id, event]
+      )
+    );
+    // What the events say about campaigns and offers stays; the person goes.
+    expect(events.ev_gate).toEqual({ level: "INFO", message: "Follow gate rejected a button tap",
+      payload: { automationId: "campaign_account", automationName: "Campaign account" } });
+    expect(events.ev_offer.payload).toEqual({ contactOfferId: "anna_offer", offerId: "offer", offerName: "Guide",
+      automationId: "campaign_account", reason: "WINDOW_CLOSED" });
+    expect(events.ev_job).toEqual({ level: "ERROR", message: "DM worker job postback_ig_account_deleted_mid_1 failed: boom",
+      payload: { jobId: "postback_ig_account_deleted_mid_1", attemptsMade: 3, instagramAccountId: "ig_account", commentId: null } });
+    expect(events.ev_nested).toEqual({ level: "INFO", message: "Offer message delivery unconfirmed", payload: null });
+    for (const id of ["ev_gate", "ev_offer", "ev_job", "ev_nested"]) {
+      expect(JSON.stringify(events[id]), id).not.toMatch(new RegExp(`${ANNA}|anna\\.k`));
+    }
+    expect(events.ev_ben.payload).toEqual({ automationId: "campaign_account", userId: BEN, commenterName: "ben_m" });
+    expect(events.ev_sweep.payload).toEqual({ campaign: "Campaign account", enqueued: 1 });
+    expect(events.ev_other.payload).toEqual({ userId: ANNA, commenterName: "anna.k" });
+
+    const webhooks = Object.fromEntries(
+      (await db.webhookEvent.findMany({ select: { id: true, payload: true, status: true, errorMessage: true } })).map(
+        ({ id, ...webhook }) => [id, webhook]
+      )
+    );
+    // Anna's raw comment and tap on this account are emptied; the rows stay
+    // for Diagnostics.
+    expect(webhooks.wh_comment).toEqual({ payload: {}, status: "PROCESSED", errorMessage: null });
+    expect(webhooks.wh_tap).toEqual({ payload: {}, status: "FAILED", errorMessage: "Redis down" });
+    // Ben's, the other account's (the same IGSID string there is another
+    // person) and the other workspace's stay as received.
+    expect(webhooks.wh_ben.payload).toEqual(comment("account", BEN, "Prompt"));
+    expect(webhooks.wh_anna_b.payload).toEqual(comment("account_b", ANNA, "Prompt"));
+    expect(webhooks.wh_other.payload).toEqual(comment("account_other", ANNA, "Prompt"));
+    expect(webhooks.wh_tap_other.payload).toEqual(tap("account_other", ANNA));
   });
 
   it("deletes nothing of another workspace", async () => {

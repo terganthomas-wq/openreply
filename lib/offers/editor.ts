@@ -1,27 +1,31 @@
 /**
  * The offer editor's form and the steps between it and the Offers API (R3,
  * R13): the body the editor saves, the tag names a new offer takes from the
- * workspace's tag templates, a funnel stage's share of everyone offered,
- * moving an entry up or down, cleaning up a campaign's own offer order and
- * what went wrong with a card image upload.
+ * workspace's tag templates, the API's rules by form field in the interface
+ * language, a funnel stage's share of everyone offered, moving an entry up
+ * or down, cleaning up a campaign's own offer order and what went wrong with
+ * a card image upload.
  *
  * Kept apart from the pages so it can be unit-tested
  * (__tests__/offers-editor.test.ts). Client-safe: no database, queue or
  * fetch.
  */
 
+import type { z } from "zod";
 import {
   EMPTY_MESSAGE_DEFAULTS,
   renderTagTemplate,
   type MessageDefaultsUpdate,
   type OfferDefaults,
 } from "@/lib/campaigns/message-defaults";
+import type { I18n } from "@/lib/i18n";
 import {
   OFFER_DELAY_MAX_SECONDS,
   OFFER_IMAGE_MAX_BYTES,
   OFFER_IMAGE_TYPES,
   REMINDER_DELAY_MAX_HOURS,
 } from "@/lib/offers/schema";
+import { issueMessage } from "@/lib/validation/messages";
 
 /** One message of a list and the pause before it, in seconds. */
 export interface TimedMessage {
@@ -395,6 +399,40 @@ export function firstErrorField(
   errors: Partial<Record<OfferField, string>>
 ): OfferField | null {
   return OFFER_FORM_FIELDS.find((field) => errors[field] !== undefined) ?? null;
+}
+
+/**
+ * The form field a failed check points at: the first segment of its path,
+ * after "offer" for the workspace's default texts (whose tag templates stand
+ * for the tags). The defaults route names a path as one string
+ * ("offer.offerMessages.1"); split it first. Null when the path names no
+ * field of the form.
+ */
+export function offerFieldOfPath(
+  path: readonly PropertyKey[]
+): OfferField | null {
+  const [first] = path[0] === "offer" ? path.slice(1) : path;
+  if (first === "tagTemplates") return "tagOffered";
+  return OFFER_FORM_FIELDS.find((field) => field === first) ?? null;
+}
+
+/**
+ * The first issue per field of a failed check of an offer (offerInputSchema)
+ * or of its default texts (offerDefaultsSchema), in the interface language
+ * (lib/validation/messages.ts), so the form never shows the schema's English.
+ */
+export function offerFieldErrors(
+  issues: readonly z.core.$ZodIssue[],
+  t: I18n["t"]
+): Partial<Record<OfferField, string>> {
+  const errors: Partial<Record<OfferField, string>> = {};
+  for (const issue of issues) {
+    const field = offerFieldOfPath(issue.path);
+    if (field && errors[field] === undefined) {
+      errors[field] = issueMessage(t, issue);
+    }
+  }
+  return errors;
 }
 
 /**

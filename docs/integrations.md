@@ -114,8 +114,11 @@ curl -X POST https://YOUR-DOMAIN/api/v1/campaigns \
   installation's language (`DEFAULT_LOCALE`, German today) written once, as on
   the editor's first visit; in a language without a built-in set there are no
   defaults and the body must carry the texts (at least `dmMessage`). The
-  defaults switch offers on only while the workspace has an active offer.
-  Anything the body sends, `null` included, wins over a default.
+  defaults switch offers on only while the workspace has an active offer and
+  only together with the opening DM they bring along, which offers need.
+  Anything the body sends, `null` included, wins over a default, so a body
+  that switches the opening DM off while the defaults have offers on also
+  sends `"offersEnabled": false`.
 - **Paused.** A created campaign is paused unless the body sends
   `"isActive": true`. Once active it answers matching comments with DMs.
 - **Link.** `trackedDestinationUrl` becomes the DM's tracked link button. As

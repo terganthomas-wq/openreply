@@ -17,16 +17,24 @@ unsaved campaign stays in the editor when switching languages. Default outgoing
 message content retains its original values in both languages.
 
 New campaigns open with the workspace's default texts: the opening DM, both
-follow requests, the link DM and its button, the public replies and the
-question-mark filter. A workspace without them gets the built-in set of the
-interface language once, the first time someone opens a new campaign. Only
-German has one (generic texts with "du", no brand copy); in the other languages
-the editor opens blank until an owner or admin uses **Save these texts as
-defaults for new campaigns**. From then on the texts belong to the workspace
-and stay as they are when anyone changes the interface language; **Reset to
-built-in defaults** brings back the built-in set of the current language. They
-are stored in `Workspace.messageDefaults` (`lib/campaigns/message-defaults.ts`)
-and are never translation keys.
+follow requests, the link DM and its button, the public replies, the
+question-mark filter and whether a lead magnet is offered after the link. A
+workspace without them gets the built-in set of the interface language once,
+the first time someone opens a new campaign. Only German has one (generic
+texts with "du", no brand copy); in the other languages the editor opens blank
+until an owner or admin uses **Save these texts as defaults for new
+campaigns**. From then on the texts belong to the workspace and stay as they
+are when anyone changes the interface language; **Reset to built-in
+defaults** brings back the built-in campaign texts of the current language
+(none in a language without a built-in set) and leaves the default texts for
+offers as they were saved. They are stored in `Workspace.messageDefaults`
+(`lib/campaigns/message-defaults.ts`) and are never translation keys.
+
+The offer editor and both **Save these texts as defaults** buttons check what
+they save with the API's own rules first and say what is wrong in the
+interface language, naming the field as the form shows it (for example the
+640 characters a message with a button keeps). The API itself answers in
+English.
 
 Public marketing, template playbooks, legal pages, authentication emails, and
 raw API/provider error details remain in English. Those are outside this

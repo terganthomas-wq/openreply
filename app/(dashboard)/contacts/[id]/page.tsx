@@ -114,7 +114,7 @@ function ContactDetail({ contactId }: { contactId: string }) {
   async function deleteContact() {
     if (
       !window.confirm(
-        t("Delete this contact? Their tags, offer history and link clicks are deleted and their DM log entries are anonymised. This cannot be undone.")
+        t("Delete this contact? Their tags, offer history and link clicks are deleted, and their entries in the DM log and in Diagnostics are anonymised. This cannot be undone.")
       )
     ) {
       return;
@@ -462,7 +462,7 @@ function ContactDetail({ contactId }: { contactId: string }) {
         <section className="space-y-3 rounded border border-error/20 p-4 sm:p-6">
           <h2 className="text-sm font-semibold">{t("Delete contact")}</h2>
           <p className="text-sm text-muted">
-            {t("For a data deletion request. Deletes this person's tags, offer history and link clicks and anonymises their DM log entries, so campaign counts stay. If they comment or write again, they start as a new contact.")}
+            {t("For a data deletion request. Deletes this person's tags, offer history and link clicks and anonymises their entries in the DM log and in Diagnostics, so campaign counts stay. If they comment or write again, they start as a new contact.")}
           </p>
           {deleteError && (
             <div

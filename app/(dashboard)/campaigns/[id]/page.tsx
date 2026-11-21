@@ -218,10 +218,14 @@ export default function CampaignDetailPage() {
     { label: t("Failed"), value: campaign.analytics.failed },
   ];
 
+  // min-w-0 on the cells: a grid item defaults to min-width:auto, so below
+  // lg, where the one column is sized by its content, a long unwrapped string
+  // (a truncated offer or campaign name) would widen every box past the
+  // screen.
   return (
     <div className="grid gap-6 lg:grid-cols-[minmax(0,340px)_1fr]">
       {/* Left: config summary */}
-      <div className="space-y-6">
+      <div className="min-w-0 space-y-6">
         <div className="flex items-center gap-2">
           <Link
             href="/campaigns"
@@ -421,7 +425,7 @@ export default function CampaignDetailPage() {
       </div>
 
       {/* Right: top bar + tabs */}
-      <div className="space-y-4">
+      <div className="min-w-0 space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-3 border-b border-border pb-3">
           <div className="flex gap-4">
             <TabButton active={tab === "insights"} onClick={() => setTab("insights")}>
@@ -521,9 +525,11 @@ function Summary({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
+// Texts are the user's own and may hold a long link: it wraps inside the box
+// instead of running past it on a phone.
 function FieldBox({ children }: { children: React.ReactNode }) {
   return (
-    <div className="rounded border border-border bg-surface px-3 py-2 text-sm text-foreground">
+    <div className="wrap-anywhere rounded border border-border bg-surface px-3 py-2 text-sm text-foreground">
       {children}
     </div>
   );

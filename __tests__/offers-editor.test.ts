@@ -5,8 +5,10 @@ import {
   mergeMessageDefaults,
   messageDefaultsSchema,
   messageDefaultsUpdateSchema,
+  offerDefaultsSchema,
   type OfferDefaults,
 } from "../lib/campaigns/message-defaults";
+import { createI18n } from "../lib/i18n";
 import {
   clampDelaySeconds,
   clampReminderHours,
@@ -21,6 +23,8 @@ import {
   moveItem,
   newOfferEditorState,
   offerDefaultsUpdate,
+  offerFieldErrors,
+  offerFieldOfPath,
   offerPayload,
   percentOfOffered,
   sentMessages,
@@ -382,6 +386,75 @@ describe("form checks", () => {
     expect(sentMessages([{ text: " a ", delaySeconds: 99 }])).toEqual([
       { text: "a", delaySeconds: 60 },
     ]);
+  });
+});
+
+describe("the editor's own check in the interface language", () => {
+  const de = createI18n("de").t;
+  const LAST_MESSAGE_DE =
+    "Die letzte Angebotsnachricht trägt den Button: höchstens 640 Zeichen (Emojis zählen doppelt).";
+
+  // Message 2 grew to 742 characters (it may: only the last one carries the
+  // button), then message 3 was removed, so message 2 is the last now.
+  function lastMessageTooLong(): OfferEditorState {
+    const typed = typedGermanOffer();
+    return {
+      ...typed,
+      offerMessages: [typed.offerMessages[0], { text: "a".repeat(742), delaySeconds: 3 }],
+    };
+  }
+
+  it("says the last offer message's limit in German when the offer is saved", () => {
+    const parsed = offerInputSchema.safeParse(offerPayload(lastMessageTooLong()));
+    expect(parsed.success).toBe(false);
+
+    const errors = offerFieldErrors(parsed.error!.issues, de);
+
+    expect(errors).toEqual({ offerMessages: LAST_MESSAGE_DE });
+    expect(firstErrorField(errors)).toBe("offerMessages");
+  });
+
+  it("says it the same way when the texts are saved as defaults", () => {
+    const update = offerDefaultsUpdate(lastMessageTooLong());
+    const parsed = offerDefaultsSchema.safeParse({
+      ...update.offer,
+      tagTemplates: GERMAN.tagTemplates,
+    });
+    expect(parsed.success).toBe(false);
+    // Not a bare "1": the path names the list.
+    expect(parsed.error!.issues[0].path).toEqual(["offerMessages", 1]);
+
+    expect(offerFieldErrors(parsed.error!.issues, de)).toEqual({
+      offerMessages: LAST_MESSAGE_DE,
+    });
+  });
+
+  it("words labels and card texts by their limit, the first issue per field", () => {
+    const parsed = offerInputSchema.safeParse(
+      offerPayload({
+        ...typedGermanOffer(),
+        name: "a".repeat(101),
+        offerButtonLabel: "Ja, gerne! 🙌🙌🙌🙌🙌",
+        cardTitle: "a".repeat(81),
+      })
+    );
+
+    expect(offerFieldErrors(parsed.error!.issues, de)).toEqual({
+      // Names count code points, as zod does.
+      name: "Höchstens 100 Zeichen.",
+      offerButtonLabel: "Höchstens 20 Zeichen (Emojis zählen doppelt).",
+      cardTitle: "Höchstens 80 Zeichen (Emojis zählen doppelt).",
+    });
+  });
+
+  it("names the form field behind a path, the defaults route's included", () => {
+    expect(offerFieldOfPath(["offerMessages", 1])).toBe("offerMessages");
+    expect(offerFieldOfPath("offer.offerMessages.1".split("."))).toBe("offerMessages");
+    expect(offerFieldOfPath(["offer", "reminderMessage"])).toBe("reminderMessage");
+    // The tag templates stand for the tags.
+    expect(offerFieldOfPath(["offer", "tagTemplates", "sent"])).toBe("tagOffered");
+    expect(offerFieldOfPath(["campaign", "dmMessage"])).toBeNull();
+    expect(offerFieldOfPath([])).toBeNull();
   });
 });
 

@@ -66,6 +66,14 @@ const delays = z
   .max(OFFER_MESSAGES_MAX);
 
 /**
+ * The rule that the last offer message, which carries the button, keeps the
+ * 640 units of a button message (here and in the workspace's default texts
+ * for offers). Its issue names the rule and the limit in params, so the
+ * editors can word it in the interface language.
+ */
+export const LAST_OFFER_MESSAGE_RULE = "lastOfferMessage";
+
+/**
  * Every field of an offer. A body is the whole offer: what it leaves out gets
  * its default, on an edit too, so a form that drops a field clears it. The
  * exception is isActive, the Offers page's pause switch: left out, a new
@@ -140,6 +148,7 @@ export const offerInputSchema = offerFieldsSchema.superRefine((offer, ctx) => {
       code: "custom",
       path: ["offerMessages", last],
       message: `The last offer message carries the button: at most ${BUTTON_TEXT_MAX} characters (emoji count as 2)`,
+      params: { maximum: BUTTON_TEXT_MAX, rule: LAST_OFFER_MESSAGE_RULE },
     });
   }
   if (offer.reminderEnabled && !offer.reminderMessage) {

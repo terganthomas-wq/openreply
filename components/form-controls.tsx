@@ -2,8 +2,8 @@
 
 /**
  * Form building blocks shared by the campaign editor and the offer editor:
- * a titled section, a radio row, an on/off switch and a text input with a
- * live length counter.
+ * a titled section, a radio row, an on/off switch, a text input with a live
+ * length counter and the counter alone, for a textarea.
  */
 
 import { useId } from "react";
@@ -132,5 +132,22 @@ export function CountedInput({
         {value.length}/{max}
       </span>
     </div>
+  );
+}
+
+/**
+ * The live length of a textarea's text against its limit, under the field,
+ * counted like CountedInput (UTF-16 units). Red once a text is over it: one
+ * saved before the limit, or loaded from an import.
+ */
+export function LengthCounter({ value, max }: { value: string; max: number }) {
+  return (
+    <p
+      className={`text-right text-xs tabular-nums ${
+        value.length > max ? "text-error" : "text-muted"
+      }`}
+    >
+      {value.length}/{max}
+    </p>
   );
 }

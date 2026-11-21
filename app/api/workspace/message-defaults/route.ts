@@ -17,10 +17,12 @@ import { Prisma } from "@/app/generated/prisma/client";
 import {
   builtInMessageDefaults,
   EMPTY_MESSAGE_DEFAULTS,
+  isMessageDefaultsSection,
   mergeMessageDefaults,
   messageDefaultsSchema,
   messageDefaultsUpdateSchema,
   parseMessageDefaults,
+  resetMessageDefaultsSection,
   type MessageDefaults,
 } from "@/lib/campaigns/message-defaults";
 import { prisma } from "@/lib/db/client";
@@ -165,18 +167,48 @@ export async function PUT(request: NextRequest) {
 }
 
 /**
- * Back to the built-in set: the column goes back to NULL, so the next read
- * seeds it again in the reader's language. The response carries what that
- * read will return.
+ * Back to the built-in set. ?section=campaign (the campaign editor's reset)
+ * or ?section=offer resets that part alone, to the built-in set of the
+ * reader's language or, without one, to empty defaults, and keeps the other
+ * part as saved: both live in the one column. Without a section, or when
+ * nothing saved is left to keep (resetMessageDefaultsSection), the column
+ * goes back to NULL, so the next read seeds it again in the reader's
+ * language. The response carries the defaults new campaigns and offers now
+ * start from.
  */
-export async function DELETE() {
+export async function DELETE(request: NextRequest) {
   const access = await writableWorkspace();
   if ("response" in access) return access.response;
   const { context } = access;
+
+  const section = request.nextUrl.searchParams.get("section");
+  if (section !== null && !isMessageDefaultsSection(section)) {
+    return fail(400, 'The section is "campaign" or "offer"');
+  }
+
+  const builtIn = await builtInForRequest();
+  const kept = section
+    ? resetMessageDefaultsSection(
+        parseMessageDefaults(context.workspace.messageDefaults),
+        section,
+        builtIn
+      )
+    : null;
+  if (kept) {
+    // The kept section was valid when saved and the reset one is built in;
+    // checked all the same, like every write of this column.
+    const checked = messageDefaultsSchema.safeParse(kept);
+    if (!checked.success) return invalidInput(checked.error);
+    await prisma.workspace.update({
+      where: { id: context.workspaceId },
+      data: { messageDefaults: checked.data },
+    });
+    return respond(checked.data, true);
+  }
 
   await prisma.workspace.update({
     where: { id: context.workspaceId },
     data: { messageDefaults: Prisma.DbNull },
   });
-  return respond(await builtInForRequest(), true);
+  return respond(builtIn, true);
 }
