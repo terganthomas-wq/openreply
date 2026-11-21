@@ -910,10 +910,72 @@ describe("late start", () => {
         workspaceId: "workspace_123",
         instagramAccountId: "ig_account_row_1",
         igsid: "commenter_999",
+        // Recorded by the time the delivery queued the start, two seconds
+        // after the tap, give or take a minute of the database's clock.
+        createdAt: { lte: new Date(TAP_TIME + 2000 + 60_000) },
       },
       select: { id: true, username: true, lastInteractionAt: true },
     });
     expect(mockPrisma.contact.upsert).not.toHaveBeenCalled();
+  });
+
+  // The bound is the time the delivery queued the start, not the tap or DM
+  // itself: someone new is recorded only when the worker gets to their DM.
+  it("takes only a contact recorded by the time its job was queued", async () => {
+    // The worker got to a first DM three hours late: the contact is from
+    // then, the start's job from right after, and both count.
+    const queuedAt = TAP_TIME + 3 * HOUR + 5000;
+    await processOffer(lateJob({}, { timestamp: queuedAt }));
+
+    expect(mockPrisma.contact.findFirst.mock.calls[0][0].where.createdAt).toEqual({
+      lte: new Date(queuedAt + 60_000),
+    });
+    expect(mockPrisma.contactOffer.create).toHaveBeenCalledTimes(1);
+  });
+
+  // The contact the delivery recorded was deleted on request, and the person
+  // came back later: their new contact is newer than the start's job, so the
+  // lookup finds none, and the old trigger brings no offer.
+  it("skips a contact recorded after its job, untouched and unnamed", async () => {
+    // The database leaves out a row the bound excludes.
+    mockPrisma.contact.findFirst.mockImplementation(async ({ where }) =>
+      where.createdAt ? null : { ...STORED_CONTACT, lastInteractionAt: null }
+    );
+
+    await processOffer(lateJob());
+
+    expect(mockPrisma.contact.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.contactOffer.create).not.toHaveBeenCalled();
+    expect(mockPrisma.contactTag.createMany).not.toHaveBeenCalled();
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+    expect(sends()).toBe(0);
+    expect(console.log).toHaveBeenCalledWith(
+      "[Offers] Late start skipped: the contact no longer exists",
+      { automationId: "auto_789" }
+    );
+    expect(JSON.stringify(vi.mocked(console.log).mock.calls)).not.toContain(
+      "commenter_999"
+    );
+  });
+
+  it("bounds the contact by the trigger when the job carries no queue time", async () => {
+    const job = lateJob();
+    (job as { timestamp?: number }).timestamp = undefined;
+
+    await processOffer(job);
+
+    expect(mockPrisma.contact.findFirst.mock.calls[0][0].where.createdAt).toEqual({
+      lte: new Date(TAP_TIME + 60_000),
+    });
+  });
+
+  it("records the contact as before for a start right after the link", async () => {
+    mockPrisma.contact.upsert.mockResolvedValue(STORED_CONTACT);
+
+    await processOffer(lateJob({ lateStart: undefined }));
+
+    expect(mockPrisma.contact.upsert).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.contact.findFirst).not.toHaveBeenCalled();
   });
 
   it("records that the offer started late and queues its first message", async () => {

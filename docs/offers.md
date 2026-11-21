@@ -75,10 +75,17 @@ link**; `offerDelayHours` in the campaign API) has two settings:
   reminder: whoever does not tap gets nothing more.
 
 At its start a late offer works like any other: it takes the campaign's
-current offer order and checks the window. A contact deleted in the
-meantime gets nothing and is not created again. If the window has closed
-after all, for example because the worker was down, the start is skipped and
-Diagnostics says "Offer skipped: messaging window closed".
+current offer order and checks the window. It only takes the contact the
+delivery recorded: one recorded by the time the delivery queued the start
+(the job's timestamp, plus a minute for the database's clock). A contact
+deleted in the meantime gets nothing and is not created again, and neither
+does the person's new contact when they wrote or tapped again after that
+deletion; the start is skipped with an anonymous log line. The bound is the
+queue time rather than the tap or DM itself because someone whose first DM
+brought the link is recorded only when the worker gets to that DM. If the
+window has closed after all, for example because the worker was down, the
+start is skipped and Diagnostics says "Offer skipped: messaging window
+closed".
 
 The setting applies to links delivered from then on. Late starts already
 waiting keep their time when it changes, also when a campaign goes back to
@@ -94,8 +101,14 @@ without a tap or a DM (as the comment's private reply) starts no offer.
 Every offer message checks the window first, and the reminder is sent no
 later than 23.5 hours after the person's last tap or DM, so it may come a
 little earlier than the hours you set. A follow-up message switched on in the
-same campaign also goes out after the link and can land between the offer
-messages.
+same campaign also goes out after the link. With an offer right after the link
+it can land between the offer messages, and the campaign editor warns about
+it. With an offer 22 hours later it comes first as long as it waits at most
+1260 minutes (21 hours): the offer starts 21.5 to 22 hours after the tap or
+DM, and the other half hour is for a link that took a while. Only a longer
+follow-up can reach the offer, and only then does the editor warn. A link that
+an Instagram request limit held back for longer
+(`docs/delivery-retries.md`) can still bring a shorter follow-up near it.
 
 ## The card image
 
@@ -148,7 +161,9 @@ person the link.
 The landing page keeps the code with the pending sign-up and, once the
 sign-up is confirmed, reports it from its server: `POST /api/offers/signup`
 with `{"token": "<ig value>"}` and a service key that has `signups:write`
-(**Report sign-ups** on the API & MCP page; such a key can do nothing else).
+(**Report sign-ups** on the API & MCP page; such a key can do nothing else,
+lives up to 365 days, a year by default, and API & MCP and Diagnostics warn
+14 days before it expires, see `docs/integrations.md`).
 The request, the answers and a PHP example are in `deploy/README.de.md`. The
 first report records the sign-up (`signedUpAt` and the offer's "signed up"
 tag, in one transaction) and queues the chat confirmation; every later report

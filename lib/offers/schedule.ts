@@ -76,6 +76,42 @@ export function lateStartDelayMs(
   return Math.max(0, lateStartFireAt(interactionAt) - now);
 }
 
+// A late offer starts no earlier than this after the tap or DM (minutes):
+// lateStartFireAt rounds down by up to half an hour.
+const LATE_START_EARLIEST_MINUTES =
+  OFFER_LATE_START_HOURS * 60 - WAKE_UP_GRID_MS / MINUTE_MS;
+
+// How long after its tap or DM a link may go out and still count as right
+// after it: a follow re-check waits up to a minute, a busy queue longer.
+const LINK_DELAY_ALLOWANCE_MINUTES = 30;
+
+/**
+ * A campaign's follow-up message goes out followUpDelayMinutes after the
+ * link. One that waits longer than this (21 hours) can reach a late offer,
+ * which starts 21.5 to 22 hours after the tap or DM; one that waits no longer
+ * comes before it. Only a link that went out more than half an hour after
+ * its tap or DM, held back by an Instagram request limit for instance, can
+ * bring a shorter follow-up near the offer.
+ */
+export const LATE_OFFER_FOLLOW_UP_LIMIT_MINUTES =
+  LATE_START_EARLIEST_MINUTES - LINK_DELAY_ALLOWANCE_MINUTES;
+
+/**
+ * Whether a campaign's follow-up message can land between its offer's
+ * messages. An offer right after the link starts with it and then waits
+ * hours for a tap or its reminder, so any follow-up can. A late offer only
+ * meets a follow-up that waits longer than LATE_OFFER_FOLLOW_UP_LIMIT_MINUTES.
+ */
+export function followUpCanMeetOffer(
+  offerDelayHours: number | null | undefined,
+  followUpDelayMinutes: number
+): boolean {
+  return (
+    !offerStartsLate(offerDelayHours) ||
+    followUpDelayMinutes > LATE_OFFER_FOLLOW_UP_LIMIT_MINUTES
+  );
+}
+
 /**
  * The workspace's default offer order. `position` decides it; `createdAt` and
  * `id` only break ties, so tied rows never come back in a different order.

@@ -1,33 +1,42 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import KeyExpiryNotice, { ACCESS_LABELS, type KeyNeedingAttention } from "@/components/key-expiry-notice";
 import { useI18n } from "@/lib/i18n/provider";
+import { KEY_EXPIRY_WARNING_DAYS, keyLifetime, type KeyExpiryWarning } from "@/lib/integrations/key-lifetime";
 import { ACCESS_SCOPES, keyAccess, type KeyAccess } from "@/lib/integrations/scopes";
 import { SIGNUP_CALLBACK_PATH } from "@/lib/offers/signup-link";
 
-type Key = { id: string; name: string; scopes: string[]; expiresAt: string; revokedAt: string | null };
+// As the keys route lists them; it tells by its own clock whether a key has
+// expired or needs a new one soon.
+type Key = { id: string; name: string; scopes: string[]; expiresAt: string; revokedAt: string | null;
+  expired: boolean; expiryWarning: KeyExpiryWarning | null };
 // The three kinds of key the form creates.
 type Access = Exclude<KeyAccess, "createOnly">;
 
-// The form's words for each kind, also in the key list, which names a key by
-// its scopes. A key with campaigns:write alone comes only from the API. The
-// offer editor names the sign-up key's access the same way.
-const ACCESS_LABELS = {
-  read: "Read only",
-  write: "Read and write",
-  createOnly: "Write only",
-  signups: "Report sign-ups",
-} as const satisfies Record<KeyAccess, string>;
+// The lifetimes a kind of key may have: a sign-up key up to a year.
+const lifetimeOf = (access: Access) => keyLifetime(ACCESS_SCOPES[access]);
+
+// The keys that need a new one, for the notice above the form.
+function needingAttention(keys: Key[]): KeyNeedingAttention[] {
+  return keys.flatMap(key => key.expiryWarning ? [{ ...key, warning: key.expiryWarning }] : []);
+}
 
 export default function IntegrationsPage() {
   const { t, locale } = useI18n();
   const [keys, setKeys] = useState<Key[]>([]);
   const [name, setName] = useState("");
-  const [days, setDays] = useState(30);
+  const [days, setDays] = useState(lifetimeOf("read").defaultDays);
   const [access, setAccess] = useState<Access>("read");
   const [token, setToken] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
+
+  // Each kind starts at its own default lifetime: a year for a sign-up key.
+  function selectAccess(next: Access) {
+    setAccess(next);
+    setDays(lifetimeOf(next).defaultDays);
+  }
 
   async function load() {
     const response = await fetch("/api/integrations/keys");
@@ -76,17 +85,19 @@ export default function IntegrationsPage() {
     <p className="text-muted">{t("Workspace-scoped keys. A read-only key lists and reads campaigns. A read-and-write key can also create campaigns; they start paused unless the request switches them on. No key can change or delete existing campaigns. Only admins and owners can manage keys.")}</p>
     <p className="text-muted">{t("A key that only reports sign-ups is for your landing page: it tells this tool who signed up after clicking an offer's link (offers with “Report the sign-up back”). It can do nothing else.")}</p>
     {notice && <p role="status">{notice}</p>}
+    <KeyExpiryNotice keys={needingAttention(keys)} />
     <section className="space-y-3 rounded border border-border p-4">
       <label className="block">{t("Key name")}<input maxLength={100} disabled={busy} className="w-full rounded border border-border p-2" value={name} onChange={e => setName(e.target.value)} /></label>
-      <label className="block">{t("Access")}<select disabled={busy} value={access} onChange={e => setAccess(e.target.value as Access)} className="ml-3 max-w-full rounded border border-border p-2">
+      <label className="block">{t("Access")}<select disabled={busy} value={access} onChange={e => selectAccess(e.target.value as Access)} className="ml-3 max-w-full rounded border border-border p-2">
         <option value="read">{t(ACCESS_LABELS.read)}</option>
         <option value="write">{t(ACCESS_LABELS.write)}</option>
         <option value="signups">{t(ACCESS_LABELS.signups)}</option>
       </select></label>
       <label className="block">{t("Key lifetime")}<select disabled={busy} value={days} onChange={e => setDays(Number(e.target.value))} className="ml-3 rounded border border-border p-2">
-        {[30, 60, 90].map(value => <option key={value} value={value}>{t("{days} days", { days: value })}</option>)}
+        {lifetimeOf(access).choices.map(value => <option key={value} value={value}>{t("{days} days", { days: value })}</option>)}
       </select></label>
       <p className="text-sm text-muted">{t("Applies only to new keys. Existing expiration dates do not change.")}</p>
+      <p className="text-sm text-muted">{t("This page and Diagnostics warn {days} days before a key expires.", { days: KEY_EXPIRY_WARNING_DAYS })}</p>
       <button disabled={busy || !name.trim()} onClick={create} className="rounded bg-accent px-4 py-2 text-white disabled:opacity-50">{t("Create key for {days} days", { days })}</button>
       {token && <div role="status" className="space-y-2">
         <p>{t("Shown once. Store securely; never put keys in URLs, screenshots or GitHub.")}</p>
@@ -98,9 +109,11 @@ export default function IntegrationsPage() {
     <section className="space-y-3">{keys.map(key => {
       // Scopes that are no kind (the keys route stores none) show as stored.
       const access = keyAccess(key.scopes);
-      return <div key={key.id} className="rounded border border-border p-4">
+      const date = new Date(key.expiresAt).toLocaleDateString(locale);
+      return <div key={key.id} className={`rounded border p-4 ${key.expiryWarning ? "border-warning/30" : "border-border"}`}>
         <strong className="break-words">{key.name}</strong>
-        <p className="text-sm">{access ? t(ACCESS_LABELS[access]) : key.scopes.join(" + ")} · {t("Expires: {date}", { date: new Date(key.expiresAt).toLocaleDateString(locale) })}</p>
+        <p className="text-sm">{access ? t(ACCESS_LABELS[access]) : key.scopes.join(" + ")} · <span className={key.expiryWarning ? "text-warning" : undefined}>
+          {key.expired ? t("Expired: {date}", { date }) : t("Expires: {date}", { date })}</span></p>
         {key.revokedAt ? <span>{t("Revoked")}</span> : <button disabled={busy} onClick={() => revoke(key)} className="text-red-500">{t("Revoke key")}</button>}
       </div>;
     })}</section>

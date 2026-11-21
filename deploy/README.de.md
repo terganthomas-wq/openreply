@@ -204,9 +204,14 @@ starten?“ pro Kampagne fest, wann das Lead-Magnet-Angebot kommt:
   die Angebote aus oder löschst du die Kampagne, startet keins der geplanten
   Angebote mehr. Eine pausierte Kampagne startet sie trotzdem, denn die Links
   sind schon raus. Ein inzwischen gelöschter Kontakt bekommt nichts und wird
-  nicht neu angelegt. Ist das Fenster zum Start doch zu (etwa weil der Worker
-  stundenlang aus war), steht in *Diagnostics* „Offer skipped: messaging
-  window closed“.
+  nicht neu angelegt, auch nicht, wenn die Person danach wieder schreibt oder
+  tippt: Der neue Kontakt bekommt das Angebot aus der alten Unterhaltung
+  nicht. Ist das Fenster zum Start doch zu (etwa weil der Worker stundenlang
+  aus war), steht in *Diagnostics* „Offer skipped: messaging window closed“.
+- Eine Folgenachricht der Kampagne kommt bei „22 Stunden später“ vor dem
+  Angebot, solange sie höchstens 1260 Minuten (21 Stunden) nach dem Link
+  geplant ist. Erst darüber kann sie zwischen die Angebotsnachrichten fallen,
+  und nur dann warnt der Editor davor.
 - Die späten Starts warten als verzögerte Jobs in Redis (einige hundert Bytes
   pro Person). Erst wenn auch der Worker aktualisiert ist (siehe *Updates*),
   starten Angebote 22 Stunden später, vorher weiter direkt.
@@ -234,11 +239,15 @@ So richtest du es ein:
    ersten Klick der Person und bleibt danach gleich. Ohne den Schalter geht
    der Link genau so raus wie eingetragen.
 2. Unter *API & MCP* einen Schlüssel mit dem Zugriff „Eintragungen melden“
-   anlegen, am besten für 90 Tage. Er kann nur Eintragungen melden, keine
-   Kampagnen lesen oder anlegen. Schlüssel laufen spätestens nach 90 Tagen
-   ab: rechtzeitig einen neuen anlegen und auf der Landingpage austauschen.
-   Mit einem abgelaufenen Schlüssel kommt `401`, die Seite selbst merkt davon
-   nichts.
+   anlegen. Er kann nur Eintragungen melden, keine Kampagnen lesen oder
+   anlegen, und gilt bis zu 365 Tage (so ist er voreingestellt; zur Wahl
+   stehen 90, 180 und 365 Tage). Schlüssel für Kampagnen gelten weiter
+   höchstens 90 Tage. Mit einem abgelaufenen Schlüssel kommt `401`, die
+   Seite selbst merkt davon nichts. Deshalb warnen *API & MCP* und *Diagnose*
+   14 Tage vor dem Ablauf, mit Name und Datum des Schlüssels, und nach dem
+   Ablauf weiter, solange er in den letzten 30 Tagen noch benutzt wurde.
+   Dann einen neuen Schlüssel anlegen, auf der Landingpage austauschen und
+   den alten widerrufen; ein widerrufener Schlüssel warnt nicht mehr.
 3. Die Landingpage übernimmt `ig` aus ihrer Adresse in ein verstecktes
    Formularfeld, speichert den Wert zusammen mit der noch unbestätigten
    Eintragung und meldet ihn erst, wenn die Eintragung bestätigt ist (beim

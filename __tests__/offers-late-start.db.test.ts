@@ -134,9 +134,15 @@ function offerJob(jobId: string, data: ProcessOfferJob, timestamp = Date.now()):
 
 /**
  * The start job a delivered link queued for a tap `hoursAgo` hours ago, as
- * it runs now. A late one was queued right after that tap.
+ * it runs now. A late one was queued right after the delivery, by default
+ * two seconds after that tap.
  */
-function startJob(igsid: string, hoursAgo: number, lateStart: boolean): Job<ProcessOfferJob> {
+function startJob(
+  igsid: string,
+  hoursAgo: number,
+  lateStart: boolean,
+  queuedAfterTapMs = 2000
+): Job<ProcessOfferJob> {
   const tappedAt = Date.now() - hoursAgo * HOUR;
   return offerJob(
     `start_${igsid}`,
@@ -151,12 +157,16 @@ function startJob(igsid: string, hoursAgo: number, lateStart: boolean): Job<Proc
       startKey: `campaign:tap:mid_${igsid}`,
       ...(lateStart ? { lateStart: true } : {}),
     },
-    tappedAt + 2000
+    tappedAt + queuedAfterTapMs
   );
 }
 
-/** The contact as the delivery recorded it, at its tap. */
-function deliveredTo(igsid: string, hoursAgo: number) {
+/**
+ * The contact as the delivery recorded it, at its tap, or `recordedAfterTapMs`
+ * later: the first DM of someone new is recorded when the worker gets to it.
+ */
+function deliveredTo(igsid: string, hoursAgo: number, recordedAfterTapMs = 0) {
+  const tappedAt = Date.now() - hoursAgo * HOUR;
   return db.contact.create({
     data: {
       workspaceId,
@@ -164,7 +174,8 @@ function deliveredTo(igsid: string, hoursAgo: number) {
       igsid,
       username: igsid,
       recipientHash: `hash_${igsid}`,
-      lastInteractionAt: new Date(Date.now() - hoursAgo * HOUR),
+      lastInteractionAt: new Date(tappedAt),
+      createdAt: new Date(tappedAt + recordedAfterTapMs),
     },
   });
 }
@@ -362,6 +373,51 @@ describe.skipIf(!databaseUrl)("offers that start 22 hours later, on a real Postg
     expect(await rowOf(igsid)).toBeNull();
     expect(waiting.size).toBe(0);
     expect(sent).toEqual([]);
+  });
+
+  it("brings no offer to the person's new contact after such a deletion", async () => {
+    const igsid = "igsid_came_back";
+    const contact = await deliveredTo(igsid, 22);
+    await db.contact.delete({ where: { id: contact.id } });
+    // An hour ago the person wrote again: a new contact, recorded then. Its
+    // window is open, but the old trigger is not its own.
+    const comeback = await db.contact.create({
+      data: {
+        workspaceId,
+        instagramAccountId: "account",
+        igsid,
+        recipientHash: `hash_${igsid}`,
+        lastInteractionAt: new Date(Date.now() - HOUR),
+      },
+    });
+
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await processOffer(startJob(igsid, 22, true));
+      expect(consoleLog).toHaveBeenCalledWith(
+        "[Offers] Late start skipped: the contact no longer exists",
+        { automationId: "campaign" }
+      );
+    } finally {
+      consoleLog.mockRestore();
+    }
+
+    expect(await rowOf(igsid)).toBeNull();
+    expect(waiting.size).toBe(0);
+    expect(sent).toEqual([]);
+    // Untouched: no tag, the same last interaction, still the only row.
+    expect(await db.contactTag.count({ where: { contactId: comeback.id } })).toBe(0);
+    expect(await db.contact.findMany({ where: { igsid } })).toEqual([comeback]);
+  });
+
+  it("starts for someone new whose first DM the worker got to late", async () => {
+    const igsid = "igsid_busy_queue";
+    // Recorded ten minutes after the DM, the link and the start right after.
+    await deliveredTo(igsid, 22, 10 * 60_000);
+
+    await processOffer(startJob(igsid, 22, true, 10 * 60_000 + 3000));
+
+    expect(await rowOf(igsid)).toMatchObject({ lateStart: true });
   });
 
   it("keeps the late start of a campaign switched back to right after the link", async () => {

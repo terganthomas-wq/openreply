@@ -95,6 +95,19 @@ describe("key management", () => {
     expect((await createKey(request({ name: "Reader", scopes: ["campaigns:read"], days }))).status).toBe(400);
     expect(state.keys.create).not.toHaveBeenCalled();
   });
+  // Only a sign-up key may live longer: campaign keys keep 90 days at most
+  // and 30 by default, whichever campaign scopes they carry.
+  it.each([[["campaigns:read", "campaigns:write"]], [["campaigns:write"]]])("keeps keys with %j to 90 days, 30 by default", async scopes => {
+    for (const days of [91, 180, 365]) {
+      expect((await createKey(request({ name: "Writer", scopes, days }))).status).toBe(400);
+    }
+    expect(state.keys.create).not.toHaveBeenCalled();
+    const before = Date.now();
+    expect((await createKey(request({ name: "Writer", scopes }))).status).toBe(201);
+    const expiresAt = state.keys.create.mock.calls[0][0].data.expiresAt.getTime();
+    expect(expiresAt).toBeGreaterThanOrEqual(before + 30 * 86400000);
+    expect(expiresAt).toBeLessThanOrEqual(Date.now() + 30 * 86400000);
+  });
   it.each([null, { workspaceId: "workspace", role: "MEMBER" }])("requires admin access for all management routes", async value => {
     state.context.mockResolvedValue(value);
     expect((await listKeys()).status).toBe(403);
@@ -124,6 +137,35 @@ describe("key management", () => {
     for (const scopes of [[], ["campaigns:delete"], ["campaigns:read", "contacts:read"]]) {
       expect(keyAccess(scopes), scopes.join(" ")).toBeNull();
     }
+  });
+  // The page shows which keys have expired and which need a new one soon,
+  // by the server's clock: from 14 days before the expiry, and after it
+  // while something used the key in the last 30 days.
+  it("tells per key whether it has expired or needs a new one", async () => {
+    const day = 86400000;
+    const now = Date.now();
+    const at = (offset: number) => new Date(now + offset * day);
+    const stored = [
+      { id: "fresh", expiresAt: at(15), revokedAt: null, lastUsedAt: at(-1) },
+      { id: "soon", expiresAt: at(13), revokedAt: null, lastUsedAt: null },
+      { id: "revoked-soon", expiresAt: at(2), revokedAt: at(-1), lastUsedAt: at(-1) },
+      { id: "expired-in-use", expiresAt: at(-3), revokedAt: null, lastUsedAt: at(-4) },
+      { id: "expired-idle", expiresAt: at(-3), revokedAt: null, lastUsedAt: at(-31) },
+      { id: "expired-unused", expiresAt: at(-3), revokedAt: null, lastUsedAt: null },
+    ].map(key => ({ name: key.id, scopes: ["signups:write"], createdAt: at(-300), ...key }));
+    state.keys.findMany.mockResolvedValue(stored);
+
+    const { keys } = await (await listKeys()).json();
+
+    expect(keys.map((key: { id: string; expired: boolean; expiryWarning: string | null }) => [key.id, key.expired, key.expiryWarning])).toEqual([
+      ["fresh", false, null],
+      ["soon", false, "expiring"],
+      ["revoked-soon", false, null],
+      ["expired-in-use", true, "expired"],
+      ["expired-idle", true, null],
+      ["expired-unused", true, null],
+    ]);
+    expect(JSON.stringify(keys)).not.toContain("tokenHash");
   });
   it("lists safe workspace metadata and revokes only workspace keys", async () => {
     expect((await listKeys()).status).toBe(200);
@@ -474,13 +516,37 @@ describe("sign-up keys (signups:write)", () => {
     expect(keyAccess(["signups:write", "campaigns:read"])).toBeNull();
   });
 
-  it("are created with that scope alone, for up to 90 days", async () => {
+  it("are created with that scope alone", async () => {
     const response = await createKey(request({ name: "Landingpage", scopes: ["signups:write"], days: 90 }));
     expect(response.status).toBe(201);
     expect(state.keys.create.mock.calls[0][0].data.scopes).toEqual(["signups:write"]);
     // Named twice it is stored once, as every scope is.
     expect((await createKey(request({ name: "Landingpage", scopes: ["signups:write", "signups:write"] }))).status).toBe(201);
     expect(state.keys.create.mock.calls[1][0].data.scopes).toEqual(["signups:write"]);
+  });
+
+  // A key on a landing page's server that runs out stops the sign-up
+  // feedback unnoticed, so it may live up to a year, a year by default.
+  it.each([
+    { label: "a year by default", days: undefined, expected: 365 },
+    { label: "up to a year", days: 365, expected: 365 },
+    { label: "longer than a campaign key", days: 180, expected: 180 },
+    { label: "or shorter", days: 30, expected: 30 },
+  ])("live $label", async ({ days, expected }) => {
+    const before = Date.now();
+    // Named twice, the scope still makes a sign-up key.
+    for (const scopes of [["signups:write"], ["signups:write", "signups:write"]]) {
+      expect((await createKey(request({ name: "Landingpage", scopes, ...(days === undefined ? {} : { days }) }))).status).toBe(201);
+    }
+    for (const [{ data }] of state.keys.create.mock.calls) {
+      expect(data.expiresAt.getTime()).toBeGreaterThanOrEqual(before + expected * 86400000);
+      expect(data.expiresAt.getTime()).toBeLessThanOrEqual(Date.now() + expected * 86400000);
+    }
+  });
+
+  it.each([0, 366, 730, 1.5])("never live %s days", async days => {
+    expect((await createKey(request({ name: "Landingpage", scopes: ["signups:write"], days }))).status).toBe(400);
+    expect(state.keys.create).not.toHaveBeenCalled();
   });
 
   it.each([

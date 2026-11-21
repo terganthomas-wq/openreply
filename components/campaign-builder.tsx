@@ -1581,6 +1581,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
             openingDmEnabled={openingDmEnabled}
             openingDmSwitchedOn={openingDmSwitchedOn}
             followUpEnabled={followUpEnabled}
+            followUpDelayMinutes={followUpDelayMinutes}
             onManageOffers={() => setOffersPageVisits((visits) => visits + 1)}
           />
         </Section>

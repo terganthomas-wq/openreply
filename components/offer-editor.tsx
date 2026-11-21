@@ -34,6 +34,10 @@ import {
 } from "@/lib/campaigns/message-defaults";
 import { useI18n } from "@/lib/i18n/provider";
 import {
+  KEY_EXPIRY_WARNING_DAYS,
+  SIGNUP_KEY_LIFETIME,
+} from "@/lib/integrations/key-lifetime";
+import {
   clampDelaySeconds,
   clampReminderHours,
   editorStateFromOffer,
@@ -1251,7 +1255,13 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
                       </Link>
                     </p>
                     <p className="text-xs text-muted">
-                      {t("A key runs out after 90 days at the latest. Create a new one in time and replace it on your landing page.")}
+                      {t(
+                        "A key for your landing page lasts up to {days} days. API & MCP and Diagnostics warn you {warnDays} days before it expires: then create a new one and replace it on your landing page.",
+                        {
+                          days: SIGNUP_KEY_LIFETIME.maxDays,
+                          warnDays: KEY_EXPIRY_WARNING_DAYS,
+                        }
+                      )}
                     </p>
                   </div>
 
@@ -1308,7 +1318,7 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
                   <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-xs text-muted">
                     {/* Tag names are the user's own words: never translated. */}
                     <span className="min-w-0 break-words">
-                      {t("Tag after the sign-up: {tag}", {
+                      {t("Tag for everyone who signed up: {tag}", {
                         tag: form.tags.signedUp.trim() || "—",
                       })}
                     </span>

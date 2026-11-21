@@ -182,14 +182,14 @@ describe("interface translations", () => {
       "Your landing page reports the sign-up to this address",
       "Your landing page also needs a key with the access “{access}”.",
       "Create the key under API & MCP",
-      "A key runs out after 90 days at the latest. Create a new one in time and replace it on your landing page.",
+      "A key for your landing page lasts up to {days} days. API & MCP and Diagnostics warn you {warnDays} days before it expires: then create a new one and replace it on your landing page.",
       "Details for whoever builds your landing page",
       "Copy the value of ig from the address of the landing page into a hidden form field and store it with the sign-up. Once the sign-up is confirmed (with double opt-in: after the click in the confirmation email), your server sends it:",
       "Wait at most 3 seconds for the answer and ignore errors, so the page never breaks. The key stays on the server, never in the page itself.",
       "Message in the chat after the sign-up",
       "Leave it empty to only tag the person.",
       "Instagram allows the message only up to 24 hours after the person's last tap or DM. Whoever signs up later only gets the tag.",
-      "Tag after the sign-up: {tag}",
+      "Tag for everyone who signed up: {tag}",
       "Change the tag",
       "After the sign-up on your landing page",
       "Signed up",
@@ -210,6 +210,12 @@ describe("interface translations", () => {
       // The callback address is this tool's, not the landing page's own:
       // the label says what it is for.
       expect(catalog, "old address label").not.toHaveProperty(["Address for your landing page"]);
+      // „Tag nach der Eintragung“ read as "the day after the sign-up".
+      expect(catalog, "old tag label").not.toHaveProperty(["Tag after the sign-up: {tag}"]);
+      // Sign-up keys live up to a year now.
+      expect(catalog, "old key lifetime").not.toHaveProperty([
+        "A key runs out after 90 days at the latest. Create a new one in time and replace it on your landing page.",
+      ]);
     }
     const { t } = createI18n("de");
     expect(t("Report the sign-up back")).toBe("Eintragung zurückmelden");
@@ -221,8 +227,20 @@ describe("interface translations", () => {
     expect(t("Your landing page also needs a key with the access “{access}”.", { access: t("Report sign-ups") })).toBe(
       "Deine Landingpage braucht dafür einen Schlüssel mit dem Zugriff „Eintragungen melden“."
     );
-    expect(t("Tag after the sign-up: {tag}", { tag: "Guide eingetragen" })).toBe(
-      "Tag nach der Eintragung: Guide eingetragen"
+    // Worded like the delivery tag's label, so "Tag" cannot read as "day".
+    expect(t("Tag for everyone who signed up: {tag}", { tag: "Guide eingetragen" })).toBe(
+      "Tag für alle, die sich eingetragen haben: Guide eingetragen"
+    );
+    expect(t("Tag for everyone who signed up: {tag}", { tag: "x" })).toMatch(
+      new RegExp(`^${t("Tag people who got the link").split(",")[0]},`)
+    );
+    expect(
+      t(
+        "A key for your landing page lasts up to {days} days. API & MCP and Diagnostics warn you {warnDays} days before it expires: then create a new one and replace it on your landing page.",
+        { days: 365, warnDays: 14 }
+      )
+    ).toBe(
+      "Ein Schlüssel für deine Landingpage gilt bis zu 365 Tage. 14 Tage vor dem Ablauf warnen dich API & MCP und die Diagnose: Dann erstell einen neuen und tausch ihn auf deiner Landingpage aus."
     );
     expect(createI18n("en").t("Signed up on the landing page: {offer}", { offer: "Guide" })).toBe(
       "Signed up on the landing page: Guide"
@@ -263,6 +281,63 @@ describe("interface translations", () => {
       })
     ).toBe(
       "Die Instagram-Anfragen für @studio liegen bei 85 % des Limits. Bei 100 % lehnt Instagram Nachrichten ab."
+    );
+  });
+
+  // R1-keys: the lifetime of a key and the warning before and after it
+  // expires, on the API & MCP page and in Diagnostics.
+  it("names expiring keys in every language", () => {
+    const keys = [
+      "Keys are expiring",
+      "Key “{name}” ({access}) expires on {date}.",
+      "Key “{name}” ({access}) expired on {date}, but was used in the last {days} days.",
+      "An expired key no longer works: your landing page, for example, can no longer report sign-ups. Create a new key in time, replace the old one wherever it is used, then revoke the old one.",
+      "Open API & MCP",
+      "Expired: {date}",
+      "This page and Diagnostics warn {days} days before a key expires.",
+    ] as const;
+    for (const catalog of [zhTW, ptBR, ru, de]) {
+      for (const key of keys) expect(catalog[key], key).toBeTruthy();
+    }
+    const { t } = createI18n("de");
+    expect(t("Keys are expiring")).toBe("Schlüssel laufen ab");
+    expect(
+      t("Key “{name}” ({access}) expires on {date}.", {
+        name: "Landingpage",
+        access: t("Report sign-ups"),
+        date: "5.12.2026",
+      })
+    ).toBe("Der Schlüssel „Landingpage“ (Eintragungen melden) läuft am 5.12.2026 ab.");
+    expect(
+      t("Key “{name}” ({access}) expired on {date}, but was used in the last {days} days.", {
+        name: "Landingpage",
+        access: t("Report sign-ups"),
+        date: "5.12.2026",
+        days: 30,
+      })
+    ).toBe(
+      "Der Schlüssel „Landingpage“ (Eintragungen melden) ist am 5.12.2026 abgelaufen, wurde in den letzten 30 Tagen aber noch benutzt."
+    );
+    expect(t("Expired: {date}", { date: "5.12.2026" })).toBe("Abgelaufen am 5.12.2026");
+    // The page names Diagnostics as the menu does.
+    expect(t("This page and Diagnostics warn {days} days before a key expires.", { days: 14 })).toContain(
+      t("Diagnostics")
+    );
+  });
+
+  // G1 leftover: with the offer 22 hours later the follow-up message only
+  // meets it when it waits that long, and the warning says so.
+  it("words the follow-up warning for a late offer in every language", () => {
+    const late =
+      "The follow-up message comes {minutes} minutes after the link. The offer may have started by then, so the follow-up can land between the offer messages. With {limit} minutes or less it comes before the offer.";
+    for (const catalog of [zhTW, ptBR, ru, de]) {
+      expect(catalog[late], late).toBeTruthy();
+      expect(
+        catalog["The follow-up message also goes out after the link, so it can land between the offer messages."]
+      ).toBeTruthy();
+    }
+    expect(createI18n("de").t(late, { minutes: 1300, limit: 1260 })).toBe(
+      "Die Folgenachricht kommt 1300 Minuten nach dem Link. Dann kann das Angebot schon laufen, und sie landet womöglich zwischen den Angebotsnachrichten. Mit höchstens 1260 Minuten kommt sie vor dem Angebot."
     );
   });
 });

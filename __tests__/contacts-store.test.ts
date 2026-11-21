@@ -224,6 +224,33 @@ describe("findContact", () => {
     expect(mockPrisma.contact.updateMany).not.toHaveBeenCalled();
   });
 
+  // A contact deleted on request comes back as a new row when the person
+  // writes again; work from before the deletion must not find it.
+  it("takes only a row recorded by `recordedBy`, when given", async () => {
+    await findContact({ ...IDENTITY, interactionAt: NOW, recordedBy: EARLIER });
+
+    expect(mockPrisma.contact.findFirst).toHaveBeenCalledWith({
+      where: {
+        workspaceId: "workspace_1",
+        instagramAccountId: "account_row_1",
+        igsid: "igsid_1",
+        createdAt: { lte: EARLIER },
+      },
+      select: { id: true, username: true, lastInteractionAt: true },
+    });
+  });
+
+  it("neither returns nor touches a row the bound leaves out", async () => {
+    mockPrisma.contact.findFirst.mockResolvedValue(null);
+
+    await expect(
+      findContact({ ...IDENTITY, interactionAt: NOW, recordedBy: EARLIER })
+    ).resolves.toBeNull();
+
+    expect(mockPrisma.contact.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.contact.upsert).not.toHaveBeenCalled();
+  });
+
   it("returns null for a contact that is gone, and writes nothing", async () => {
     mockPrisma.contact.findFirst.mockResolvedValue(null);
 

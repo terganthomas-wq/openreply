@@ -171,6 +171,10 @@ function sameJob(job: Job<ProcessOfferJob>, jobId: string): PauseCopy {
 // A reminder that could only go out within a minute is not worth a job.
 const MIN_REMINDER_DELAY_MS = 60_000;
 
+// A late start takes only a contact recorded by the time its job was queued
+// (the worker's clock); the database's clock may run up to this far ahead.
+const LATE_START_CLOCK_TOLERANCE_MS = 60_000;
+
 // The reminder carries the offer's link, so it counts as sent (sentAt, the
 // funnel's "Sent"), but it is not the card: until the card goes out as well,
 // sentVia says so.
@@ -237,8 +241,9 @@ async function loadContactOffer(
  * whichever campaign (ContactOffer is unique per contact and offer).
  *
  * A late start (job.data.lateStart) runs 22 hours after the delivery and
- * otherwise works the same, with two differences: it never creates the
- * contact, and its row records that it started late, so no reminder follows.
+ * otherwise works the same, with two differences: it only takes the contact
+ * the delivery recorded, never creating one, and its row records that it
+ * started late, so no reminder follows.
  */
 async function startOffer(job: Job<ProcessOfferJob>): Promise<void> {
   const {
@@ -280,12 +285,22 @@ async function startOffer(job: Job<ProcessOfferJob>): Promise<void> {
     igsid: userId,
     interactionAt: new Date(interactionAt),
   };
-  // The delivery recorded the contact. A late start comes 22 hours later,
-  // and a contact that is gone by then was deleted on request (GDPR): it is
-  // not created again, and no offer follows. The log names no person. Both
-  // throw on a database error: nothing was sent yet, so BullMQ retries.
+  // The delivery recorded the contact and then queued this start. A late
+  // start comes 22 hours later and takes only a contact recorded by the time
+  // its job was queued. One that is gone by then was deleted on request
+  // (GDPR); one recorded since is the same person back after such a
+  // deletion, whose new contact the old trigger must not reach. Either way
+  // nothing is created or touched, no offer follows, and the log names no
+  // person. The queue time, not the trigger's, is the bound: a person whose
+  // first DM brought the link was recorded only when the worker got to that
+  // DM, which a busy queue may delay. Both lookups throw on a database
+  // error: nothing was sent yet, so BullMQ retries.
+  const queuedAt = Number.isFinite(job.timestamp) ? job.timestamp : interactionAt;
   const contact = lateStart
-    ? await findContact(identity)
+    ? await findContact({
+        ...identity,
+        recordedBy: new Date(queuedAt + LATE_START_CLOCK_TOLERANCE_MS),
+      })
     : await ensureContact(identity);
   if (!contact) {
     console.log("[Offers] Late start skipped: the contact no longer exists", {

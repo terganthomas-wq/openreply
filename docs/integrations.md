@@ -1,12 +1,25 @@
 # API and MCP
 
 Workspace owners and admins can create keys at **API & MCP** (`/integrations`).
-The UI offers 30, 60 or 90 days (default: 30). The API accepts whole days from
-1 to 90. Existing keys are never extended. Copy the token at creation; only its
-SHA-256 hash is stored. Revocation takes effect on subsequent authenticated requests.
-Use HTTPS and never put a token in a URL, source control, screenshots or prompts.
-Keys belong to the workspace, not their creator, and remain valid until expiry,
-revocation or workspace deletion. Review keys when team members leave.
+For campaign keys the UI offers 30, 60 or 90 days (default: 30), and the API
+accepts whole days from 1 to 90. A **report sign-ups** key (`signups:write`
+alone) sits on a landing page's server, where an expired key would stop the
+sign-up feedback without anyone noticing, so it may live longer: the UI offers
+90, 180 or 365 days (default: 365), the API accepts 1 to 365 and gives it 365
+when the request names no lifetime. Existing keys are never extended. Copy the
+token at creation; only its SHA-256 hash is stored. Revocation takes effect on
+subsequent authenticated requests. Use HTTPS and never put a token in a URL,
+source control, screenshots or prompts. Keys belong to the workspace, not their
+creator, and remain valid until expiry, revocation or workspace deletion.
+Review keys when team members leave.
+
+From 14 days before a key expires, **API & MCP** and **Diagnostics** show a
+warning with its name, kind and expiry date. After the expiry the warning stays
+while the key was used in the last 30 days (its last successful request,
+`lastUsedAt`): whatever still uses it is refused now. A key nothing used
+expires quietly. Create a new key, replace the old one where it is used, then
+revoke the old one; a revoked key never warns. Diagnostics shows the warning to
+every member of the workspace, without when the key was last used.
 
 ## Scopes
 
@@ -191,11 +204,13 @@ curl -X POST https://YOUR-DOMAIN/api/offers/signup \
 `deploy/README.de.md` has a PHP example for the landing page.
 
 Admin key management uses session authentication at `/api/integrations/keys`:
-GET lists metadata (never hashes/tokens), POST creates a key with `scopes` of
-one or both campaign scopes above, or `signups:write` alone, DELETE with
-`?id=` revokes it. A supplied Origin must match `NEXTAUTH_URL` (or the request
-origin). JSON request bodies are bounded to 64 KiB including streamed/chunked
-requests.
+GET lists metadata (never hashes/tokens) with `expired` and `expiryWarning`
+(`"expiring"`, `"expired"` or `null`, as above) by the server's clock, POST
+creates a key with `scopes` of one or both campaign scopes above, or
+`signups:write` alone, and an optional `days` (1 to 90 for campaign keys, 1 to
+365 for a sign-up key; 400 otherwise), DELETE with `?id=` revokes it. A
+supplied Origin must match `NEXTAUTH_URL` (or the request origin). JSON request
+bodies are bounded to 64 KiB including streamed/chunked requests.
 
 ## Verification
 

@@ -8,6 +8,8 @@
 
 import { describe, expect, it, vi } from "vitest";
 import {
+  followUpCanMeetOffer,
+  LATE_OFFER_FOLLOW_UP_LIMIT_MINUTES,
   lateStartDelayMs,
   lateStartFireAt,
   OFFER_DELAY_HOURS,
@@ -230,6 +232,52 @@ describe("late offer start", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// The campaign editor warns that the follow-up message can land between the
+// offer messages only where it can (G1 leftover). The follow-up goes out
+// followUpDelayMinutes (0 to 1440) after the link, the link moments after the
+// tap or DM, a late offer 21.5 to 22 hours after that tap or DM.
+describe("followUpCanMeetOffer", () => {
+  it("always can with an offer right after the link", () => {
+    for (const minutes of [0, 1, 60, LATE_OFFER_FOLLOW_UP_LIMIT_MINUTES, 1440]) {
+      expect(followUpCanMeetOffer(0, minutes), String(minutes)).toBe(true);
+    }
+    // Anything but the late value starts the offer right away.
+    expect(followUpCanMeetOffer(5, 10)).toBe(true);
+    expect(followUpCanMeetOffer(null, 10)).toBe(true);
+  });
+
+  it("can with a late offer only when the follow-up waits more than 21 hours", () => {
+    expect(LATE_OFFER_FOLLOW_UP_LIMIT_MINUTES).toBe(21 * 60);
+    for (const minutes of [0, 5, 60, 600, 1200, LATE_OFFER_FOLLOW_UP_LIMIT_MINUTES]) {
+      expect(followUpCanMeetOffer(OFFER_LATE_START_HOURS, minutes), String(minutes)).toBe(false);
+    }
+    for (const minutes of [LATE_OFFER_FOLLOW_UP_LIMIT_MINUTES + 1, 1290, 1320, 1440]) {
+      expect(followUpCanMeetOffer(OFFER_LATE_START_HOURS, minutes), String(minutes)).toBe(true);
+    }
+  });
+
+  it("leaves a follow-up within the limit before every late start, with half an hour for the link", () => {
+    for (let minute = 0; minute < 60; minute++) {
+      for (const second of [0, 59]) {
+        const tap = Date.parse("2026-11-20T08:00:00.000Z") + minute * MINUTE + second * 1000;
+        // The link out half an hour after the tap, the follow-up at the limit.
+        const followUpAt = tap + 30 * MINUTE + LATE_OFFER_FOLLOW_UP_LIMIT_MINUTES * MINUTE;
+        expect(followUpAt).toBeLessThan(lateStartFireAt(tap));
+      }
+    }
+  });
+
+  it("can meet a late start once it waits longer", () => {
+    // A tap at 08:29:59 starts its offer at 06:00 the next day, 21.5 hours
+    // and a second later; a follow-up 1291 minutes after a link sent within
+    // a second of the tap comes after that.
+    const tap = Date.parse("2026-11-20T08:29:59.000Z");
+    expect(lateStartFireAt(tap)).toBe(Date.parse("2026-11-21T06:00:00.000Z"));
+    expect(tap + 1000 + 1291 * MINUTE).toBeGreaterThan(lateStartFireAt(tap));
+    expect(followUpCanMeetOffer(OFFER_LATE_START_HOURS, 1291)).toBe(true);
   });
 });
 

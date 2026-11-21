@@ -4,6 +4,9 @@ import type { I18n } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
 import type { EventDetail } from "@/lib/ops/event-details";
 import { useEffect, useState } from "react";
+import KeyExpiryNotice, {
+  type KeyNeedingAttention,
+} from "@/components/key-expiry-notice";
 import StatusBadge from "@/components/status-badge";
 
 interface DiagnosticsData {
@@ -59,6 +62,9 @@ interface DiagnosticsData {
     resumeAt: string;
     waiting: number | null;
   }>;
+  // Service keys that expire within 14 days, or expired although something
+  // used them in the last 30 days.
+  keyWarnings: KeyNeedingAttention[];
 }
 
 function formatDate(value: string, locale: string) {
@@ -224,6 +230,10 @@ export default function DiagnosticsPage() {
             ))}
           </ul>
         </section>
+      ) : null}
+
+      {data?.keyWarnings?.length ? (
+        <KeyExpiryNotice keys={data.keyWarnings} linkToKeys />
       ) : null}
 
       <div className="grid grid-cols-2 gap-3 sm:gap-4 md:grid-cols-3">

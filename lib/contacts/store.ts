@@ -107,17 +107,28 @@ function upsertContact({
  * The stored contact, never created: null when there is none. For work that
  * runs long after the contact was recorded, such as an offer that starts 22
  * hours after its link: a contact deleted in the meantime (on request, GDPR)
- * must stay deleted. A found contact's last interaction moves forward to
- * `interactionAt` like in ensureContact. Throws on a database error.
+ * must stay deleted. With `recordedBy`, only a row created by then counts: a
+ * newer one belongs to a person who came back after such a deletion, and is
+ * neither returned nor touched. A found contact's last interaction moves
+ * forward to `interactionAt` like in ensureContact. Throws on a database
+ * error.
  */
 export async function findContact({
   workspaceId,
   instagramAccountId,
   igsid,
   interactionAt,
-}: Omit<ContactIdentity, "username">): Promise<ContactSummary | null> {
+  recordedBy,
+}: Omit<ContactIdentity, "username"> & {
+  recordedBy?: Date;
+}): Promise<ContactSummary | null> {
   const contact = await prisma.contact.findFirst({
-    where: { workspaceId, instagramAccountId, igsid },
+    where: {
+      workspaceId,
+      instagramAccountId,
+      igsid,
+      ...(recordedBy ? { createdAt: { lte: recordedBy } } : {}),
+    },
     select: { id: true, username: true, lastInteractionAt: true },
   });
   if (!contact) return null;

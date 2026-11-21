@@ -2,7 +2,8 @@
  * Diagnostics on Meta's request limits (R1): which of the workspace's
  * accounts are paused, until when and how many jobs wait, and what the page
  * needs to show the limit events in the reader's language. Event payloads
- * themselves stay on the server.
+ * themselves stay on the server. Also the service keys that need a new one
+ * (R1 item 9).
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeRedis } from "./helpers/fake-redis";
@@ -13,6 +14,7 @@ const { mockPrisma, redis, workspaceId } = vi.hoisted(() => ({
     dmLog: { findMany: vi.fn() },
     operationalEvent: { findMany: vi.fn() },
     instagramAccount: { findMany: vi.fn() },
+    serviceKey: { findMany: vi.fn() },
   },
   redis: { current: null as unknown },
   workspaceId: vi.fn(),
@@ -49,6 +51,7 @@ beforeEach(() => {
     { instagramId: "ig_1", username: "studio" },
     { instagramId: "ig_2", username: "other" },
   ]);
+  mockPrisma.serviceKey.findMany.mockReset().mockResolvedValue([]);
 });
 
 async function diagnostics() {
@@ -149,5 +152,57 @@ describe("Diagnostics and Meta's request limits", () => {
   it("refuses without a workspace", async () => {
     workspaceId.mockResolvedValue(null);
     expect((await GET()).status).toBe(401);
+    expect(mockPrisma.serviceKey.findMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("Diagnostics and expiring service keys", () => {
+  const DAY = 86_400_000;
+  const at = (days: number) => new Date(NOW + days * DAY);
+
+  it("shows no key when none needs a new one", async () => {
+    expect((await diagnostics()).keyWarnings).toEqual([]);
+  });
+
+  it("asks for this workspace's unrevoked keys that expire within 14 days or expired while in use", async () => {
+    await diagnostics();
+
+    expect(mockPrisma.serviceKey.findMany).toHaveBeenCalledWith({
+      where: {
+        workspaceId: "workspace",
+        revokedAt: null,
+        OR: [
+          { expiresAt: { gt: at(0), lte: at(14) } },
+          { expiresAt: { lte: at(0) }, lastUsedAt: { gte: at(-30) } },
+        ],
+      },
+      orderBy: { expiresAt: "asc" },
+      take: 20,
+      select: {
+        id: true,
+        name: true,
+        scopes: true,
+        expiresAt: true,
+        revokedAt: true,
+        lastUsedAt: true,
+      },
+    });
+  });
+
+  it("names each key, its kind, its expiry and why, never when it was used", async () => {
+    mockPrisma.serviceKey.findMany.mockResolvedValue([
+      { id: "k1", name: "Landingpage", scopes: ["signups:write"], expiresAt: at(-2), revokedAt: null, lastUsedAt: at(-3) },
+      { id: "k2", name: "Claude", scopes: ["campaigns:read"], expiresAt: at(5), revokedAt: null, lastUsedAt: null },
+      // Read in a race with its revocation, or out of bounds: left out.
+      { id: "k3", name: "Old", scopes: ["campaigns:read"], expiresAt: at(-40), revokedAt: null, lastUsedAt: at(-41) },
+    ]);
+
+    const { keyWarnings } = await diagnostics();
+
+    expect(keyWarnings).toEqual([
+      { id: "k1", name: "Landingpage", scopes: ["signups:write"], expiresAt: at(-2).toISOString(), warning: "expired" },
+      { id: "k2", name: "Claude", scopes: ["campaigns:read"], expiresAt: at(5).toISOString(), warning: "expiring" },
+    ]);
+    expect(JSON.stringify(keyWarnings)).not.toContain("lastUsedAt");
   });
 });

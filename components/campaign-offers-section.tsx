@@ -18,6 +18,8 @@ import { Radio, Toggle } from "@/components/form-controls";
 import { useI18n } from "@/lib/i18n/provider";
 import { moveItem, type OfferRecord } from "@/lib/offers/editor";
 import {
+  followUpCanMeetOffer,
+  LATE_OFFER_FOLLOW_UP_LIMIT_MINUTES,
   OFFER_LATE_START_HOURS,
   resolveOfferOrder,
   type OfferDelayHours,
@@ -99,6 +101,8 @@ interface CampaignOffersSectionProps {
   /** Switching offers on just switched the opening DM on as well. */
   openingDmSwitchedOn: boolean;
   followUpEnabled: boolean;
+  /** How long the follow-up message waits after the link, in minutes. */
+  followUpDelayMinutes: number;
   /** The "Manage offers" link was opened (in a new tab). */
   onManageOffers: () => void;
 }
@@ -116,6 +120,7 @@ export default function CampaignOffersSection({
   openingDmEnabled,
   openingDmSwitchedOn,
   followUpEnabled,
+  followUpDelayMinutes,
   onManageOffers,
 }: CampaignOffersSectionProps) {
   const { t } = useI18n();
@@ -351,11 +356,24 @@ export default function CampaignOffersSection({
             </p>
           </div>
 
-          {followUpEnabled && (
-            <p className="text-xs text-warning">
-              {t("The follow-up message also goes out after the link, so it can land between the offer messages.")}
-            </p>
-          )}
+          {/* Right after the link, the offer runs from the link on, so any
+              follow-up can come in between. A late offer starts 21.5 to 22
+              hours after the tap or DM: only a follow-up that waits longer
+              than 21 hours can reach it. */}
+          {followUpEnabled &&
+            followUpCanMeetOffer(delayHours, followUpDelayMinutes) && (
+              <p className="text-xs text-warning">
+                {delayHours === OFFER_LATE_START_HOURS
+                  ? t(
+                      "The follow-up message comes {minutes} minutes after the link. The offer may have started by then, so the follow-up can land between the offer messages. With {limit} minutes or less it comes before the offer.",
+                      {
+                        minutes: followUpDelayMinutes,
+                        limit: LATE_OFFER_FOLLOW_UP_LIMIT_MINUTES,
+                      }
+                    )
+                  : t("The follow-up message also goes out after the link, so it can land between the offer messages.")}
+              </p>
+            )}
           {/* A new tab: the editor keeps no draft, so leaving it would lose
               the campaign typed so far. */}
           <Link
