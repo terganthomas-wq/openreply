@@ -65,6 +65,8 @@ interface DiagnosticsData {
   // Service keys that expire within 14 days, or expired although something
   // used them in the last 30 days.
   keyWarnings: KeyNeedingAttention[];
+  // Whether the reader may create and revoke keys (owners and admins).
+  canManageKeys: boolean;
 }
 
 function formatDate(value: string, locale: string) {
@@ -233,7 +235,11 @@ export default function DiagnosticsPage() {
       ) : null}
 
       {data?.keyWarnings?.length ? (
-        <KeyExpiryNotice keys={data.keyWarnings} linkToKeys />
+        <KeyExpiryNotice
+          keys={data.keyWarnings}
+          linkToKeys
+          canManageKeys={data.canManageKeys}
+        />
       ) : null}
 
       <div className="grid grid-cols-2 gap-3 sm:gap-4 md:grid-cols-3">

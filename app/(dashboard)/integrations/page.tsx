@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import KeyExpiryNotice, { ACCESS_LABELS, type KeyNeedingAttention } from "@/components/key-expiry-notice";
 import { useI18n } from "@/lib/i18n/provider";
-import { KEY_EXPIRY_WARNING_DAYS, keyLifetime, type KeyExpiryWarning } from "@/lib/integrations/key-lifetime";
+import { KEY_EXPIRY_WARNING_DAYS, keyLifetime, lifetimeAfterAccessChange, type KeyExpiryWarning } from "@/lib/integrations/key-lifetime";
 import { ACCESS_SCOPES, keyAccess, type KeyAccess } from "@/lib/integrations/scopes";
 import { SIGNUP_CALLBACK_PATH } from "@/lib/offers/signup-link";
 
@@ -32,10 +32,11 @@ export default function IntegrationsPage() {
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
 
-  // Each kind starts at its own default lifetime: a year for a sign-up key.
+  // A kind with other lifetime rules starts at its own default, a year for a
+  // sign-up key; between read-only and read-and-write the choice stays.
   function selectAccess(next: Access) {
+    setDays(lifetimeAfterAccessChange(days, ACCESS_SCOPES[access], ACCESS_SCOPES[next]));
     setAccess(next);
-    setDays(lifetimeOf(next).defaultDays);
   }
 
   async function load() {
@@ -97,7 +98,7 @@ export default function IntegrationsPage() {
         {lifetimeOf(access).choices.map(value => <option key={value} value={value}>{t("{days} days", { days: value })}</option>)}
       </select></label>
       <p className="text-sm text-muted">{t("Applies only to new keys. Existing expiration dates do not change.")}</p>
-      <p className="text-sm text-muted">{t("This page and Diagnostics warn {days} days before a key expires.", { days: KEY_EXPIRY_WARNING_DAYS })}</p>
+      <p className="text-sm text-muted">{t("From {days} days before a key expires, this page and Diagnostics show a notice when you open them (there is no e-mail).", { days: KEY_EXPIRY_WARNING_DAYS })}</p>
       <button disabled={busy || !name.trim()} onClick={create} className="rounded bg-accent px-4 py-2 text-white disabled:opacity-50">{t("Create key for {days} days", { days })}</button>
       {token && <div role="status" className="space-y-2">
         <p>{t("Shown once. Store securely; never put keys in URLs, screenshots or GitHub.")}</p>

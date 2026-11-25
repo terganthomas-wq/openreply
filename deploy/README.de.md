@@ -61,7 +61,10 @@ neu verbinden.
   Tag zurück: Ein 35 Stunden alter Kommentar unter dem elftneuesten Reel
   wurde so nie gefunden. Das Alter eines Beitrags zählt dabei nicht, auch ein
   altes Reel bekommt neue Kommentare. Jeder Beitrag kostet pro Durchlauf eine
-  Leseanfrage bei Meta, egal wie viele Kampagnen es gibt. Auf einem schon
+  Leseanfrage bei Meta, egal wie viele Kampagnen es gibt. Pro Durchlauf
+  nimmt sich jede Kampagne höchstens 30 neue Kommentare vor
+  (`COMMENT_POLL_MAX_PER_SWEEP`), über alle ihre Beiträge zusammen und die
+  ältesten zuerst; der Rest kommt im nächsten Durchlauf dran. Auf einem schon
   laufenden Server kommt der Wert erst an, wenn du `worker.env` neu
   erzeugst (`node deploy/make-env.mjs <ordner>`) und hochlädst
   (`bash deploy/oracle/upload-env.sh <server-ip> <ordner>/worker.env`).
@@ -135,8 +138,18 @@ Was das Tool daraus macht:
   einmal.
 - Erst nach 12 Pausen hintereinander gibt das Tool auf: Link oder
   DM-Antwort stehen dann auf „Fehlgeschlagen“, ein Angebot endet mit
-  „Rate-Limit“. Die Warte-Nachricht beim Follow-Gate fällt während einer
-  Pause einfach weg.
+  „Rate-Limit“. Das gilt auch für einen Link, der hinter der Prüfung wartet,
+  ob die Person folgt. Die Warte-Nachricht beim Follow-Gate fällt während
+  einer Pause einfach weg.
+- Geht ein wartender Link oder eine wartende DM-Antwort nach der Pause nicht
+  mehr raus, steht der Eintrag im DM-Protokoll ebenfalls auf
+  „Fehlgeschlagen“, mit dem Grund: wenn du die Kampagne in der Zwischenzeit
+  pausiert oder geändert hast (etwa ihre Stichwörter oder die Antwort auf
+  DMs), oder wenn die Prüfung nach der Pause kein Folgen mehr findet (dann
+  bekommt die Person wieder die Folgen-Bitte). „Ausstehend“ bleibt dabei
+  nichts hängen: Solange ein Link wartet, schickt das Tool ihn dieser Person
+  nicht auf anderem Weg, etwa wenn sie die Eröffnungs-DM nur liest und nicht
+  tippt.
 - Über Zernio verbundene Konten bleiben, wie sie sind: Zernios eigenes Limit
   (HTTP 429) löst keine Pause aus.
 
@@ -203,11 +216,12 @@ starten?“ pro Kampagne fest, wann das Lead-Magnet-Angebot kommt:
   zurück auf „Direkt nach dem Link“ stellst. Schaltest du bei der Kampagne
   die Angebote aus oder löschst du die Kampagne, startet keins der geplanten
   Angebote mehr. Eine pausierte Kampagne startet sie trotzdem, denn die Links
-  sind schon raus. Ein inzwischen gelöschter Kontakt bekommt nichts und wird
-  nicht neu angelegt, auch nicht, wenn die Person danach wieder schreibt oder
-  tippt: Der neue Kontakt bekommt das Angebot aus der alten Unterhaltung
-  nicht. Ist das Fenster zum Start doch zu (etwa weil der Worker stundenlang
-  aus war), steht in *Diagnostics* „Offer skipped: messaging window closed“.
+  sind schon raus. Ein inzwischen gelöschter Kontakt bekommt nichts, und der
+  späte Start legt ihn nicht neu an. Schreibt oder tippt die Person danach
+  wieder, entsteht ein neuer Kontakt; der bekommt das Angebot aus der alten
+  Unterhaltung nicht. Ist das Fenster zum Start doch zu (etwa weil der
+  Worker stundenlang aus war), steht in *Diagnostics*
+  „Offer skipped: messaging window closed“.
 - Eine Folgenachricht der Kampagne kommt bei „22 Stunden später“ vor dem
   Angebot, solange sie höchstens 1260 Minuten (21 Stunden) nach dem Link
   geplant ist. Erst darüber kann sie zwischen die Angebotsnachrichten fallen,
@@ -243,11 +257,16 @@ So richtest du es ein:
    anlegen, und gilt bis zu 365 Tage (so ist er voreingestellt; zur Wahl
    stehen 90, 180 und 365 Tage). Schlüssel für Kampagnen gelten weiter
    höchstens 90 Tage. Mit einem abgelaufenen Schlüssel kommt `401`, die
-   Seite selbst merkt davon nichts. Deshalb warnen *API & MCP* und *Diagnose*
-   14 Tage vor dem Ablauf, mit Name und Datum des Schlüssels, und nach dem
-   Ablauf weiter, solange er in den letzten 30 Tagen noch benutzt wurde.
-   Dann einen neuen Schlüssel anlegen, auf der Landingpage austauschen und
-   den alten widerrufen; ein widerrufener Schlüssel warnt nicht mehr.
+   Seite selbst merkt davon nichts. Deshalb zeigen *API & MCP* und *Diagnose*
+   ab 14 Tagen vor dem Ablauf einen Hinweis mit Name und Datum des
+   Schlüssels, und nach dem Ablauf weiter, solange er in den letzten 30
+   Tagen noch benutzt wurde. Der Hinweis erscheint nur, wenn du eine der
+   beiden Seiten öffnest; eine E-Mail gibt es nicht. Dann einen neuen
+   Schlüssel anlegen, auf der Landingpage austauschen und den alten
+   widerrufen; ein widerrufener Schlüssel warnt nicht mehr. Mitglieder ohne
+   Admin-Rechte sehen den Hinweis in der *Diagnose* auch. Weil sie keine
+   Schlüssel anlegen können, bittet er sie, den Inhaber oder einen Admin zu
+   fragen, und zeigt keinen Link zu *API & MCP*.
 3. Die Landingpage übernimmt `ig` aus ihrer Adresse in ein verstecktes
    Formularfeld, speichert den Wert zusammen mit der noch unbestätigten
    Eintragung und meldet ihn erst, wenn die Eintragung bestätigt ist (beim

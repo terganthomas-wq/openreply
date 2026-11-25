@@ -162,8 +162,9 @@ The landing page keeps the code with the pending sign-up and, once the
 sign-up is confirmed, reports it from its server: `POST /api/offers/signup`
 with `{"token": "<ig value>"}` and a service key that has `signups:write`
 (**Report sign-ups** on the API & MCP page; such a key can do nothing else,
-lives up to 365 days, a year by default, and API & MCP and Diagnostics warn
-14 days before it expires, see `docs/integrations.md`).
+lives up to 365 days, a year by default, and from 14 days before it expires
+API & MCP and Diagnostics show a warning when opened, see
+`docs/integrations.md`).
 The request, the answers and a PHP example are in `deploy/README.de.md`. The
 first report records the sign-up (`signedUpAt` and the offer's "signed up"
 tag, in one transaction) and queues the chat confirmation; every later report

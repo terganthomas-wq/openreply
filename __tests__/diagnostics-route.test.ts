@@ -8,7 +8,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeRedis } from "./helpers/fake-redis";
 
-const { mockPrisma, redis, workspaceId } = vi.hoisted(() => ({
+const { mockPrisma, redis, workspaceContext } = vi.hoisted(() => ({
   mockPrisma: {
     webhookEvent: { findMany: vi.fn() },
     dmLog: { findMany: vi.fn() },
@@ -17,11 +17,20 @@ const { mockPrisma, redis, workspaceId } = vi.hoisted(() => ({
     serviceKey: { findMany: vi.fn() },
   },
   redis: { current: null as unknown },
-  workspaceId: vi.fn(),
+  workspaceContext: vi.fn(),
 }));
 
 vi.mock("@/lib/db/client", () => ({ prisma: mockPrisma }));
-vi.mock("@/lib/auth", () => ({ getCurrentWorkspaceId: workspaceId }));
+// Keeps next-auth out of the test; the context below stands in for it.
+vi.mock("@/lib/auth", () => ({
+  getCurrentUserId: vi.fn(),
+  getCurrentWorkspaceId: vi.fn(),
+}));
+// The real role check; only the signed-in context is replaced.
+vi.mock("@/lib/workspace-access", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/workspace-access")>()),
+  getCurrentWorkspaceContext: workspaceContext,
+}));
 vi.mock("@/lib/queue/client", () => ({
   getRedisConnection: () => redis.current,
   getDMQueue: () => ({
@@ -38,12 +47,22 @@ import { GET } from "../app/api/admin/diagnostics/route";
 const NOW = new Date("2026-11-21T13:00:00.000Z").getTime();
 let fake: FakeRedis;
 
+// A signed-in reader of the workspace, in a role.
+function signedIn(role: "OWNER" | "ADMIN" | "MEMBER") {
+  return {
+    userId: "user",
+    workspaceId: "workspace",
+    workspace: { id: "workspace" },
+    role,
+  };
+}
+
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(NOW);
   fake = new FakeRedis();
   redis.current = fake;
-  workspaceId.mockReset().mockResolvedValue("workspace");
+  workspaceContext.mockReset().mockResolvedValue(signedIn("OWNER"));
   mockPrisma.webhookEvent.findMany.mockReset().mockResolvedValue([]);
   mockPrisma.dmLog.findMany.mockReset().mockResolvedValue([]);
   mockPrisma.operationalEvent.findMany.mockReset().mockResolvedValue([]);
@@ -150,7 +169,7 @@ describe("Diagnostics and Meta's request limits", () => {
   });
 
   it("refuses without a workspace", async () => {
-    workspaceId.mockResolvedValue(null);
+    workspaceContext.mockResolvedValue(null);
     expect((await GET()).status).toBe(401);
     expect(mockPrisma.serviceKey.findMany).not.toHaveBeenCalled();
   });
@@ -204,5 +223,27 @@ describe("Diagnostics and expiring service keys", () => {
       { id: "k2", name: "Claude", scopes: ["campaigns:read"], expiresAt: at(5).toISOString(), warning: "expiring" },
     ]);
     expect(JSON.stringify(keyWarnings)).not.toContain("lastUsedAt");
+  });
+
+  // Every member sees Diagnostics, but only owners and admins may create and
+  // revoke keys: the notice asks a member to have one of them do it.
+  it.each([
+    ["OWNER", true],
+    ["ADMIN", true],
+    ["MEMBER", false],
+  ] as const)("tells whether a reader with the role %s can replace a key", async (role, canManage) => {
+    workspaceContext.mockResolvedValue(signedIn(role));
+    mockPrisma.serviceKey.findMany.mockResolvedValue([
+      { id: "k1", name: "Landingpage", scopes: ["signups:write"], expiresAt: at(5), revokedAt: null, lastUsedAt: null },
+    ]);
+
+    const data = await diagnostics();
+
+    expect(data.canManageKeys).toBe(canManage);
+    // The warning itself is the same for everyone.
+    expect(data.keyWarnings).toHaveLength(1);
+    expect(mockPrisma.serviceKey.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ workspaceId: "workspace" }) })
+    );
   });
 });

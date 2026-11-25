@@ -41,10 +41,17 @@ export interface KeyNeedingAttention {
 export default function KeyExpiryNotice({
   keys,
   linkToKeys = false,
+  canManageKeys = true,
 }: {
   keys: readonly KeyNeedingAttention[];
   /** Diagnostics points to the API & MCP page, where keys are made. */
   linkToKeys?: boolean;
+  /**
+   * Whether the reader may create and revoke keys: owners and admins. Every
+   * member sees Diagnostics; a member is asked to have an owner or admin
+   * replace the key, and gets no link to a page that would refuse them.
+   */
+  canManageKeys?: boolean;
 }) {
   const { t, locale } = useI18n();
   if (keys.length === 0) return null;
@@ -76,11 +83,15 @@ export default function KeyExpiryNotice({
         })}
       </ul>
       <p className="mt-3 text-sm text-foreground">
-        {t(
-          "An expired key no longer works: your landing page, for example, can no longer report sign-ups. Create a new key in time, replace the old one wherever it is used, then revoke the old one."
-        )}
+        {canManageKeys
+          ? t(
+              "An expired key no longer works: your landing page, for example, can no longer report sign-ups. Create a new key in time, replace the old one wherever it is used, then revoke the old one."
+            )
+          : t(
+              "An expired key no longer works: your landing page, for example, can no longer report sign-ups. Ask your workspace owner or an admin to create a new key in time and revoke the old one."
+            )}
       </p>
-      {linkToKeys && (
+      {linkToKeys && canManageKeys && (
         <Link
           href="/integrations"
           className="mt-3 inline-block text-sm font-medium text-accent hover:underline"

@@ -1256,7 +1256,7 @@ export default function OfferEditor({ mode, offerId }: OfferEditorProps) {
                     </p>
                     <p className="text-xs text-muted">
                       {t(
-                        "A key for your landing page lasts up to {days} days. API & MCP and Diagnostics warn you {warnDays} days before it expires: then create a new one and replace it on your landing page.",
+                        "A key for your landing page lasts up to {days} days. From {warnDays} days before it expires, API & MCP and Diagnostics show a notice when you open them (there is no e-mail): then create a new key and replace it on your landing page.",
                         {
                           days: SIGNUP_KEY_LIFETIME.maxDays,
                           warnDays: KEY_EXPIRY_WARNING_DAYS,

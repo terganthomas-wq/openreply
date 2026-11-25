@@ -111,7 +111,11 @@ a limit instead of reading it as "not following":
   same comment get it once. The copies only replace BullMQ's retries.
 - The comment sweep skips an account while it is paused, and a read that
   Meta refuses with a limit ends the whole sweep there, recorded once; the
-  next sweep runs as scheduled.
+  next sweep runs as scheduled. A campaign queues at most
+  `COMMENT_POLL_MAX_PER_SWEEP` (30) comments per sweep across all of its
+  posts, oldest first: per post, an any-post campaign over 30 posts could
+  queue 900 private replies in one sweep, the kind of burst that runs into
+  the limit.
 
 Every message after a tap or a DM waits for the pause the same way: button
 taps (the follow check, the follow prompt and the second follow request, the
@@ -139,7 +143,25 @@ message:
 - Meanwhile the tap's link and the DM's reply show PENDING with
   "Instagram request limit; next try at HH:MM UTC" on their DmLog row; a row
   that says the message went out is never set back. A follow check or a
-  follow prompt that waits writes nothing: the tap's row is the link's.
+  follow prompt that waits creates no row: the tap's row is the link's. Once
+  a link waited, though, a gated tap's copies keep the follow check's
+  payload, so a pause that goes on meets them before the check; each such
+  wait moves the PENDING row's next try along.
+- A waiting row never stays PENDING once nothing will send it: the copy
+  that ends without the message logs it FAILED with the reason (only a
+  PENDING row; one that says the message went out stays). That is a capped
+  or closed-window wait at a follow check or prompt as well as at the link,
+  a copy whose campaign was paused or moved to another account meanwhile
+  (or whose account has no usable token), a tap's copy whose
+  follow check after the pause finds no follow and asks for the follow
+  instead ("Not sent: the follow check after the account's pause found no
+  follow"), and a DM's copy for a campaign that no longer answers the DM:
+  paused, its DM trigger switched off, its keywords changed, or bound to
+  another connection ("Not sent: the campaign was paused or changed while
+  the account was paused"; the DM's copy settles these before it answers
+  anything). Only the copies settle these rows, and the read fallback stands
+  back while one is PENDING (below), so a row left PENDING would hold the
+  campaign's read fallback for that person back for good.
 - A read fallback waits one minute longer than the taps and DM replies held
   for the same pause, and it now also stands back while a tap's link or the
   campaign's answer to the person's DM waits (PENDING), so the fallback does
@@ -150,13 +172,14 @@ message:
 - When the window is closed by the time the copy would run, nothing is
   queued: the tap's link and the DM's reply are logged FAILED ("Instagram
   request limit: the messaging window closes before the account's pause ends
-  …") without a retry, a follow prompt, a read fallback and a follow-up are
-  only logged to the console, as their failures always were.
+  …") without a retry, and so is a tap's waiting link behind a follow check
+  or prompt; a follow prompt, a read fallback and a follow-up are only
+  logged to the console, as their failures always were.
 - After 12 copies the message fails as a refused send: the link or the reply
   is logged FAILED with "the account was still paused after 12 waits …" and
   the job is thrown back to BullMQ, as is a tap whose follow check still
-  meets the limit; a follow prompt, a read fallback and a follow-up are only
-  logged.
+  meets the limit (its waiting link logged FAILED the same way); a follow
+  prompt, a read fallback and a follow-up are only logged.
 - The follow-up has no claim, so its job never fails while it waits: a copy
   that could not be queued is logged, never retried next to one that was.
 - The follow re-check acknowledgement is best effort: while the account is

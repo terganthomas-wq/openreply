@@ -426,6 +426,122 @@ describe("how many posts an any-post sweep reads", () => {
   });
 });
 
+// COMMENT_POLL_MAX_PER_SWEEP caps what one campaign queues per sweep across
+// all of its posts. Applied per post, one sweep of an any-post campaign over
+// 30 posts (make-env's COMMENT_POLL_MEDIA_LIMIT) could queue 900 private
+// replies at once: the burst that runs into Meta's request limits.
+describe("the per-sweep cap of a campaign", () => {
+  const MINUTE = 60_000;
+  const account = {
+    id: "connection",
+    instagramId: "owner",
+    username: "studio",
+    provider: "META",
+    accessToken: "test",
+  };
+  const campaign = {
+    id: "campaign",
+    name: "Campaign",
+    workspaceId: "workspace",
+    postId: null as string | null,
+    matchAnyPost: true,
+    matchAnyWord: true,
+    keywords: [] as string[],
+    wholeWordMatch: true,
+    ignoreQuestionComments: false,
+    publicReplyEnabled: false,
+    instagramAccount: account,
+  };
+  const posts = Array.from({ length: 30 }, (_, i) => `m${i + 1}`);
+  // 40 unanswered comments on every post. Comment i of post m<p> is
+  // i * 30 + p minutes old, so the oldest comments are spread over all posts.
+  const ageOf = (mediaId: string, i: number) => i * 30 + Number(mediaId.slice(1));
+  function commentsOn(mediaId: string) {
+    return Array.from({ length: 40 }, (_, i) => ({
+      id: `${mediaId}_c${i}`,
+      text: "LINK",
+      from: { id: `reader_${mediaId}_${i}` },
+      timestamp: new Date(Date.now() - ageOf(mediaId, i) * MINUTE).toISOString(),
+    }));
+  }
+  const queued = () => queueAdd.mock.calls.map(([, data]) => data);
+
+  beforeEach(() => {
+    queueAdd.mockReset();
+    readMedia.mockReset().mockResolvedValue(posts.map((id) => ({ id })));
+    readComments
+      .mockReset()
+      .mockImplementation(async ({ mediaId }: { mediaId: string }) => commentsOn(mediaId));
+    mockPrisma.automation.findMany.mockReset().mockResolvedValue([campaign]);
+    mockPrisma.operationalEvent.create.mockReset().mockResolvedValue({});
+    mockPrisma.$queryRaw.mockReset().mockResolvedValue([]);
+    mockPrisma.dmLog.findMany.mockReset().mockResolvedValue([]);
+  });
+
+  it("queues at most 30 for an any-post campaign over 30 posts, the oldest first whatever the post", async () => {
+    await reconcileComments();
+
+    // Every post is still read.
+    expect(readComments).toHaveBeenCalledTimes(30);
+    expect(queueAdd).toHaveBeenCalledTimes(30);
+    // The 30 oldest comments are the last one of each post, oldest first:
+    // m30's is 1200 minutes old, m1's 1171.
+    expect(queued().map((data) => data.commentId)).toEqual(
+      [...posts].reverse().map((mediaId) => `${mediaId}_c39`)
+    );
+    // Each with the post it is on.
+    for (const data of queued()) {
+      expect(data.mediaId).toBe(data.commentId.split("_")[0]);
+    }
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          payload: expect.objectContaining({ enqueued: 30, matched: 1200 }),
+        }),
+      })
+    );
+  });
+
+  it("leaves out what is handled, and takes the next oldest instead", async () => {
+    mockPrisma.dmLog.findMany.mockImplementation(
+      async ({ where }: { where: { commentId: { in: string[] } } }) =>
+        where.commentId.in
+          .filter((id) => id.endsWith("_c39"))
+          .map((commentId) => ({
+            commentId,
+            status: "SENT",
+            attempts: 1,
+            errorMessage: null,
+            dmDeliveryUnconfirmed: false,
+            publicReplySentAt: null,
+            publicReplyDeliveryUnconfirmed: false,
+          }))
+    );
+
+    await reconcileComments();
+
+    expect(queued().map((data) => data.commentId)).toEqual(
+      [...posts].reverse().map((mediaId) => `${mediaId}_c38`)
+    );
+  });
+
+  it("caps a campaign bound to a post across the post and its ad copy", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      { ...campaign, postId: "m1", matchAnyPost: false },
+    ]);
+    mockPrisma.$queryRaw.mockResolvedValue([{ mediaId: "m2" }]);
+
+    await reconcileComments();
+
+    expect(readMedia).not.toHaveBeenCalled();
+    expect(queueAdd).toHaveBeenCalledTimes(30);
+    // A comment on the ad carries the post it was made from.
+    const onAd = queued().filter((data) => data.mediaId === "m2");
+    expect(onAd).toHaveLength(15);
+    for (const data of onAd) expect(data.originalMediaId).toBe("m1");
+  });
+});
+
 // R1: a read Meta refuses with a request limit ends the sweep there, recorded
 // once; an account paused for a limit is not swept until the pause is over.
 describe("the sweep and Meta's request limits", () => {

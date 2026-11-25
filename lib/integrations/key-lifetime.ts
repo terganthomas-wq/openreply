@@ -44,6 +44,23 @@ export function keyLifetime(scopes: readonly string[]): KeyLifetime {
     : CAMPAIGN_KEY_LIFETIME;
 }
 
+/**
+ * The lifetime the API & MCP page's form shows once its access changes from
+ * one kind of key to another: the chosen one while both kinds follow the
+ * same rules (read-only and read-and-write keys share them), otherwise the
+ * new kind's default, a year for a sign-up key.
+ */
+export function lifetimeAfterAccessChange(
+  days: number,
+  from: readonly string[],
+  to: readonly string[]
+): number {
+  const next = keyLifetime(to);
+  return keyLifetime(from) === next && next.choices.includes(days)
+    ? days
+    : next.defaultDays;
+}
+
 /** From this many days before a key expires, the page and Diagnostics warn. */
 export const KEY_EXPIRY_WARNING_DAYS = 14;
 

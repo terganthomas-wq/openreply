@@ -24,12 +24,17 @@ const state = vi.hoisted(() => ({
   redis: null as unknown,
   processor: null as null | ((job: unknown) => Promise<void>),
 }));
-const { mockQueueAdd, mockSendDirectMessage, mockSendDirectMessageWithButton } =
-  vi.hoisted(() => ({
-    mockQueueAdd: vi.fn(),
-    mockSendDirectMessage: vi.fn(),
-    mockSendDirectMessageWithButton: vi.fn(),
-  }));
+const {
+  mockQueueAdd,
+  mockSendDirectMessage,
+  mockSendDirectMessageWithButton,
+  mockGetUserFollowStatus,
+} = vi.hoisted(() => ({
+  mockQueueAdd: vi.fn(),
+  mockSendDirectMessage: vi.fn(),
+  mockSendDirectMessageWithButton: vi.fn(),
+  mockGetUserFollowStatus: vi.fn(),
+}));
 
 vi.mock("@/lib/db/client", () => ({
   get prisma() {
@@ -76,6 +81,7 @@ vi.mock("@/lib/meta/client", () => {
   return {
     sendDirectMessage: mockSendDirectMessage,
     sendDirectMessageWithButton: mockSendDirectMessageWithButton,
+    getUserFollowStatus: mockGetUserFollowStatus,
     getUserUsername: async () => null,
     MetaApiError,
     TokenExpiredError,
@@ -111,6 +117,7 @@ const databaseUrl = process.env.TEST_DATABASE_URL;
 const schema = `conversation_pause_${randomBytes(4).toString("hex")}`;
 const NOW = new Date("2026-11-21T13:00:00.000Z").getTime();
 const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
 let sql: Client;
 
 // Meta's answer to a send while the app is over its limit, as seen live.
@@ -134,15 +141,35 @@ function tapJob(userId: string, mid: string, extra: Record<string, unknown> = {}
   };
 }
 
-function messageJob(senderId: string, mid: string, id?: string) {
+function messageJob(senderId: string, mid: string, id?: string, text = "LINK please") {
   return {
     name: "process-message",
     id: id ?? `message_ig_conv_${mid}`,
     attemptsMade: 0,
     opts: { attempts: 3 },
     timestamp: Date.now(),
-    data: { ...ACCOUNT, messageId: mid, messageText: "LINK please", senderId },
+    data: { ...ACCOUNT, messageId: mid, messageText: text, senderId },
   };
+}
+
+// The read fallback of a campaign for someone who read its opening DM.
+function readFallback(userId: string, automationId: string) {
+  return tapJob(
+    userId,
+    "unused",
+    { payload: `reveal:${automationId}`, fallback: true, mid: undefined },
+    `read_fallback_${userId}`
+  );
+}
+
+// The account's pause, set or extended to `until` (epoch ms).
+function pauseUntil(until: number) {
+  return (state.redis as FakeRedis).set(
+    "meta:pause:ig_conv",
+    String(until),
+    "PX",
+    until - Date.now()
+  );
 }
 
 function offerJob(contactOfferId: string, extra: Record<string, unknown> = {}, id?: string) {
@@ -182,9 +209,9 @@ function asJob(copy: ReturnType<typeof pauseCopies>[number]) {
   };
 }
 
-function dmLogRow(commentId: string) {
+function dmLogRow(commentId: string, automationId = "automation") {
   return state.db.dmLog.findUnique({
-    where: { automationId_commentId: { automationId: "automation", commentId } },
+    where: { automationId_commentId: { automationId, commentId } },
   });
 }
 
@@ -252,6 +279,38 @@ describe.skipIf(!databaseUrl)("taps, DM replies and offer messages and Meta's re
         dmTriggerEnabled: true,
       },
     });
+    // A follow-gated campaign, one that is paused during a test, and one
+    // that answers the DM keyword GUIDE. None answers "LINK please".
+    await state.db.automation.createMany({
+      data: [
+        {
+          id: "gated",
+          workspaceId: "workspace",
+          instagramAccountId: "account",
+          name: "Gated",
+          keywords: ["FOLLOW"],
+          dmMessage: "Here is your gated guide",
+          requireFollow: true,
+        },
+        {
+          id: "tap_campaign",
+          workspaceId: "workspace",
+          instagramAccountId: "account",
+          name: "Tap",
+          keywords: ["TAP"],
+          dmMessage: "Here is your tap guide",
+        },
+        {
+          id: "dm_campaign",
+          workspaceId: "workspace",
+          instagramAccountId: "account",
+          name: "DM",
+          keywords: ["GUIDE"],
+          dmMessage: "Here is your DM guide",
+          dmTriggerEnabled: true,
+        },
+      ],
+    });
     await state.db.offer.create({
       data: {
         id: "offer",
@@ -293,6 +352,7 @@ describe.skipIf(!databaseUrl)("taps, DM replies and offer messages and Meta's re
     mockQueueAdd.mockReset().mockResolvedValue({});
     mockSendDirectMessage.mockReset().mockResolvedValue(SENT);
     mockSendDirectMessageWithButton.mockReset().mockResolvedValue(SENT);
+    mockGetUserFollowStatus.mockReset().mockResolvedValue(true);
     vi.spyOn(console, "log").mockImplementation(() => {});
   });
 
@@ -413,5 +473,217 @@ describe.skipIf(!databaseUrl)("taps, DM replies and offer messages and Meta's re
     });
     // Nothing was sent: its claim is free again.
     expect(await state.db.postbackDelivery.count()).toBe(0);
+  });
+
+  // A gated tap whose link was refused once waits as PENDING. Its copies keep
+  // the follow check's payload, so a pause that goes on meets each of them
+  // before the check. Wherever the wait ends, the waiting link ends with it:
+  // a row left PENDING would hold the read fallback back for good.
+  describe("a gated tap whose link waited", () => {
+    const tap = (userId: string, mid: string) =>
+      tapJob(userId, mid, { payload: "followcheck:gated" });
+
+    it("moves the next try along, ends FAILED when its copies give up, and the read fallback then delivers", async () => {
+      mockSendDirectMessage.mockRejectedValueOnce(LIMIT());
+      await run(tap("person_gated", "mid_gated"));
+      let row = await dmLogRow("reveal:person_gated", "gated");
+      expect(row?.status).toBe("PENDING");
+
+      // An hour more each time a copy is due: every copy meets the pause
+      // before its follow check.
+      let clock = NOW;
+      let copy = pauseCopies().at(-1)!;
+      for (let wait = 1; wait < 12; wait++) {
+        clock += copy.opts.delay;
+        vi.setSystemTime(clock);
+        await pauseUntil(clock + HOUR);
+        const before = row?.errorMessage;
+        await expect(run(asJob(copy))).resolves.toBeUndefined();
+        row = await dmLogRow("reveal:person_gated", "gated");
+        expect(row?.status).toBe("PENDING");
+        expect(row?.errorMessage).toMatch(/^Instagram request limit; next try at \d\d:\d\d UTC$/);
+        expect(row?.errorMessage).not.toBe(before);
+        copy = pauseCopies().at(-1)!;
+        expect(copy.data.pauseRequeue).toBe(wait + 1);
+      }
+
+      // The twelfth copy and both of BullMQ's retries still find the pause.
+      clock += copy.opts.delay;
+      vi.setSystemTime(clock);
+      await pauseUntil(clock + HOUR);
+      for (const attemptsMade of [0, 1, 2]) {
+        await expect(run({ ...asJob(copy), attemptsMade })).rejects.toMatchObject({
+          name: "AccountPausedError",
+        });
+      }
+      expect(pauseCopies()).toHaveLength(12);
+      expect(await dmLogRow("reveal:person_gated", "gated")).toMatchObject({
+        status: "FAILED",
+        errorMessage: expect.stringMatching(
+          /^Instagram request limit: the account was still paused after 12 waits \(until \d\d:\d\d UTC\), so the DM was not sent$/
+        ),
+      });
+      // Only the first run asked Instagram anything: one check, one refused link.
+      expect(mockGetUserFollowStatus).toHaveBeenCalledTimes(1);
+      expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+      expect(await state.db.postbackDelivery.count()).toBe(0);
+
+      // Once the pause is over the person reads the opening DM: the read
+      // fallback checks the follow and delivers.
+      vi.setSystemTime(clock + 2 * HOUR);
+      await run(readFallback("person_gated", "gated"));
+
+      expect(mockGetUserFollowStatus).toHaveBeenCalledTimes(2);
+      expect(mockSendDirectMessage).toHaveBeenCalledTimes(2);
+      expect(await dmLogRow("reveal:person_gated", "gated")).toMatchObject({
+        status: "SENT",
+        errorMessage: null,
+      });
+    });
+
+    it("ends FAILED when the twelfth copy's follow check still meets the limit", async () => {
+      mockSendDirectMessage.mockRejectedValueOnce(LIMIT());
+      await run(tap("person_check", "mid_check"));
+      const [first] = pauseCopies();
+      const twelfth = {
+        ...asJob(first),
+        id: first.opts.jobId.replace(/_pause_1$/, "_pause_12"),
+        data: { ...first.data, pauseRequeue: 12 },
+      };
+
+      vi.setSystemTime(NOW + 5 * HOUR);
+      mockGetUserFollowStatus.mockRejectedValueOnce(LIMIT());
+      await expect(run(twelfth)).rejects.toMatchObject({ name: "RateLimitError" });
+
+      expect(pauseCopies()).toHaveLength(1);
+      expect(await dmLogRow("reveal:person_check", "gated")).toMatchObject({
+        status: "FAILED",
+        errorMessage: expect.stringMatching(
+          /^Instagram request limit: the account was still paused after 12 waits \(until 18:20 UTC\), so the DM was not sent\. RateLimitError 4: \(#4\) Application request limit reached/
+        ),
+      });
+      expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it("ends FAILED when the window closes during the pause", async () => {
+      // The tap came 23 hours ago; its link was refused just now.
+      mockSendDirectMessage.mockRejectedValueOnce(LIMIT());
+      await run({ ...tap("person_late", "mid_late"), timestamp: NOW - 23 * HOUR });
+      expect((await dmLogRow("reveal:person_late", "gated"))?.status).toBe("PENDING");
+
+      const [copy] = pauseCopies();
+      const clock = NOW + copy.opts.delay;
+      vi.setSystemTime(clock);
+      await pauseUntil(clock + HOUR);
+      await expect(run(asJob(copy))).resolves.toBeUndefined();
+
+      // Nothing more is queued: the window is closed by the time it would run.
+      expect(pauseCopies()).toHaveLength(1);
+      expect(await dmLogRow("reveal:person_late", "gated")).toMatchObject({
+        status: "FAILED",
+        errorMessage: expect.stringMatching(
+          /^Instagram request limit: the messaging window closes before the account's pause ends \(\d\d:\d\d UTC\), so the DM was not sent$/
+        ),
+      });
+    });
+
+    it("ends FAILED when the copy's follow check finds no follow, and the person is asked to follow", async () => {
+      mockSendDirectMessage.mockRejectedValueOnce(LIMIT());
+      await run(tapJob("person_unfollowed", "mid_open", { payload: "followcheck:gated:open" }));
+      const [copy] = pauseCopies();
+
+      vi.setSystemTime(NOW + copy.opts.delay);
+      mockGetUserFollowStatus.mockResolvedValueOnce(false);
+      await run(asJob(copy));
+
+      expect(mockSendDirectMessageWithButton).toHaveBeenCalledTimes(1);
+      expect(await dmLogRow("reveal:person_unfollowed", "gated")).toMatchObject({
+        status: "FAILED",
+        errorMessage: "Not sent: the follow check after the account's pause found no follow",
+      });
+    });
+  });
+
+  // A copy that no longer reaches its campaign settles what it held, so the
+  // campaign's read fallback works again once the campaign is back on.
+  it("ends a waiting link FAILED when its campaign was paused meanwhile, and the fallback delivers after", async () => {
+    mockSendDirectMessage.mockRejectedValueOnce(LIMIT());
+    await run(tapJob("person_paused", "mid_paused", { payload: "reveal:tap_campaign" }));
+    expect((await dmLogRow("reveal:person_paused", "tap_campaign"))?.status).toBe("PENDING");
+
+    await state.db.automation.update({ where: { id: "tap_campaign" }, data: { isActive: false } });
+    try {
+      const [copy] = pauseCopies();
+      vi.setSystemTime(NOW + copy.opts.delay);
+      await expect(run(asJob(copy))).resolves.toBeUndefined();
+
+      expect(pauseCopies()).toHaveLength(1);
+      expect(await dmLogRow("reveal:person_paused", "tap_campaign")).toMatchObject({
+        status: "FAILED",
+        errorMessage: "Not sent: the campaign was paused or changed while the account was paused",
+      });
+    } finally {
+      await state.db.automation.update({ where: { id: "tap_campaign" }, data: { isActive: true } });
+    }
+
+    vi.setSystemTime(NOW + HOUR);
+    await run(readFallback("person_paused", "tap_campaign"));
+
+    // The refused try and the fallback's link.
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(2);
+    expect((await dmLogRow("reveal:person_paused", "tap_campaign"))?.status).toBe("SENT");
+  });
+
+  it("ends a waiting DM reply FAILED when its campaign was paused meanwhile, and the fallback delivers after", async () => {
+    mockSendDirectMessage.mockRejectedValueOnce(LIMIT());
+    await run(messageJob("person_guide", "mid_guide", undefined, "GUIDE please"));
+    expect((await dmLogRow("dm:mid_guide", "dm_campaign"))?.status).toBe("PENDING");
+
+    await state.db.automation.update({ where: { id: "dm_campaign" }, data: { isActive: false } });
+    try {
+      const [copy] = pauseCopies();
+      vi.setSystemTime(NOW + copy.opts.delay);
+      await expect(run(asJob(copy))).resolves.toBeUndefined();
+
+      expect(pauseCopies()).toHaveLength(1);
+      expect(await dmLogRow("dm:mid_guide", "dm_campaign")).toMatchObject({
+        status: "FAILED",
+        errorMessage: "Not sent: the campaign was paused or changed while the account was paused",
+      });
+    } finally {
+      await state.db.automation.update({ where: { id: "dm_campaign" }, data: { isActive: true } });
+    }
+
+    vi.setSystemTime(NOW + HOUR);
+    await run(readFallback("person_guide", "dm_campaign"));
+
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(2);
+    expect((await dmLogRow("reveal:person_guide", "dm_campaign"))?.status).toBe("SENT");
+  });
+
+  it("ends a waiting DM reply FAILED when the campaign's keywords changed meanwhile", async () => {
+    mockSendDirectMessage.mockRejectedValueOnce(LIMIT());
+    // A job from before jobs were bound to a connection: the copy finds the
+    // DM's rows by the account's Instagram id.
+    const unbound = messageJob("person_keyword", "mid_keyword", undefined, "GUIDE please");
+    const data: Record<string, unknown> = { ...unbound.data };
+    delete data.accountConnectionId;
+    await run({ ...unbound, data });
+    expect((await dmLogRow("dm:mid_keyword", "dm_campaign"))?.status).toBe("PENDING");
+
+    await state.db.automation.update({ where: { id: "dm_campaign" }, data: { keywords: ["OTHER"] } });
+    try {
+      const [copy] = pauseCopies();
+      vi.setSystemTime(NOW + copy.opts.delay);
+      await run(asJob(copy));
+
+      expect(await dmLogRow("dm:mid_keyword", "dm_campaign")).toMatchObject({
+        status: "FAILED",
+        errorMessage: "Not sent: the campaign was paused or changed while the account was paused",
+      });
+      expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      await state.db.automation.update({ where: { id: "dm_campaign" }, data: { keywords: ["GUIDE"] } });
+    }
   });
 });

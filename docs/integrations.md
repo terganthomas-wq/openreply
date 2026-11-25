@@ -14,12 +14,16 @@ creator, and remain valid until expiry, revocation or workspace deletion.
 Review keys when team members leave.
 
 From 14 days before a key expires, **API & MCP** and **Diagnostics** show a
-warning with its name, kind and expiry date. After the expiry the warning stays
-while the key was used in the last 30 days (its last successful request,
+warning with its name, kind and expiry date whenever someone opens them; there
+is no e-mail or other notification. After the expiry the warning stays while
+the key was used in the last 30 days (its last successful request,
 `lastUsedAt`): whatever still uses it is refused now. A key nothing used
 expires quietly. Create a new key, replace the old one where it is used, then
 revoke the old one; a revoked key never warns. Diagnostics shows the warning to
-every member of the workspace, without when the key was last used.
+every member of the workspace, without when the key was last used. Only owners
+and admins can create and revoke keys, so a member's warning asks them to have
+an owner or admin replace the key and carries no link to API & MCP (the route
+sends `canManageKeys`).
 
 ## Scopes
 

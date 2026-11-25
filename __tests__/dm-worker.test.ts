@@ -4426,8 +4426,19 @@ describe("DM Worker — Meta request limits on taps, DM replies and follow-ups",
       expect(anyLinkSends()).toBe(0);
       expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
       expect(mockPrisma.postbackDelivery.create).not.toHaveBeenCalled();
-      // The tap's row is the link's: a follow check leaves it alone.
-      expect(mockPrisma.dmLog.updateMany).not.toHaveBeenCalled();
+      // The tap's row is the link's: a follow check that waits creates none.
+      // It only moves the next try of a link that waits already.
+      expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith({
+        where: {
+          automationId: "auto_789",
+          commentId: "reveal:commenter_999",
+          status: "PENDING",
+        },
+        data: {
+          errorMessage: expect.stringMatching(/^Instagram request limit; next try at 13:2\d UTC$/),
+        },
+      });
+      expect(mockPrisma.dmLog.create).not.toHaveBeenCalled();
       expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
       await expect(redis.get(PAUSE_KEY)).resolves.toBe(String(NOW + 20 * MINUTE));
       expect(pauseCopies()).toHaveLength(1);
@@ -4444,8 +4455,256 @@ describe("DM Worker — Meta request limits on taps, DM replies and follow-ups",
       await getProcessor()(tap({ payload: "followcheck:auto_789" }));
 
       expect(mockGetUserFollowStatus).not.toHaveBeenCalled();
-      expect(mockPrisma.dmLog.updateMany).not.toHaveBeenCalled();
+      // No row of its own; a link that waits already gets the next try.
+      expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledTimes(1);
+      expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith({
+        where: {
+          automationId: "auto_789",
+          commentId: "reveal:commenter_999",
+          status: "PENDING",
+        },
+        data: {
+          errorMessage: expect.stringMatching(/^Instagram request limit; next try at 13:1\d UTC$/),
+        },
+      });
+      expect(mockPrisma.dmLog.create).not.toHaveBeenCalled();
       expect(pauseCopies()).toHaveLength(1);
+    });
+
+    // A gated tap whose link was refused once waits as PENDING. Its copies
+    // keep the follow check's payload, so a later pause meets them before the
+    // check: wherever the wait ends there, the waiting link ends with it.
+    describe("a link that waited, behind a follow check", () => {
+      const waitingRow = (data: Record<string, unknown>) => ({
+        where: {
+          automationId: "auto_789",
+          commentId: "reveal:commenter_999",
+          status: "PENDING",
+        },
+        data,
+      });
+      const gatedCopy = (data: Record<string, unknown> = {}) =>
+        tap({
+          payload: "followcheck:auto_789",
+          tapId: "mid_tap",
+          tappedAt: TAPPED,
+          ...data,
+        });
+
+      beforeEach(() => {
+        mockPrisma.automation.findFirst.mockResolvedValue(gated);
+      });
+
+      it("is logged FAILED when the twelfth wait still finds the pause before the check", async () => {
+        await pauseFor(10);
+
+        await expect(getProcessor()(gatedCopy({ pauseRequeue: 12 }))).rejects.toMatchObject({
+          name: "AccountPausedError",
+        });
+
+        expect(mockGetUserFollowStatus).not.toHaveBeenCalled();
+        expect(pauseCopies()).toHaveLength(0);
+        expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith(
+          waitingRow({
+            status: "FAILED",
+            errorMessage:
+              "Instagram request limit: the account was still paused after 12 waits (until 13:10 UTC), so the DM was not sent",
+          })
+        );
+        // A tap whose link never waited gets no row: a follow request has none.
+        expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
+        expect(mockPrisma.dmLog.create).not.toHaveBeenCalled();
+      });
+
+      it("is logged FAILED when the twelfth wait's follow check still meets the limit", async () => {
+        mockGetUserFollowStatus.mockRejectedValueOnce(limit(4));
+
+        await expect(getProcessor()(gatedCopy({ pauseRequeue: 12 }))).rejects.toMatchObject({
+          name: "RateLimitError",
+        });
+
+        expect(pauseCopies()).toHaveLength(0);
+        expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith(
+          waitingRow({
+            status: "FAILED",
+            errorMessage: expect.stringMatching(
+              /^Instagram request limit: the account was still paused after 12 waits \(until 13:20 UTC\), so the DM was not sent\. \(#4\) Application request limit reached/
+            ),
+          })
+        );
+        expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
+      });
+
+      it("is logged FAILED when the window closes before the pause ends", async () => {
+        const longAgo = NOW - 23 * HOUR - 50 * MINUTE;
+        mockPrisma.contact.upsert.mockResolvedValue({
+          id: "contact_1",
+          username: "commenter_user",
+          lastInteractionAt: new Date(longAgo),
+        });
+        await pauseFor(10);
+
+        await expect(
+          getProcessor()(gatedCopy({ tappedAt: longAgo, pauseRequeue: 3 }))
+        ).resolves.toBeUndefined();
+
+        expect(pauseCopies()).toHaveLength(0);
+        expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith(
+          waitingRow({
+            status: "FAILED",
+            errorMessage:
+              "Instagram request limit: the messaging window closes before the account's pause ends (13:10 UTC), so the DM was not sent",
+          })
+        );
+        expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
+      });
+
+      it("is logged FAILED when the follow prompt is still refused after the twelfth wait", async () => {
+        mockGetUserFollowStatus.mockResolvedValue(false);
+        mockSendDirectMessageWithButton.mockRejectedValueOnce(limit(4));
+
+        await expect(
+          getProcessor()(gatedCopy({ payload: "followcheck:auto_789:open", pauseRequeue: 12 }))
+        ).resolves.toBeUndefined();
+
+        expect(pauseCopies()).toHaveLength(0);
+        expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledTimes(1);
+        expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith(
+          waitingRow({
+            status: "FAILED",
+            errorMessage: expect.stringMatching(
+              /^Instagram request limit: the account was still paused after 12 waits \(until 13:20 UTC\), so the DM was not sent\. /
+            ),
+          })
+        );
+      });
+
+      it("is logged FAILED when the copy's follow check finds no follow and asks to follow instead", async () => {
+        mockGetUserFollowStatus.mockResolvedValue(false);
+
+        await getProcessor()(gatedCopy({ payload: "followcheck:auto_789:open", pauseRequeue: 2 }));
+
+        expect(mockSendDirectMessageWithButton).toHaveBeenCalledTimes(1);
+        expect(anyLinkSends()).toBe(0);
+        expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith(
+          waitingRow({
+            status: "FAILED",
+            errorMessage: "Not sent: the follow check after the account's pause found no follow",
+          })
+        );
+      });
+
+      it("is logged FAILED after the copy's last re-check sends the second follow request", async () => {
+        mockGetUserFollowStatus.mockResolvedValue(false);
+
+        await getProcessor()(
+          gatedCopy({ pauseRequeue: 2, followRecheck: true, followRecheckAttempt: 2 })
+        );
+
+        expect(mockSendDirectMessageWithButton).toHaveBeenLastCalledWith(
+          META_AUTH,
+          "ig_456",
+          "commenter_999",
+          expect.any(String),
+          expect.any(String),
+          "followcheck:auto_789:retry"
+        );
+        expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith(
+          waitingRow({
+            status: "FAILED",
+            errorMessage: "Not sent: the follow check after the account's pause found no follow",
+          })
+        );
+      });
+
+      it("still waits while the copy's follow re-checks run", async () => {
+        mockGetUserFollowStatus.mockResolvedValue(false);
+
+        await getProcessor()(gatedCopy({ pauseRequeue: 2 }));
+
+        // The re-check carries the copy on; the link may still come.
+        expect(mockQueueAdd).toHaveBeenCalledWith(
+          "process-postback",
+          expect.objectContaining({ pauseRequeue: 2, followRecheckAttempt: 1 }),
+          expect.anything()
+        );
+        expect(mockPrisma.dmLog.updateMany).not.toHaveBeenCalled();
+      });
+
+      it("leaves the row alone when a tap that never waited finds no follow", async () => {
+        mockGetUserFollowStatus.mockResolvedValue(false);
+
+        await getProcessor()(tap({ payload: "followcheck:auto_789:open" }));
+
+        expect(mockSendDirectMessageWithButton).toHaveBeenCalledTimes(1);
+        expect(mockPrisma.dmLog.updateMany).not.toHaveBeenCalled();
+      });
+    });
+
+    describe("a copy that no longer reaches its campaign", () => {
+      const copy = (data: Record<string, unknown> = {}) =>
+        tap({ tapId: "mid_tap", tappedAt: TAPPED, pauseRequeue: 1, ...data });
+      const settled = (errorMessage: string) => ({
+        where: {
+          automationId: "auto_789",
+          commentId: "reveal:commenter_999",
+          status: "PENDING",
+        },
+        data: { status: "FAILED", errorMessage },
+      });
+
+      it("logs the link that waited FAILED when the campaign was paused or moved meanwhile", async () => {
+        // Paused or deleted: the lookup finds no active campaign.
+        mockPrisma.automation.findFirst.mockResolvedValue(null);
+        await expect(getProcessor()(copy())).resolves.toBeUndefined();
+        expect(mockPrisma.dmLog.updateMany).toHaveBeenLastCalledWith(
+          settled("Not sent: the campaign was paused or changed while the account was paused")
+        );
+
+        // Moved to another account.
+        mockPrisma.automation.findFirst.mockResolvedValue({
+          ...mockAutomation,
+          instagramAccount: { ...mockAutomation.instagramAccount, instagramId: "ig_other" },
+        });
+        await getProcessor()(copy());
+        expect(mockPrisma.dmLog.updateMany).toHaveBeenLastCalledWith(
+          settled("Not sent: the campaign was paused or changed while the account was paused")
+        );
+        expect(anyLinkSends()).toBe(0);
+        expect(pauseCopies()).toHaveLength(0);
+      });
+
+      it("logs it FAILED when the account has no usable token any more", async () => {
+        mockPrisma.automation.findFirst.mockResolvedValue({
+          ...mockAutomation,
+          instagramAccount: { ...mockAutomation.instagramAccount, accessToken: "" },
+        });
+        await getProcessor()(copy());
+        expect(mockPrisma.dmLog.updateMany).toHaveBeenLastCalledWith(
+          settled("No Instagram access token available")
+        );
+
+        mockPrisma.automation.findFirst.mockResolvedValue(mockAutomation);
+        mockDecryptToken.mockImplementationOnce(() => {
+          throw new Error("Unsupported state or unable to authenticate data");
+        });
+        await getProcessor()(copy());
+        expect(mockPrisma.dmLog.updateMany).toHaveBeenLastCalledWith(
+          settled("Failed to decrypt Instagram access token")
+        );
+        expect(anyLinkSends()).toBe(0);
+      });
+
+      it("touches nothing for a tap that never waited, or for a read fallback", async () => {
+        mockPrisma.automation.findFirst.mockResolvedValue(null);
+
+        await getProcessor()(tap());
+        await getProcessor()(
+          tap({ payload: "reveal:auto_789", fallback: true, mid: undefined, pauseRequeue: 1 })
+        );
+
+        expect(mockPrisma.dmLog.updateMany).not.toHaveBeenCalled();
+      });
     });
 
     it("waits when the follow prompt is refused, and the copy prompts once", async () => {
@@ -5062,6 +5321,78 @@ describe("DM Worker — Meta request limits on taps, DM replies and follow-ups",
 
       expect(anyLinkSends()).toBe(0);
       expect(pauseCopies()).toHaveLength(0);
+    });
+
+    describe("a copy whose campaign no longer answers the DM", () => {
+      const settledFor = (account: Record<string, unknown>, notIn?: string[]) => ({
+        where: {
+          commentId: "dm:mid_abc",
+          status: "PENDING",
+          ...account,
+          ...(notIn ? { automationId: { notIn } } : {}),
+        },
+        data: {
+          status: "FAILED",
+          errorMessage: "Not sent: the campaign was paused or changed while the account was paused",
+        },
+      });
+
+      it("logs the reply that waited FAILED when the campaign was paused or its DM trigger switched off", async () => {
+        // Neither is found any more by the campaigns' query.
+        mockPrisma.automation.findMany.mockResolvedValue([]);
+
+        await expect(
+          getProcessor()(
+            message({ receivedAt: RECEIVED, pauseRequeue: 1, accountConnectionId: "ig_account_row_1" })
+          )
+        ).resolves.toBeUndefined();
+
+        expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith(
+          settledFor({ instagramAccountId: "ig_account_row_1" })
+        );
+        expect(anyLinkSends()).toBe(0);
+
+        // A job from before connections were bound names the account itself.
+        await getProcessor()(message({ receivedAt: RECEIVED, pauseRequeue: 1 }));
+        expect(mockPrisma.dmLog.updateMany).toHaveBeenLastCalledWith(
+          settledFor({ instagramAccount: { instagramId: "ig_456" } })
+        );
+      });
+
+      it("logs it FAILED when the campaign's keywords no longer match, and answers the campaigns that do", async () => {
+        const second = { ...dmTriggerCampaign, id: "auto_second" };
+        mockPrisma.automation.findMany.mockResolvedValue([dmTriggerCampaign, second]);
+        mockMatchKeywords
+          .mockReturnValueOnce({ matched: false, matchedKeyword: null })
+          .mockReturnValueOnce({ matched: true, matchedKeyword: "LINK" });
+
+        await getProcessor()(
+          message({ receivedAt: RECEIVED, pauseRequeue: 1, accountConnectionId: "ig_account_row_1" })
+        );
+
+        expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith(
+          settledFor({ instagramAccountId: "ig_account_row_1" }, ["auto_second"])
+        );
+        // The settling comes first, whichever way the copy ends.
+        expect(mockPrisma.dmLog.updateMany.mock.invocationCallOrder[0]).toBeLessThan(
+          mockSendDirectMessage.mock.invocationCallOrder[0]
+        );
+        expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+        expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { automationId_commentId: { automationId: "auto_second", commentId: "dm:mid_abc" } },
+            update: expect.objectContaining({ status: "SENT" }),
+          })
+        );
+      });
+
+      it("touches nothing for a DM that never waited", async () => {
+        mockPrisma.automation.findMany.mockResolvedValue([]);
+
+        await getProcessor()(message());
+
+        expect(mockPrisma.dmLog.updateMany).not.toHaveBeenCalled();
+      });
     });
 
     it("logs the reply FAILED when the window closes before the pause ends", async () => {

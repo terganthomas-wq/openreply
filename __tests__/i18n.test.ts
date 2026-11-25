@@ -182,7 +182,7 @@ describe("interface translations", () => {
       "Your landing page reports the sign-up to this address",
       "Your landing page also needs a key with the access “{access}”.",
       "Create the key under API & MCP",
-      "A key for your landing page lasts up to {days} days. API & MCP and Diagnostics warn you {warnDays} days before it expires: then create a new one and replace it on your landing page.",
+      "A key for your landing page lasts up to {days} days. From {warnDays} days before it expires, API & MCP and Diagnostics show a notice when you open them (there is no e-mail): then create a new key and replace it on your landing page.",
       "Details for whoever builds your landing page",
       "Copy the value of ig from the address of the landing page into a hidden form field and store it with the sign-up. Once the sign-up is confirmed (with double opt-in: after the click in the confirmation email), your server sends it:",
       "Wait at most 3 seconds for the answer and ignore errors, so the page never breaks. The key stays on the server, never in the page itself.",
@@ -216,6 +216,11 @@ describe("interface translations", () => {
       expect(catalog, "old key lifetime").not.toHaveProperty([
         "A key runs out after 90 days at the latest. Create a new one in time and replace it on your landing page.",
       ]);
+      // „warnen dich“ read as "you will be told"; the notice only shows on
+      // the two pages, when someone opens them.
+      expect(catalog, "old key warning").not.toHaveProperty([
+        "A key for your landing page lasts up to {days} days. API & MCP and Diagnostics warn you {warnDays} days before it expires: then create a new one and replace it on your landing page.",
+      ]);
     }
     const { t } = createI18n("de");
     expect(t("Report the sign-up back")).toBe("Eintragung zurückmelden");
@@ -236,11 +241,11 @@ describe("interface translations", () => {
     );
     expect(
       t(
-        "A key for your landing page lasts up to {days} days. API & MCP and Diagnostics warn you {warnDays} days before it expires: then create a new one and replace it on your landing page.",
+        "A key for your landing page lasts up to {days} days. From {warnDays} days before it expires, API & MCP and Diagnostics show a notice when you open them (there is no e-mail): then create a new key and replace it on your landing page.",
         { days: 365, warnDays: 14 }
       )
     ).toBe(
-      "Ein Schlüssel für deine Landingpage gilt bis zu 365 Tage. 14 Tage vor dem Ablauf warnen dich API & MCP und die Diagnose: Dann erstell einen neuen und tausch ihn auf deiner Landingpage aus."
+      "Ein Schlüssel für deine Landingpage gilt bis zu 365 Tage. Ab 14 Tagen vor dem Ablauf zeigen API & MCP und die Diagnose einen Hinweis, sobald du sie öffnest (eine E-Mail gibt es nicht). Dann erstell einen neuen Schlüssel und tausch ihn auf deiner Landingpage aus."
     );
     expect(createI18n("en").t("Signed up on the landing page: {offer}", { offer: "Guide" })).toBe(
       "Signed up on the landing page: Guide"
@@ -292,12 +297,16 @@ describe("interface translations", () => {
       "Key “{name}” ({access}) expires on {date}.",
       "Key “{name}” ({access}) expired on {date}, but was used in the last {days} days.",
       "An expired key no longer works: your landing page, for example, can no longer report sign-ups. Create a new key in time, replace the old one wherever it is used, then revoke the old one.",
+      "An expired key no longer works: your landing page, for example, can no longer report sign-ups. Ask your workspace owner or an admin to create a new key in time and revoke the old one.",
       "Open API & MCP",
       "Expired: {date}",
-      "This page and Diagnostics warn {days} days before a key expires.",
+      "From {days} days before a key expires, this page and Diagnostics show a notice when you open them (there is no e-mail).",
     ] as const;
     for (const catalog of [zhTW, ptBR, ru, de]) {
       for (const key of keys) expect(catalog[key], key).toBeTruthy();
+      expect(catalog, "old page note").not.toHaveProperty([
+        "This page and Diagnostics warn {days} days before a key expires.",
+      ]);
     }
     const { t } = createI18n("de");
     expect(t("Keys are expiring")).toBe("Schlüssel laufen ab");
@@ -319,10 +328,42 @@ describe("interface translations", () => {
       "Der Schlüssel „Landingpage“ (Eintragungen melden) ist am 5.12.2026 abgelaufen, wurde in den letzten 30 Tagen aber noch benutzt."
     );
     expect(t("Expired: {date}", { date: "5.12.2026" })).toBe("Abgelaufen am 5.12.2026");
-    // The page names Diagnostics as the menu does.
-    expect(t("This page and Diagnostics warn {days} days before a key expires.", { days: 14 })).toContain(
-      t("Diagnostics")
+    const note = t(
+      "From {days} days before a key expires, this page and Diagnostics show a notice when you open them (there is no e-mail).",
+      { days: 14 }
     );
+    expect(note).toBe(
+      "Ab 14 Tagen vor dem Ablauf eines Schlüssels zeigen diese Seite und die Diagnose einen Hinweis, sobald du sie öffnest (eine E-Mail gibt es nicht)."
+    );
+    // The page names Diagnostics as the menu does.
+    expect(note).toContain(t("Diagnostics"));
+    // A member sees the notice in Diagnostics but cannot replace a key.
+    expect(
+      t(
+        "An expired key no longer works: your landing page, for example, can no longer report sign-ups. Ask your workspace owner or an admin to create a new key in time and revoke the old one."
+      )
+    ).toBe(
+      "Ein abgelaufener Schlüssel funktioniert nicht mehr: Deine Landingpage kann dann zum Beispiel keine Eintragungen mehr melden. Bitte den Inhaber oder einen Admin deines Workspaces, rechtzeitig einen neuen Schlüssel zu erstellen und den alten zu widerrufen."
+    );
+  });
+
+  // Every text that sends the reader to the API & MCP page names it as the
+  // menu does, in every language.
+  it("names the API & MCP page as its menu item does", () => {
+    const naming = [
+      "Open API & MCP",
+      "Create the key under API & MCP",
+      "A key for your landing page lasts up to {days} days. From {warnDays} days before it expires, API & MCP and Diagnostics show a notice when you open them (there is no e-mail): then create a new key and replace it on your landing page.",
+    ] as const;
+    for (const catalog of [zhTW, ptBR, ru, de]) {
+      const menu = (catalog as Record<string, string>)["API & MCP"] ?? "API & MCP";
+      for (const key of naming) expect(catalog[key], key).toContain(menu);
+      // The hint names Diagnostics as the menu does, too.
+      expect(catalog[naming[2]], naming[2]).toContain(catalog["Diagnostics"]);
+    }
+    expect(createI18n("pt-BR").t("Open API & MCP")).toBe("Abrir API e MCP");
+    expect(createI18n("ru").t("Open API & MCP")).toBe("Открыть API и MCP");
+    expect(createI18n("zh-TW").t("Open API & MCP")).toBe("開啟 API 與 MCP");
   });
 
   // G1 leftover: with the offer 22 hours later the follow-up message only

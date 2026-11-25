@@ -57,8 +57,9 @@ import { matchKeywords } from "@/lib/utils/keyword-matcher";
 // Only consider comments from the last few days — older ones are outside
 // Instagram's private-reply window anyway, so a DM to them would just fail.
 const LOOKBACK_HOURS = Number(process.env.COMMENT_POLL_LOOKBACK_HOURS ?? 72);
-// Hard cap on how many new comments a single campaign can enqueue per sweep, so
-// a viral post drains gradually instead of bursting into the comment API.
+// Hard cap on how many new comments a single campaign can enqueue per sweep,
+// across all of its posts, so a viral post or a backlog on many posts drains
+// gradually instead of bursting into the comment API.
 const MAX_NEW_PER_SWEEP = Number(process.env.COMMENT_POLL_MAX_PER_SWEEP ?? 30);
 
 export const DEFAULT_COMMENT_POLL_MEDIA_LIMIT = 10;
@@ -306,7 +307,11 @@ async function sweepCampaign({
   }
   if (mediaIds.length === 0) return stat;
 
-  const queue = getDMQueue();
+  // The comments the campaign still has to act on, from all of its posts.
+  // The cap applies to the campaign, not to each post: per post, one sweep of
+  // an any-post campaign over 30 posts could queue 900 private replies at
+  // once, the burst that runs into Meta's request limits.
+  const candidates: { comment: InstagramComment; mediaId: string }[] = [];
 
   for (const mediaId of mediaIds) {
     let comments: InstagramComment[];
@@ -319,10 +324,11 @@ async function sweepCampaign({
         sinceMs
       );
     } catch (error) {
-      // The remaining posts would be refused as well.
+      // The remaining posts would be refused as well. What the posts before
+      // brought is still queued below.
       if (isMetaThrottle(error)) {
         stat.limit = error;
-        return stat;
+        break;
       }
       stat.errors.push(`Comments ${mediaId}: ${errMessage(error)}`);
       continue;
@@ -396,38 +402,46 @@ async function sweepCampaign({
       return dmStopped && replyStopped;
     }).map((log) => log.commentId));
 
-    // Oldest first, so whoever commented earliest gets answered first, capped.
-    const fresh = needsAction
-      .filter((c) => !handledSet.has(c.id))
-      .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp))
-      .slice(0, MAX_NEW_PER_SWEEP);
-
-    for (const c of fresh) {
-      // No deterministic jobId here: a retained completed/failed job from an
-      // earlier sweep would otherwise be treated as a duplicate and silently
-      // drop this add, so the comment would never be retried. Dedup is handled
-      // above and by the worker's atomic, durable per-leg claims. Send attempts
-      // are counted in DmLog across jobs, so a sweep cannot reset the budget.
-      await queue.add(COMMENT_JOB_NAME, {
-        instagramAccountId: account.instagramId,
-        accountConnectionId: account.id,
-        commentId: c.id,
-        commentText: c.text ?? "",
-        commenterId: c.from!.id,
-        commenterName: c.from?.username,
-        mediaId,
-        // When the sweep is looking at an ad, the campaign is bound to the post
-        // the ad was made from: without this the worker matches nothing and
-        // drops the comment, so the sweep would enqueue it again every five
-        // minutes and never deliver it.
-        originalMediaId:
-          automation.postId && mediaId !== automation.postId
-            ? automation.postId
-            : undefined,
-        source: "POLLING",
-      });
-      stat.enqueued += 1;
+    for (const comment of needsAction) {
+      if (!handledSet.has(comment.id)) candidates.push({ comment, mediaId });
     }
+  }
+
+  // Oldest first across all the campaign's posts, so whoever commented
+  // earliest gets answered first, capped. Feed order would let the newest
+  // posts crowd out older comments that the lookback is about to drop.
+  const fresh = candidates
+    .sort(
+      (a, b) => Date.parse(a.comment.timestamp) - Date.parse(b.comment.timestamp)
+    )
+    .slice(0, MAX_NEW_PER_SWEEP);
+
+  const queue = getDMQueue();
+  for (const { comment: c, mediaId } of fresh) {
+    // No deterministic jobId here: a retained completed/failed job from an
+    // earlier sweep would otherwise be treated as a duplicate and silently
+    // drop this add, so the comment would never be retried. Dedup is handled
+    // above and by the worker's atomic, durable per-leg claims. Send attempts
+    // are counted in DmLog across jobs, so a sweep cannot reset the budget.
+    await queue.add(COMMENT_JOB_NAME, {
+      instagramAccountId: account.instagramId,
+      accountConnectionId: account.id,
+      commentId: c.id,
+      commentText: c.text ?? "",
+      commenterId: c.from!.id,
+      commenterName: c.from?.username,
+      mediaId,
+      // When the sweep is looking at an ad, the campaign is bound to the post
+      // the ad was made from: without this the worker matches nothing and
+      // drops the comment, so the sweep would enqueue it again every five
+      // minutes and never deliver it.
+      originalMediaId:
+        automation.postId && mediaId !== automation.postId
+          ? automation.postId
+          : undefined,
+      source: "POLLING",
+    });
+    stat.enqueued += 1;
   }
 
   return stat;

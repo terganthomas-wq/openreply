@@ -128,7 +128,7 @@ Optional, for tuning the polling reconciler (defaults are fine to start):
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `COMMENT_POLL_INTERVAL_MS` | `300000` | How often the worker sweeps for missed comments (5 min). |
-| `COMMENT_POLL_MAX_PER_SWEEP` | `30` | Max new comments each campaign acts on per sweep. Keep it conservative; higher gets closer to Instagram's rate limits. |
+| `COMMENT_POLL_MAX_PER_SWEEP` | `30` | Max new comments each campaign acts on per sweep, across all of its posts, oldest first; the rest wait for the next sweep. Keep it conservative; higher gets closer to Instagram's rate limits. |
 | `COMMENT_POLL_LOOKBACK_HOURS` | `72` | How far back a sweep considers comments. |
 | `COMMENT_POLL_MEDIA_LIMIT` | `10` | How many of the newest posts an "any post" campaign's sweep reads, 1 to 50. Only this count bounds the posts, not their age: an old reel can still get comments, and the lookback bounds those. Each post costs one comment read per sweep and account, however many campaigns share it. An account that posts ten times a day reaches back about a day with the default. |
 

@@ -1,22 +1,25 @@
 import { NextResponse } from "next/server";
-import { getCurrentWorkspaceId } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
 import { getDMQueue } from "@/lib/queue/client";
 import { readAccountPauses } from "@/lib/queue/account-pause";
 import { keyExpiryBounds, keyExpiryWarning } from "@/lib/integrations/key-lifetime";
 import { eventDetail } from "@/lib/ops/event-details";
 import { getWorkerAlerts, getWorkerHealth } from "@/lib/ops/worker-health";
+import { canManageWorkspace, getCurrentWorkspaceContext } from "@/lib/workspace-access";
 
 export const runtime = "nodejs";
 
 export async function GET() {
-  const workspaceId = await getCurrentWorkspaceId();
-  if (!workspaceId) {
+  // Open to every member of the workspace; the role only decides what the
+  // key notice asks of the reader.
+  const context = await getCurrentWorkspaceContext();
+  if (!context) {
     return NextResponse.json(
       { success: false, error: "Unauthorized" },
       { status: 401 }
     );
   }
+  const { workspaceId } = context;
 
   // Service keys that need a new one: expiring within 14 days, or expired
   // although something used them within 30 (lib/integrations/key-lifetime.ts).
@@ -162,6 +165,9 @@ export async function GET() {
       })),
       accountPauses,
       keyWarnings,
+      // Only owners and admins create and revoke keys (the keys route
+      // refuses everyone else): a member is asked to have one of them do it.
+      canManageKeys: canManageWorkspace(context.role),
     },
   });
 }

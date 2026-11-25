@@ -16,6 +16,7 @@ import {
   keyExpiryBounds,
   keyExpiryWarning,
   keyLifetime,
+  lifetimeAfterAccessChange,
   SIGNUP_KEY_LIFETIME,
 } from "../lib/integrations/key-lifetime";
 import { ACCESS_SCOPES } from "../lib/integrations/scopes";
@@ -55,6 +56,31 @@ describe("key lifetimes", () => {
       expect(lifetime.choices.every((days) => Number.isInteger(days) && days >= 1)).toBe(true);
     }
     expect(CAMPAIGN_KEY_LIFETIME.choices).toEqual([30, 60, 90]);
+  });
+});
+
+// The API & MCP page's form when its access changes: read-only and
+// read-and-write keys share their rules, so a chosen lifetime stays; a
+// change to or from a sign-up key starts at that kind's default.
+describe("the lifetime after the access changes", () => {
+  const { read, write, signups } = ACCESS_SCOPES;
+
+  it("keeps the chosen lifetime between read-only and read-and-write", () => {
+    expect(lifetimeAfterAccessChange(90, read, write)).toBe(90);
+    expect(lifetimeAfterAccessChange(60, write, read)).toBe(60);
+    expect(lifetimeAfterAccessChange(30, read, read)).toBe(30);
+    expect(lifetimeAfterAccessChange(180, signups, signups)).toBe(180);
+  });
+
+  it("starts at the new kind's default when the rules change", () => {
+    expect(lifetimeAfterAccessChange(90, read, signups)).toBe(365);
+    expect(lifetimeAfterAccessChange(30, write, signups)).toBe(365);
+    expect(lifetimeAfterAccessChange(365, signups, read)).toBe(30);
+    expect(lifetimeAfterAccessChange(90, signups, write)).toBe(30);
+  });
+
+  it("never keeps a lifetime the form does not offer", () => {
+    expect(lifetimeAfterAccessChange(45, read, write)).toBe(30);
   });
 });
 
