@@ -7,7 +7,9 @@ import type { AccountOption } from "@/components/account-select";
 import { ZernioConnection } from "@/components/zernio-connection";
 import { InstagramConnectNotice } from "@/components/instagram-connect-notice";
 import { ConnectionIncidentNotice } from "@/components/connection-incident";
+import { MessagingSilenceNotice } from "@/components/messaging-silence";
 import { connectionIncidentOf } from "@/lib/instagram/connection-incident";
+import { messagingSilenceOf } from "@/lib/instagram/messaging-silence-incident";
 
 interface SettingsData {
   workspace: {
@@ -29,6 +31,8 @@ interface SettingsData {
       // A1: set while the worker's check finds the connection lost.
       connectionLostAt?: string | null;
       connectionLostReason?: string | null;
+      // A2: set while button taps, DMs and read receipts do not arrive.
+      messagingSilentSince?: string | null;
     }
   >;
 }
@@ -139,6 +143,7 @@ export default function SettingsPage() {
     membersData?.currentUserRole === "OWNER" ||
     membersData?.currentUserRole === "ADMIN";
   const connectionLost = accounts.some((account) => connectionIncidentOf(account));
+  const messagesMissing = accounts.some((account) => messagingSilenceOf(account));
 
   return (
     <div className="max-w-2xl mx-auto space-y-8">
@@ -170,7 +175,7 @@ export default function SettingsPage() {
             </div>
             <span
               className={`shrink-0 px-3 py-1.5 rounded-full text-xs font-medium ${
-                connectionLost
+                connectionLost || messagesMissing
                   ? "bg-error/10 text-error"
                   : accounts.length > 0
                     ? "bg-success/10 text-success"
@@ -179,9 +184,11 @@ export default function SettingsPage() {
             >
               {connectionLost
                 ? t("Connection lost")
-                : accounts.length > 0
-                  ? t("Connected")
-                  : t("Not connected")}
+                : messagesMissing
+                  ? t("Messages not arriving")
+                  : accounts.length > 0
+                    ? t("Connected")
+                    : t("Not connected")}
             </span>
           </div>
 
@@ -205,6 +212,8 @@ export default function SettingsPage() {
             )}
             {accounts.map((account) => {
               const incident = connectionIncidentOf(account);
+              // Null while the connection is lost: that notice covers it.
+              const silence = messagingSilenceOf(account);
               return (
               <div
                 key={account.id}
@@ -219,6 +228,13 @@ export default function SettingsPage() {
                     // finds the connection lost (A1).
                     <ConnectionIncidentNotice
                       incident={incident}
+                      canManage={canManageMembers}
+                    />
+                  ) : silence ? (
+                    // Nor while button taps, DMs and read receipts do not
+                    // arrive (A2).
+                    <MessagingSilenceNotice
+                      silence={silence}
                       canManage={canManageMembers}
                     />
                   ) : (

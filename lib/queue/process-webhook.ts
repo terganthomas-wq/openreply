@@ -1,8 +1,9 @@
 import { prisma } from '@/lib/db/client';
 import { COMMENT_JOB_NAME, getDMQueue, MESSAGE_JOB_NAME, POSTBACK_JOB_NAME } from '@/lib/queue/client';
-import { parseCommentEvents, parseMessageEvents, parsePostbackEvents, parseReadEvents } from '@/lib/meta/webhook';
+import { inboundMessagingAccountIds, parseCommentEvents, parseMessageEvents, parsePostbackEvents, parseReadEvents } from '@/lib/meta/webhook';
 import { Prisma, type InstagramProvider } from '@/app/generated/prisma/client';
 import { MANUAL_MATCHED_KEYWORD } from '@/lib/comments/manual';
+import { endMessagingSilencesFor } from '@/lib/instagram/messaging-silence-state';
 
 const OPENING_DM_READ_FALLBACK_DELAY_MS = 5 * 60 * 1000;
 type InstagramPayload = Parameters<typeof parseCommentEvents>[0];
@@ -22,13 +23,21 @@ export async function processInstagramWebhook({ payload: incoming, provider, wor
   // A payload that holds nothing else would still cost an account lookup and a
   // WebhookEvent insert and update, and wake the database for nothing. Nothing
   // reads such a row: Diagnostics shows failed events only, and the sweep
-  // reads comment payloads.
-  const hasWork = [parseCommentEvents, parsePostbackEvents, parseMessageEvents, parseReadEvents]
-    .some((parse) => parse(incoming).length > 0);
+  // reads comment payloads. A payload with anything a person did in a DM is
+  // kept even when no job comes of it (a reaction, a DM without text, an
+  // event in `standby` while another app receives the conversation): the
+  // messaging silence check (A2, lib/instagram/messaging-silence-check.ts)
+  // reads these rows to tell whether Instagram still passes such events on.
+  const hasWork =
+    [parseCommentEvents, parsePostbackEvents, parseMessageEvents, parseReadEvents]
+      .some((parse) => parse(incoming).length > 0) ||
+    inboundMessagingAccountIds(incoming).length > 0;
   if (!hasWork) return;
   const accounts = await prisma.instagramAccount.findMany({
     where: { instagramId: { in: incoming.entry.map(e => e.id) }, provider, ...(workspaceId ? { workspaceId } : {}) },
-    select: { id: true, instagramId: true, workspaceId: true },
+    // The silence fields: an inbound messaging event ends the account's
+    // silence below, without a query while none is open.
+    select: { id: true, instagramId: true, workspaceId: true, messagingSilentSince: true, messagingSilenceCheckAt: true },
   });
   const accountMap = new Map(accounts.map(a => [a.instagramId, a]));
   const allowed = new Set(accountMap.keys());
@@ -44,6 +53,13 @@ export async function processInstagramWebhook({ payload: incoming, provider, wor
       ...(workspaceId ? { workspaceId } : {}),
       status: "PENDING",
     },
+  });
+
+  // A2: one inbound messaging event ends the account's messaging silence at
+  // once, now that it is stored. Never throws: should it fail, the worker's
+  // next check ends the silence with this row.
+  await endMessagingSilencesFor(payload, accounts, {
+    at: webhookEvent.createdAt ?? new Date(),
   });
 
   try {

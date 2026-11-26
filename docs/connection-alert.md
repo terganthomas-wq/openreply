@@ -207,3 +207,163 @@ answer gives it back for the next sweep with the same `Idempotency-Key`, a
 refusal keeps it taken. Without e-mail settings or recipients it stays owed.
 After 24 hours, or once the connection is lost again, it is dropped.
 Diagnostics shows the last catch-up for 7 days either way.
+
+## Messages not arriving (A2)
+
+On 2026-11-25/26, after the Instagram account was linked to a Facebook Page,
+Meta kept delivering comment webhooks but no messaging webhooks at all for 21
+hours: no button taps, no DMs, no read receipts. Every opening DM went out,
+every tap on its button was lost, and the connection check above stayed
+green, as the account and its comments could be read. The worker now notices
+this too (`lib/instagram/messaging-silence-check.ts`), from the database
+alone, without a single Meta call.
+
+### The signal
+
+With every comment sweep, for each account connected through your own Meta
+app, the worker reads:
+
+- the opening DMs the account sent: `SENT` DmLog rows of a comment (not the
+  `reveal:` and `dm:` rows that a tap or a DM keyword brought), whose
+  delivery is confirmed, of campaigns whose DM has a button (an opening DM
+  with its text and button label), with their send time;
+- the inbound messaging events that arrived for the account: WebhookEvent
+  rows whose payload has, for the account, a button tap (`postback`), a DM
+  that is not an echo (with or without text, deleted or unsupported), a read
+  receipt or a reaction, in `messaging` or in `standby` (another app is the
+  conversation's primary receiver). Echoes and comment changes never count.
+  The webhook route keeps every payload with such an event, also one no job
+  comes of (a reaction, a DM without text, a `standby` event). The database
+  narrows the rows to the account's payloads with `messaging` or `standby`
+  items (jsonb containment, index on `createdAt`); what counts is decided in
+  one place, `inboundMessagingAccountIds` in `lib/meta/webhook.ts`, which the
+  webhook route uses too.
+
+A check is silent when at least 3 different people got an opening DM that
+went out at least 12 and at most 18 hours ago, after the end of the
+account's last A1 incident, and no inbound messaging event arrived since the
+first of these DMs. Two silent checks in a row, at least one sweep interval
+apart (A1's gap, a tenth early at most five minutes), open an incident; its
+start (`messagingSilentSince`) is the last inbound messaging event before the
+silence, or the first unanswered opening DM when none arrived in the last 7
+days.
+
+No judgment (the check changes nothing) while the account's connection is
+lost (an A1 incident: no webhook arrives at all then) or in doubt (A1's
+first failed check, until the next one decides), while the account is
+paused for a Meta request limit (R1), or while it has no active campaign
+whose DM has a button. A paused campaign's opening DMs still count while
+another such campaign is active: a tap on them arrives as a webhook all the
+same.
+
+### Calibration
+
+The thresholds come from replaying the production timeline of 2026-11-20 to
+2026-11-26 11:37 UTC through the real check, every 30 minutes, for each of the
+30 minutes the sweep may fall on
+(`__tests__/messaging-silence-calibration.test.ts`, with the timeline in
+`__tests__/fixtures/messaging-silence-timeline.json`):
+
+- The silence: opening DMs to 3 people at 20:49 to 20:51 UTC on the 25th,
+  right after the A1 reconnect, then nothing until the fix at 10:30. The
+  first silent check comes between 08:52 and 09:21 UTC on the 26th, and the
+  incident opens between 09:22 and 09:51 UTC (09:30 with sweeps on the hour
+  and the half hour): 12.5 to 13 hours after the unanswered DMs, about an hour
+  before the fix.
+- Never a silent check before the silence began, quiet nights included. The
+  closest call was the night of 2026-11-24/25: five people got their opening
+  DM between 12:06 and 22:17 UTC and nothing came back for 24 hours, until a
+  read receipt at 07:16. The 18-hour window is what keeps that night quiet
+  with a margin: three of those DMs within six hours (18:08 to 20:49) would
+  have made a silent check from 08:50 on, 93 minutes after the receipt;
+  without the window (any age counts) the 12:06, 18:08 and 19:35 DMs would
+  have made one from 07:35 on, 18 minutes after it, and with 2 people instead
+  of 3 it would have been a false alarm from 06:09 on. 4 people would not
+  have fired before the fix: the fourth opening DM of the silence went out at
+  04:51.
+
+A false alarm is worse than a few hours' delay, so the defaults stay
+conservative. They can be set in the worker's environment:
+
+| Variable | Meaning | Default | Allowed |
+| --- | --- | --- | --- |
+| `MESSAGING_SILENCE_MIN_PEOPLE` | Different people with an unanswered opening DM | 3 | 2 to 10, a whole number |
+| `MESSAGING_SILENCE_MIN_AGE_HOURS` | How old each of those DMs is, at least | 12 | 4 to 36 |
+| `MESSAGING_SILENCE_WINDOW_HOURS` | How old they are, at most | the minimum age plus 6 (18) | the minimum age plus 1 to plus 48 |
+
+A value outside its range is moved to the nearest bound, anything that is
+not a number falls back to the default, and the worker records a WARNING
+about it once per start in Diagnostics.
+
+### State
+
+On `InstagramAccount` (migration `20261127090000_messaging_silence`, which
+also adds the index on `WebhookEvent.createdAt`):
+
+| Column | Meaning |
+| --- | --- |
+| `messagingSilenceCheckAt` | The first silent check of the current run. |
+| `messagingSilentSince` | Open incident: since when nothing arrived. |
+| `messagingSilenceResult` | The last silence that ended: `since`, `endedAt`, `via` (`webhook` or `check`). |
+| `messagingAlertSentAt` | When the last warning e-mail about a silence went out, for any silence of the account. |
+| `messagingAlertRearmedAt` | When such a warning went out inside the 24 hours of the last one, after an all-clear. |
+| `messagingAlertCount` | E-mails for the open silence: 1 after the alert, 2 after the reminder. |
+| `messagingAllClearDueAt` | The all-clear of the last silence is still to go out. |
+| `messagingAllClearSentAt` | When the last all-clear about a silence reached an owner or admin. |
+
+### The end
+
+One inbound messaging event ends the incident: the webhook route right after
+it stored the event (`lib/instagram/messaging-silence-state.ts`, with the
+account fields of its own lookup, so a webhook costs no query while nothing
+is open), or else the next check, which first looks for one since the
+incident's start, whatever else holds (also during an A1 incident or an R1
+pause). The same event forgets a first silent check. A check that is not
+silent never ends an open incident: the DMs that made it silent may simply
+have grown too old to count. A reconnect does not end it either; only an
+event that arrives does.
+
+The end is one conditional update that also keeps the silence as
+`messagingSilenceResult` and makes its all-clear due. This is the hook for
+the search for lost taps after a silence (A2 requirement 4): with it, the end
+owes that search instead (from `since`, like A1's `connectionCatchUpFrom`),
+and the search writes the result and makes the all-clear due once it has
+finished (`afterSilence` in `lib/instagram/messaging-silence-state.ts`).
+
+### The e-mails and the dashboard
+
+A1's infrastructure and rules (`lib/ops/incident-mail.ts`, shared by both):
+every owner and admin of the workspace, the same transport and settings, the
+alert when the incident opens and one reminder 24 hours later, at most one
+warning per 24 hours per account (counted for the silence's own e-mails, so a
+lost-connection warning does not hold one back), the alert at once for a new
+silence after an all-clear (at most once per 24 hours), each e-mail claimed on
+the account row before it is sent, with an `Idempotency-Key` per person that
+is the same for every try. German with "du" when `DEFAULT_LOCALE=de`, English
+otherwise (`lib/ops/messaging-silence-email.ts`): what is wrong in plain
+words, since when, what it means, the likely causes (Instagram linked to or
+unlinked from a Facebook Page, then select that Page when reconnecting;
+"Allow access to messages" switched off in Instagram; another app set as the
+default for Instagram under "Conversation routing" in the Business Suite) and
+the fix with the link to `{NEXTAUTH_URL}/settings`.
+
+The all-clear ("Instagram passes button taps on to OpenReply again") goes
+out with the sweep after the end: how long the silence lasted, and that taps
+in that time got nothing. It is dropped when it could not go out within 24
+hours, or once a silence or a lost connection is open again.
+
+- A banner above every dashboard page, "Instagram is not passing on button
+  taps", with since when, what it means, the causes and "Reconnect" (members
+  are asked to have an owner or admin do it). While the account's connection
+  is lost, only the lost connection is shown.
+- Settings shows "Messages not arriving" instead of "Connected", and the
+  account's notice with since when, the causes and the fix.
+- Diagnostics lists the open silence with the e-mail, the last silence for 7
+  days after it ended, and names the events in the reader's language.
+- `/api/health` reports it in `checks.instagram`: `"status": "degraded"` and
+  `silences: [{ account, since, reason: "messaging-silence", alertSentAt }]`,
+  next to A1's `incidents`. The HTTP status and the top-level `status` stay as
+  before.
+- DMs keep going out, and "Send DM" on the Comments page works: only what
+  people do in their DMs does not arrive.
+

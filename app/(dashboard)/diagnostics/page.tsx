@@ -10,6 +10,8 @@ import KeyExpiryNotice, {
 import StatusBadge from "@/components/status-badge";
 import ConnectionCatchUpReport from "@/components/connection-catch-up";
 import { ReconnectButton } from "@/components/connection-incident";
+import { MESSAGING_SILENCE_TEXT } from "@/components/messaging-silence";
+import type { MessagingSilenceReport } from "@/lib/instagram/messaging-silence-incident";
 import { catchUpEventText, type CatchUpReport } from "@/lib/instagram/catch-up-report";
 import {
   CONNECTION_LOST_REASON_TEXT,
@@ -81,6 +83,14 @@ interface DiagnosticsData {
   // A1: the catch-up after an incident, while it runs and for 7 days after,
   // with the comments the owner had answered by hand.
   connectionCatchUps?: CatchUpReport[];
+  // A2: accounts whose button taps, DMs and read receipts do not arrive.
+  messagingSilences?: Array<{
+    username: string;
+    since: string;
+    alertSentAt: string | null;
+  }>;
+  // A2: the last silence of an account, for 7 days after it ended.
+  endedMessagingSilences?: MessagingSilenceReport[];
   // Owners and admins can reconnect an account.
   canReconnect?: boolean;
   // Service keys that expire within 14 days, or expired although something
@@ -172,6 +182,37 @@ function eventMessage(
     case "connection-all-clear":
       return detail.account
         ? t("All-clear e-mail for @{account} sent. Recipients: {count}", {
+            account: detail.account,
+            count: detail.recipients,
+          })
+        : event.message;
+    case "messaging-silent":
+      return detail.account
+        ? t(
+            "Instagram passes on no button taps, DMs or read receipts for @{account} since {time}.",
+            { account: detail.account, time: formatIncidentTime(detail.since, locale) }
+          )
+        : event.message;
+    case "messaging-back":
+      return detail.account
+        ? t("Button taps, DMs and read receipts for @{account} arrive again.", {
+            account: detail.account,
+          })
+        : event.message;
+    case "messaging-alert":
+      if (!detail.account) return event.message;
+      return detail.reminder
+        ? t("Reminder about the missing button taps of @{account} sent. Recipients: {count}", {
+            account: detail.account,
+            count: detail.recipients,
+          })
+        : t("Alert e-mail about the missing button taps of @{account} sent. Recipients: {count}", {
+            account: detail.account,
+            count: detail.recipients,
+          });
+    case "messaging-all-clear":
+      return detail.account
+        ? t("All-clear e-mail about the button taps of @{account} sent. Recipients: {count}", {
             account: detail.account,
             count: detail.recipients,
           })
@@ -314,6 +355,71 @@ export default function DiagnosticsPage() {
           reports={data.connectionCatchUps}
           canManage={Boolean(data.canReconnect)}
         />
+      ) : null}
+
+      {data?.messagingSilences?.length ? (
+        <section className="rounded border border-error/30 bg-error/10 p-4 sm:p-6">
+          <h2 className="text-base font-semibold text-foreground">
+            {t(MESSAGING_SILENCE_TEXT.title)}
+          </h2>
+          <p className="mt-2 text-sm text-foreground">{t(MESSAGING_SILENCE_TEXT.what)}</p>
+          <ul className="mt-3 space-y-3 text-sm text-foreground">
+            {data.messagingSilences.map((silence) => (
+              <li key={silence.username} className="break-words">
+                <p className="font-semibold">
+                  {t("@{account}: no button taps, DMs or read receipts since {time}", {
+                    account: silence.username,
+                    time: formatIncidentTime(silence.since, locale),
+                  })}
+                </p>
+                <p className="mt-0.5 text-muted">
+                  {silence.alertSentAt
+                    ? t("Alert e-mail sent: {time}", {
+                        time: formatIncidentTime(silence.alertSentAt, locale),
+                      })
+                    : t("No alert e-mail sent yet")}
+                </p>
+              </li>
+            ))}
+          </ul>
+          <p className="mt-3 text-sm text-foreground">{t(MESSAGING_SILENCE_TEXT.causes)}</p>
+          {data.canReconnect ? (
+            <ReconnectButton className="mt-4" />
+          ) : (
+            <p className="mt-3 text-sm text-muted">{t(MESSAGING_SILENCE_TEXT.askAdmin)}</p>
+          )}
+        </section>
+      ) : null}
+
+      {data?.endedMessagingSilences?.length ? (
+        <section className="panel rounded p-4 sm:p-6">
+          <h2 className="text-base font-semibold text-foreground">
+            {t("After the missing button taps")}
+          </h2>
+          <ul className="mt-3 space-y-3 text-sm text-foreground">
+            {data.endedMessagingSilences.map((report) => (
+              <li key={report.accountId} className="min-w-0 break-words">
+                <p className="font-semibold">
+                  {t("@{account}: button taps arrive again since {time}", {
+                    account: report.username,
+                    time: formatIncidentTime(report.endedAt, locale),
+                  })}
+                </p>
+                <p className="mt-0.5 text-muted">
+                  {t("No button taps, DMs or read receipts arrived from {from} to {to}.", {
+                    from: formatIncidentTime(report.since, locale),
+                    to: formatIncidentTime(report.endedAt, locale),
+                  })}
+                </p>
+              </li>
+            ))}
+          </ul>
+          <p className="mt-3 text-sm text-muted">
+            {t(
+              "Whoever tapped the button in your first DM in that time got nothing: the tap did not reach OpenReply. In Instagram such a tap shows in the conversation as a message with the button's text."
+            )}
+          </p>
+        </section>
       ) : null}
 
       {data?.accountPauses.length ? (

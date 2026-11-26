@@ -21,20 +21,18 @@
  * again, an all-clear that is still owed is dropped: it would say something
  * that is no longer news, or no longer true. Diagnostics shows the catch-up
  * either way.
+ *
+ * The claimed send is shared with the e-mails about a messaging silence (A2):
+ * lib/ops/incident-mail.ts.
  */
 
-import { createHash } from "node:crypto";
 import { prisma } from "@/lib/db/client";
 import { readCatchUpResult } from "@/lib/instagram/catch-up-state";
 import { buildAllClearEmail } from "@/lib/ops/connection-all-clear-email";
-import { alertLocale, connectionAlertRecipients } from "@/lib/ops/connection-alert";
+import { alertLocale } from "@/lib/ops/connection-alert";
 import { CONNECTION_ALL_CLEAR_EVENT } from "@/lib/ops/event-details";
-import {
-  mailTransportFromEnv,
-  warnMailNotConfigured,
-  type MailResult,
-  type MailTransport,
-} from "@/lib/ops/mail";
+import { hashedRecipient, sendIncidentMail } from "@/lib/ops/incident-mail";
+import { mailTransportFromEnv, type MailTransport } from "@/lib/ops/mail";
 import { logWorkerEvent } from "@/lib/queue/send-helpers";
 
 /** An all-clear that could not go out within this time is dropped. */
@@ -61,11 +59,7 @@ export function allClearIdempotencyKey({
   finishedAt: Date;
   to: string;
 }): string {
-  const person = createHash("sha256")
-    .update(to.trim().toLowerCase())
-    .digest("hex")
-    .slice(0, 16);
-  return `openreply-connection-all-clear/${accountId}/${finishedAt.getTime()}/${person}`;
+  return `openreply-connection-all-clear/${accountId}/${finishedAt.getTime()}/${hashedRecipient(to)}`;
 }
 
 export type AllClearOutcome =
@@ -138,111 +132,62 @@ export async function sendConnectionAllClear(
     return "dropped";
   }
 
-  if (!transport) {
-    await warnMailNotConfigured();
-    return "no-mail";
-  }
-
-  const recipients = await connectionAlertRecipients(account.workspaceId);
-  if (recipients.length === 0) {
-    if (!warnedNoRecipients.has(account.id)) {
-      warnedNoRecipients.add(account.id);
-      await logWorkerEvent({
-        workspaceId: account.workspaceId,
-        level: "WARNING",
-        message: `All-clear e-mail for @${account.username} not sent: the workspace has no owner or admin with an e-mail address`,
+  return sendIncidentMail({
+    account,
+    label: "All-clear",
+    noRecipientsLabel: "All-clear e-mail",
+    warnedNoRecipients,
+    transport,
+    // The claim: exactly the all-clear this decision was made on.
+    claim: async () => {
+      const claim = await prisma.instagramAccount.updateMany({
+        where: { id: account.id, connectionAllClearDueAt: due, connectionLostAt: null },
+        data: { connectionAllClearDueAt: null },
       });
-    }
-    return "no-recipients";
-  }
-
-  // The claim: exactly the all-clear this decision was made on.
-  const claim = await prisma.instagramAccount.updateMany({
-    where: { id: account.id, connectionAllClearDueAt: due, connectionLostAt: null },
-    data: { connectionAllClearDueAt: null },
-  });
-  if (claim.count !== 1) return "taken";
-
-  const email = buildAllClearEmail({
-    locale: alertLocale(env),
-    username: account.username,
-    lostAt: new Date(result.lostAt),
-    recoveredAt: new Date(result.recoveredAt),
-    queued: result.queued,
-    ownerAnswered: result.ownerAnswered,
-    ownerAnsweredTotal: result.ownerAnsweredTotal,
-    skipped: result.skipped,
-    commentsUrl: commentsPageUrl(env),
-  });
-
-  // One e-mail per person: nobody sees the others' addresses.
-  const results: MailResult[] = [];
-  for (const to of recipients) {
-    results.push(
-      await transport.send({
-        to,
-        ...email,
-        idempotencyKey: allClearIdempotencyKey({ accountId: account.id, finishedAt: due, to }),
-      })
-    );
-  }
-  const failures = results.filter(
-    (sent): sent is Extract<MailResult, { ok: false }> => !sent.ok
-  );
-  const delivered = results.length - failures.length;
-
-  if (delivered > 0) {
+      return claim.count === 1;
+    },
+    // Owed again, unless a newer catch-up owes its own meanwhile.
+    release: async () => {
+      await prisma.instagramAccount.updateMany({
+        where: { id: account.id, connectionAllClearDueAt: null },
+        data: { connectionAllClearDueAt: due },
+      });
+    },
+    build: () =>
+      buildAllClearEmail({
+        locale: alertLocale(env),
+        username: account.username,
+        lostAt: new Date(result.lostAt),
+        recoveredAt: new Date(result.recoveredAt),
+        queued: result.queued,
+        ownerAnswered: result.ownerAnswered,
+        ownerAnsweredTotal: result.ownerAnsweredTotal,
+        skipped: result.skipped,
+        commentsUrl: commentsPageUrl(env),
+      }),
+    idempotencyKey: (to) =>
+      allClearIdempotencyKey({ accountId: account.id, finishedAt: due, to }),
+    event: { kind: CONNECTION_ALL_CLEAR_EVENT, account: account.username },
     // Only an all-clear that went out counts: should the connection drop
     // again, its alert goes out at once instead of up to 24 hours after the
     // last warning (lib/ops/connection-alert.ts), as the owners' last e-mail
     // said it is back. Best effort: without it the 24 hours hold as before.
-    await prisma.instagramAccount
-      .updateMany({
-        where: { id: account.id },
-        data: { connectionAllClearSentAt: new Date(now) },
-      })
-      .catch((error) =>
-        console.error(
-          "[All-clear] Could not record the sent all-clear:",
-          error instanceof Error ? error.message : "unknown error"
-        )
-      );
-    await logWorkerEvent({
-      workspaceId: account.workspaceId,
-      level: "INFO",
-      message: `All-clear e-mail for @${account.username} sent to ${delivered} ${delivered === 1 ? "person" : "people"} (${transport.name})`,
-      payload: {
-        kind: CONNECTION_ALL_CLEAR_EVENT,
-        account: account.username,
-        recipients: delivered,
-      },
-    });
-    if (failures.length > 0) {
-      await logWorkerEvent({
-        workspaceId: account.workspaceId,
-        level: "WARNING",
-        message: `All-clear e-mail for @${account.username} not sent to ${failures.length} of ${results.length} (${transport.name}): ${failures.map((failure) => failure.error).join("; ")}`,
-      });
-    }
-    return "sent";
-  }
-
-  // Nobody got it. Without an answer it may still go out: it is owed again,
-  // unless a newer catch-up owes its own meanwhile, and the next sweep tries
-  // with the same keys. A refusal keeps it taken.
-  const retry = failures.some((failure) => failure.transient);
-  if (retry) {
-    await prisma.instagramAccount.updateMany({
-      where: { id: account.id, connectionAllClearDueAt: null },
-      data: { connectionAllClearDueAt: due },
-    });
-  }
-  await logWorkerEvent({
-    workspaceId: account.workspaceId,
-    level: "WARNING",
-    message: `All-clear e-mail for @${account.username} not sent (${transport.name}): ${failures.map((failure) => failure.error).join("; ")}; ${retry ? "the next sweep tries again" : "not tried again"}`,
+    onDelivered: async () => {
+      await prisma.instagramAccount
+        .updateMany({
+          where: { id: account.id },
+          data: { connectionAllClearSentAt: new Date(now) },
+        })
+        .catch((error) =>
+          console.error(
+            "[All-clear] Could not record the sent all-clear:",
+            error instanceof Error ? error.message : "unknown error"
+          )
+        );
+    },
+    retryNote: "the next sweep tries again",
+    refusalNote: "not tried again",
   });
-  return "failed";
 }
 
 /** Tests: forget which accounts were warned about having no recipients. */

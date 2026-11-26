@@ -223,6 +223,41 @@ model InstagramAccount {
   /// 24 hours of the last warning (lib/ops/connection-alert.ts).
   connectionAllClearSentAt   DateTime?
 
+  // The messaging silence check (A2, lib/instagram/messaging-silence-check.ts).
+  // With every comment sweep the worker looks, in the database only, whether
+  // Instagram still passes on what people do in their DMs: when enough people
+  // got their opening DM long enough ago and no button tap, DM, read receipt
+  // or reaction arrived since, the check is silent. Two silent checks at
+  // least one sweep interval apart open an incident; one inbound messaging
+  // event ends it (the webhook route at once, else the next check).
+
+  /// The first silent check of the current run. Cleared by a check that is
+  /// not silent and by an inbound messaging event.
+  messagingSilenceCheckAt DateTime?
+  /// Open incident: since when no button tap, DM, read receipt or reaction
+  /// arrived, which is the last one before the silence (or the first
+  /// unanswered opening DM when none is known). Null while they arrive.
+  messagingSilentSince    DateTime?
+  /// The last silence that ended (lib/instagram/messaging-silence-incident.ts):
+  /// since when, until when, what ended it. Diagnostics and the all-clear
+  /// e-mail read it; the search for lost taps (A2 requirement 4) adds its result.
+  messagingSilenceResult  Json?
+  /// When the last warning e-mail about a silence went out, for any silence
+  /// of the account: A1's rule of at most one warning per 24 hours, here for
+  /// the silence's own e-mails (lib/ops/messaging-silence-alert.ts).
+  messagingAlertSentAt    DateTime?
+  /// When such a warning went out inside those 24 hours because the owners
+  /// had been told the silence was over (messagingAllClearSentAt).
+  messagingAlertRearmedAt DateTime?
+  /// E-mails for the open silence: 1 after the alert, 2 after the one
+  /// reminder. Back to 0 when a silence starts or ends.
+  messagingAlertCount     Int       @default(0)
+  /// The all-clear e-mail of the last silence is still to go out: when that
+  /// silence ended. Null once it went out or was given up.
+  messagingAllClearDueAt  DateTime?
+  /// When the last all-clear about a silence reached an owner or admin.
+  messagingAllClearSentAt DateTime?
+
   workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   automations Automation[]
   dmLogs      DmLog[]
@@ -595,6 +630,9 @@ model WebhookEvent {
 
   @@index([workspaceId])
   @@index([status])
+  // The messaging silence check (A2) reads an account's newest messaging
+  // events of the last days with every sweep; the rows are never deleted.
+  @@index([createdAt])
 }
 
 model OperationalEvent {

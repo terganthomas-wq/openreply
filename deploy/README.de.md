@@ -382,6 +382,102 @@ nur an der Adresse deines Resend-Kontos an. Läuft die Anmeldung über einen
 eigenen SMTP-Server (`EMAIL_SERVER`), schickt der Worker auch die E-Mail
 darüber.
 
+### Nachrichten kommen nicht an
+
+Am 25./26.11.2026 kamen nach dem Verknüpfen von Instagram mit einer
+Facebook-Seite 21 Stunden lang zwar alle Kommentare an, aber keine
+Button-Tipps, keine DMs und keine Lesebestätigungen. Jede erste DM ging raus,
+doch wer auf „Ja, schick ihn mir“ getippt hat, bekam nichts. Die Prüfung oben
+blieb grün, weil das Konto und seine Kommentare lesbar waren, und niemand
+merkte etwas. Seitdem achtet der Worker auch darauf.
+
+So erkennt das Tool es, ganz ohne Anfrage an Meta, nur aus der eigenen
+Datenbank:
+
+- Bei jedem Durchlauf der Kommentar-Suche (alle 30 Minuten) schaut der
+  Worker bei jedem über die eigene Meta-App verbundenen Konto nach, wer eine
+  erste DM (die mit dem Button) bekommen hat und ob danach irgendetwas aus
+  den DMs angekommen ist: ein Button-Tipp, eine DM (nicht die Kopie deiner
+  eigenen), eine Lesebestätigung oder eine Reaktion, auch als „Standby“,
+  wenn gerade eine andere App die Unterhaltungen bekommt. Kommentare zählen
+  nicht.
+- „Still“ ist eine Prüfung, wenn mindestens 3 verschiedene Leute vor 12 bis
+  18 Stunden ihre erste DM bekommen haben und seit der ersten davon nichts
+  mehr angekommen ist. Erst zwei stille Prüfungen hintereinander, mindestens
+  einen Durchlauf auseinander, gelten als Störung. „Seit“ nennt die Zeit, zu
+  der zuletzt etwas aus den DMs ankam.
+- Es zählen nur erste DMs: nicht der Link nach einem Tipp, keine Antworten
+  auf DM-Keywords, keine DMs, bei denen unklar ist, ob sie ankamen, und nur
+  DMs nach dem Ende der letzten Unterbrechung der Verbindung.
+- Keine Prüfung, solange die Verbindung unterbrochen ist oder die
+  Verbindungsprüfung oben gerade einmal fehlgeschlagen ist (dann kommt
+  ohnehin nichts an), solange eine Meta-Pause läuft und solange das Konto
+  keine aktive Kampagne mit erster DM hat.
+
+Die Grenzen sind an den echten Daten vom 20. bis 26.11.2026 eingestellt.
+Die Störung hätte das Tool am 26.11. zwischen 10:22 und 10:51 Uhr gemeldet,
+je nachdem, auf welche Minute die Durchläufe fallen (um 10:30 Uhr bei
+Durchläufen zur vollen und zur halben Stunde), also gut 12 Stunden nach den
+ersten DMs ohne Antwort und rund eine Stunde, bevor sie behoben war. Davor
+hätte es nie angeschlagen, auch nicht in ruhigen Nächten. Am knappsten war
+die Nacht vom 24. auf den 25.11.: Fünf Leute bekamen zwischen 13:06 und
+23:17 Uhr ihre erste DM, und 24 Stunden lang kam nichts zurück, bis um 08:16
+Uhr eine Lesebestätigung eintraf. Eine stille Prüfung hätte es frühestens 93
+Minuten danach gegeben. Ein falscher Alarm ist schlimmer als ein paar
+Stunden Verzögerung; deshalb sind die Grenzen eher vorsichtig.
+
+Ändern lassen sie sich in `worker.env`, nötig ist das nicht:
+`MESSAGING_SILENCE_MIN_PEOPLE` (wie viele Leute, Standard 3, erlaubt 2 bis
+10), `MESSAGING_SILENCE_MIN_AGE_HOURS` (wie alt ihre erste DM mindestens
+ist, Standard 12, erlaubt 4 bis 36) und `MESSAGING_SILENCE_WINDOW_HOURS`
+(wie alt höchstens, Standard 6 mehr als das Mindestalter, also 18; erlaubt
+1 bis 48 mehr). Werte außerhalb setzt der Worker auf die nächste Grenze,
+Unsinniges auf den Standard, und schreibt das einmal pro Start in die
+*Diagnose*. Weniger Leute oder kürzere Zeiten melden früher, aber auch öfter
+falsch.
+
+Was dann passiert, genau wie bei der unterbrochenen Verbindung:
+
+- Alle Inhaber und Admins bekommen die E-Mail „Instagram gibt keine
+  Button-Tipps weiter: Nach der ersten DM passiert nichts“: seit wann, was
+  das heißt, die üblichen Ursachen und wie du es behebst, mit dem Link auf die
+  Einstellungen. Ist nach 24 Stunden immer noch nichts angekommen, kommt
+  genau eine Erinnerung. Höchstens eine solche Warnung in 24 Stunden pro
+  Konto; kommt nach einer Entwarnung wieder eine Störung, warnt das Tool
+  sofort, aber höchstens einmal in 24 Stunden. Die E-Mails zur unterbrochenen
+  Verbindung zählen dabei nicht mit. Gleiche Einstellungen, gleicher Versand.
+- Oben auf jeder Seite steht ein roter Hinweis „Instagram gibt keine
+  Button-Tipps weiter“ mit den Ursachen und „Neu verbinden“. In den
+  *Einstellungen* steht beim Konto „Seit … keine Button-Tipps, DMs und
+  Lesebestätigungen“, oben „Nachrichten kommen nicht an“ statt „Verbunden“.
+  Die *Diagnose* listet die Störung mit der E-Mail. Ist gleichzeitig die
+  Verbindung unterbrochen, zeigt das Dashboard nur das.
+- `GET /api/health` meldet sie unter `checks.instagram` mit
+  `"status": "degraded"` und der Liste `silences` (Grund
+  `messaging-silence`). HTTP-Status und oberster `status` bleiben, wie sie
+  sind.
+- DMs gehen weiter raus, „DM senden“ auf der Seite *Kommentare* geht auch.
+
+Die üblichen Ursachen und was du tust:
+
+1. Instagram wurde mit einer Facebook-Seite verknüpft oder davon getrennt:
+   neu verbinden und dabei die Seite mit auswählen (siehe oben).
+2. In Instagram ist „Zugriff auf Nachrichten erlauben“ ausgeschaltet:
+   einschalten.
+3. In der Meta Business Suite ist unter „Weiterleiten von Unterhaltungen“
+   eine andere App als Standard für Instagram eingetragen: deine eigene
+   Meta-App dort als Standard eintragen.
+
+Vorbei ist die Störung mit dem ersten Button-Tipp, der ersten DM, Reaktion
+oder Lesebestätigung, die wieder ankommt: sofort, wenn sie ankommt, sonst
+mit dem nächsten Durchlauf. Neu verbinden allein beendet sie nicht, erst
+etwas, das wirklich ankommt. Dann bekommen alle Inhaber und Admins die
+Entwarnung „Instagram gibt wieder Button-Tipps an OpenReply weiter“ mit der
+Dauer der Störung, und die *Diagnose* zeigt sie sieben Tage lang. Wer in der
+Zeit in deiner ersten DM auf den Button getippt hat, hat nichts bekommen.
+Solche Tipps siehst du in Instagram in der Unterhaltung als Nachricht mit dem
+Text des Buttons.
+
 ## Zugangsdaten
 
 Nie in dieses Repository. Alle Werte stehen in einem Ordner außerhalb des Repos:

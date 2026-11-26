@@ -87,6 +87,9 @@ export async function GET(request: NextRequest) {
         // of "Connected" (lib/instagram/connection-incident.ts).
         connectionLostAt: true,
         connectionLostReason: true,
+        // A2: button taps, DMs and read receipts that do not arrive
+        // (lib/instagram/messaging-silence-incident.ts).
+        messagingSilentSince: true,
       },
     }),
     prisma.automation.count({ where: { workspaceId, ...accountFilter } }),

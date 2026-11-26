@@ -4,6 +4,7 @@ import { recordWorkerHeartbeat } from "@/lib/ops/worker-health";
 import { reconcileComments } from "@/lib/polling/comment-reconciler";
 import { attachPendingNextReels } from "@/lib/automation/attach-next-reel";
 import { checkInstagramConnections } from "@/lib/instagram/connection-check";
+import { checkMessagingSilences } from "@/lib/instagram/messaging-silence-check";
 import {
   resumeConnectionCatchUps,
   stopConnectionCatchUps,
@@ -56,6 +57,27 @@ async function poll() {
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     console.error("[DM Worker] Connection check failed:", message);
+  }
+
+  // A2: from the database alone, whether Instagram still passes on button
+  // taps, DMs and read receipts for each account, so a silence like the one
+  // of 2026-11-25/26 opens an incident and e-mails the owners
+  // (lib/instagram/messaging-silence-check.ts). After the connection check,
+  // whose incidents it stands back for; on its own, like it.
+  try {
+    const silences = await checkMessagingSilences({ intervalMs: POLL_INTERVAL_MS });
+    const { quiet = 0, "no-campaign": noCampaign = 0, ...others } = silences.outcomes;
+    if (Object.keys(others).length > 0 || silences.mailed > 0) {
+      console.log("[DM Worker] Messaging silence check:", {
+        quiet,
+        noCampaign,
+        ...others,
+        mailed: silences.mailed,
+      });
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    console.error("[DM Worker] Messaging silence check failed:", message);
   }
 
   // A1: a catch-up of missed comments that is owed but neither running nor

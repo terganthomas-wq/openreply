@@ -93,8 +93,11 @@ describe("GET /api/health and a lost Instagram connection", () => {
   it("reports the Instagram connections as ok while none is lost", async () => {
     const body = await (await GET(request("Bearer health-test-secret"))).json();
     expect(body.checks.instagram).toEqual({ status: "ok" });
+    // One query for both: A1's lost connections and A2's silences.
     expect(findLostAccounts).toHaveBeenCalledWith({
-      where: { connectionLostAt: { not: null } },
+      where: {
+        OR: [{ connectionLostAt: { not: null } }, { messagingSilentSince: { not: null } }],
+      },
       orderBy: { connectionLostAt: "asc" },
       take: 50,
       select: {
@@ -103,6 +106,9 @@ describe("GET /api/health and a lost Instagram connection", () => {
         connectionLostReason: true,
         connectionAlertSentAt: true,
         connectionAlertCount: true,
+        messagingSilentSince: true,
+        messagingAlertSentAt: true,
+        messagingAlertCount: true,
       },
     });
   });
@@ -154,5 +160,77 @@ describe("GET /api/health and a lost Instagram connection", () => {
       status: "error",
       detail: "relation does not exist",
     });
+  });
+});
+
+// A2: Instagram passing on no button taps, DMs or read receipts is degraded
+// with its own reason, the same way: never a change of the HTTP status.
+describe("GET /api/health and a messaging silence", () => {
+  const silentAccount = {
+    username: "thomas.tergan",
+    connectionLostAt: null,
+    connectionLostReason: null,
+    connectionAlertSentAt: null,
+    connectionAlertCount: 0,
+    messagingSilentSince: new Date("2026-11-25T13:15:16.000Z"),
+    messagingAlertSentAt: new Date("2026-11-26T09:30:00.000Z"),
+    messagingAlertCount: 1,
+  };
+
+  it("reports a silence as degraded with its own reason, with 200 and status ok as before", async () => {
+    findLostAccounts.mockResolvedValue([
+      silentAccount,
+      // An e-mail about an earlier silence: none about this one yet.
+      { ...silentAccount, username: "second", messagingAlertCount: 0 },
+    ]);
+    const response = await GET(request("Bearer health-test-secret"));
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.status).toBe("ok");
+    expect(body.checks.instagram).toEqual({
+      status: "degraded",
+      silences: [
+        {
+          account: "thomas.tergan",
+          since: "2026-11-25T13:15:16.000Z",
+          reason: "messaging-silence",
+          alertSentAt: "2026-11-26T09:30:00.000Z",
+        },
+        {
+          account: "second",
+          since: "2026-11-25T13:15:16.000Z",
+          reason: "messaging-silence",
+          alertSentAt: null,
+        },
+      ],
+    });
+  });
+
+  it("lists a lost connection and a silence each under its own reason", async () => {
+    findLostAccounts.mockResolvedValue([
+      {
+        ...silentAccount,
+        username: "lost",
+        connectionLostAt: new Date("2026-11-25T16:45:00.000Z"),
+        connectionLostReason: "missing (Meta 100/33)",
+        messagingSilentSince: null,
+        messagingAlertCount: 0,
+      },
+      silentAccount,
+    ]);
+    const body = await (await GET(request("Bearer health-test-secret"))).json();
+    expect(body.checks.instagram.status).toBe("degraded");
+    expect(body.checks.instagram.incidents).toEqual([
+      {
+        account: "lost",
+        lostAt: "2026-11-25T16:45:00.000Z",
+        reason: "missing",
+        code: "Meta 100/33",
+        alertSentAt: null,
+      },
+    ]);
+    expect(body.checks.instagram.silences).toEqual([
+      expect.objectContaining({ account: "thomas.tergan", reason: "messaging-silence" }),
+    ]);
   });
 });

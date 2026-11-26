@@ -317,7 +317,7 @@ Meta's `/me` returns two IDs. The `id` field is app-scoped. The `user_id` field 
 4. From a different Instagram account, comment `TEST` on that post. It must be a different account, because OpenReply ignores your own comments on purpose.
 5. Watch for the DM. If nothing arrives, check the DM Logs page and `/api/health`.
 
-Hit `/api/health` any time. It reports the database, Redis, queue, and worker heartbeat. If `worker.healthy` is false, the worker is not running or cannot reach Redis, and no DM will send even though webhooks are being received. `checks.instagram` is `degraded` while an account's connection is lost ([connection alert](connection-alert.md)); it does not change the HTTP status.
+Hit `/api/health` any time. It reports the database, Redis, queue, and worker heartbeat. If `worker.healthy` is false, the worker is not running or cannot reach Redis, and no DM will send even though webhooks are being received. `checks.instagram` is `degraded` while an account's connection is lost, or while Instagram passes on no button taps, DMs or read receipts for it (`silences`, reason `messaging-silence`) ([connection alert](connection-alert.md)); it does not change the HTTP status.
 
 If you want to inspect where a comment stopped, the Postgres tables tell you: `WebhookEvent` for delivery, `DmLog` for send status and errors, `OperationalEvent` for worker crashes and the polling reconciler's sweep logs.
 

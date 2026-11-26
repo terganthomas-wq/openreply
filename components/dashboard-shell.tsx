@@ -4,7 +4,9 @@ import { useState } from "react";
 import Sidebar from "@/components/sidebar";
 import TopBar from "@/components/top-bar";
 import { ConnectionIncidentBanner } from "@/components/connection-incident";
+import { MessagingSilenceBanner } from "@/components/messaging-silence";
 import type { ConnectionIncident } from "@/lib/instagram/connection-incident";
+import type { MessagingSilenceIncident } from "@/lib/instagram/messaging-silence-incident";
 
 interface DashboardShellProps {
   children: React.ReactNode;
@@ -15,6 +17,8 @@ interface DashboardShellProps {
   canManage: boolean;
   /** Accounts whose connection Meta dropped (A1): the banner above every page. */
   connectionIncidents?: readonly ConnectionIncident[];
+  /** Accounts whose button taps, DMs and read receipts do not arrive (A2): a banner too. */
+  messagingSilences?: readonly MessagingSilenceIncident[];
 }
 
 export default function DashboardShell({
@@ -24,6 +28,7 @@ export default function DashboardShell({
   instagramAccountCount,
   canManage,
   connectionIncidents = [],
+  messagingSilences = [],
 }: DashboardShellProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
@@ -56,6 +61,7 @@ export default function DashboardShell({
             incidents={connectionIncidents}
             canManage={canManage}
           />
+          <MessagingSilenceBanner silences={messagingSilences} canManage={canManage} />
           <div className="px-4 lg:px-8 py-5 sm:py-6 max-w-7xl mx-auto">
             {children}
           </div>

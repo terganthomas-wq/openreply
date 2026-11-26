@@ -25,9 +25,10 @@ function subscribe() {
  * False while the server renders and during hydration, true afterwards. The
  * banner is rendered on the server too, which knows neither the reader's
  * time zone nor its clock: the time only shows once the browser renders, so
- * the two renders never disagree.
+ * the two renders never disagree. The messaging silence's banner (A2,
+ * components/messaging-silence.tsx) uses it too.
  */
-function useInBrowser(): boolean {
+export function useInBrowser(): boolean {
   return useSyncExternalStore(
     subscribe,
     () => true,

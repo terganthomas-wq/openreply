@@ -71,20 +71,31 @@ interface WebhookEntry {
       media_id?: string;
     };
   }>;
-  messaging?: Array<{
-    sender?: { id?: string };
-    recipient?: { id?: string };
-    postback?: { mid?: string; title?: string; payload?: string };
-    read?: { watermark?: number; seq?: number };
-    message?: {
-      mid?: string;
-      text?: string;
-      is_echo?: boolean;
-      is_deleted?: boolean;
-      is_unsupported?: boolean;
-      attachments?: Array<{ type?: string }>;
-    };
-  }>;
+  messaging?: WebhookMessagingItem[];
+  /**
+   * The same items while another app is the conversation's primary receiver
+   * (Meta's Handover Protocol, "Conversation routing" in the Business Suite).
+   * Nothing here is acted on, but the silence check (A2) counts them: they
+   * show that Instagram still passes on what people do in their DMs.
+   */
+  standby?: WebhookMessagingItem[];
+}
+
+interface WebhookMessagingItem {
+  sender?: { id?: string };
+  recipient?: { id?: string };
+  timestamp?: number;
+  postback?: { mid?: string; title?: string; payload?: string };
+  read?: { watermark?: number; seq?: number; mid?: string };
+  reaction?: { mid?: string; action?: string; reaction?: string; emoji?: string };
+  message?: {
+    mid?: string;
+    text?: string;
+    is_echo?: boolean;
+    is_deleted?: boolean;
+    is_unsupported?: boolean;
+    attachments?: Array<{ type?: string }>;
+  };
 }
 
 export interface WebhookMessageEvent {
@@ -269,4 +280,49 @@ export function parseReadEvents(payload: WebhookPayload): WebhookReadEvent[] {
   }
 
   return events;
+}
+
+/** What a person did in a DM, as the silence check (A2) counts it. */
+export type InboundMessagingKind = "postback" | "message" | "read" | "reaction";
+
+/**
+ * What one messaging item says a person did, or null when it is nothing a
+ * person did: an echo (every DM the account sends comes back as one), the
+ * account's own action, or an item of another kind.
+ */
+export function inboundMessagingKind(
+  item: WebhookMessagingItem,
+  accountId: string
+): InboundMessagingKind | null {
+  if (item.sender?.id === accountId) return null;
+  if (item.message) return item.message.is_echo ? null : "message";
+  if (item.postback) return "postback";
+  if (item.read) return "read";
+  if (item.reaction) return "reaction";
+  return null;
+}
+
+/**
+ * A2: the accounts (their Instagram business ids, entry.id) for which the
+ * payload carries at least one inbound messaging event: a button tap, a DM
+ * that is not an echo (also one without text, deleted or unsupported), a read
+ * receipt or a reaction, in `messaging` or in `standby`. Comment changes and
+ * echoes never count. The webhook route stores such a payload and ends the
+ * account's messaging silence with it (lib/instagram/messaging-silence-state.ts);
+ * the worker's check reads the stored ones (lib/instagram/messaging-silence-check.ts).
+ */
+export function inboundMessagingAccountIds(payload: WebhookPayload): string[] {
+  if (payload?.object !== "instagram" || !Array.isArray(payload.entry)) return [];
+  const accounts = new Set<string>();
+  for (const entry of payload.entry) {
+    if (typeof entry?.id !== "string" || !entry.id) continue;
+    const items = [
+      ...(Array.isArray(entry.messaging) ? entry.messaging : []),
+      ...(Array.isArray(entry.standby) ? entry.standby : []),
+    ];
+    if (items.some((item) => item && inboundMessagingKind(item, entry.id) !== null)) {
+      accounts.add(entry.id);
+    }
+  }
+  return [...accounts];
 }

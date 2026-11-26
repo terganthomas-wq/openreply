@@ -11,9 +11,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { mockPrisma, queueAdd } = vi.hoisted(() => ({
   mockPrisma: {
-    instagramAccount: { findMany: vi.fn() },
+    instagramAccount: { findMany: vi.fn(), findUnique: vi.fn(), updateMany: vi.fn() },
     webhookEvent: { create: vi.fn(), update: vi.fn() },
     dmLog: { findMany: vi.fn() },
+    operationalEvent: { create: vi.fn() },
   },
   queueAdd: vi.fn(),
 }));
@@ -244,5 +245,121 @@ describe("read receipts", () => {
         jobId: `read_fallback_${ACCOUNT}_${READER}_campaign_2`,
       }
     );
+  });
+});
+
+// A2: the messaging silence check reads the stored payloads, and one inbound
+// messaging event ends an account's silence right here.
+describe("inbound messaging events and the messaging silence", () => {
+  const SILENT_SINCE = new Date("2026-11-25T13:15:16.000Z");
+  const ARRIVED = new Date("2026-11-26T10:30:57.000Z");
+
+  beforeEach(() => {
+    mockPrisma.webhookEvent.create.mockResolvedValue({ id: "webhook_event_1", createdAt: ARRIVED });
+    mockPrisma.instagramAccount.updateMany.mockResolvedValue({ count: 1 });
+    mockPrisma.operationalEvent.create.mockResolvedValue({});
+  });
+
+  it("keeps a payload that only has an event in standby or a reaction, and queues nothing for it", async () => {
+    for (const entry of [
+      { id: ACCOUNT, time: 1, standby: [{ sender: { id: READER }, recipient: { id: ACCOUNT }, read: { mid: "m" } }] },
+      { id: ACCOUNT, time: 1, messaging: [{ sender: { id: READER }, recipient: { id: ACCOUNT }, reaction: { mid: "m", action: "react", emoji: "❤️" } }] },
+      { id: ACCOUNT, time: 1, messaging: [{ sender: { id: READER }, recipient: { id: ACCOUNT }, message: { mid: "m", attachments: [{ type: "image" }] } }] },
+    ]) {
+      vi.clearAllMocks();
+      mockPrisma.instagramAccount.findMany.mockResolvedValue([
+        { id: "account_row_1", instagramId: ACCOUNT, workspaceId: "workspace_1" },
+      ]);
+      mockPrisma.webhookEvent.create.mockResolvedValue({ id: "webhook_event_1", createdAt: ARRIVED });
+      await processInstagramWebhook({ payload: { object: "instagram", entry: [entry] } as Payload, provider: "META" });
+      expect(mockPrisma.webhookEvent.create, JSON.stringify(entry)).toHaveBeenCalledTimes(1);
+      expect(queueAdd).not.toHaveBeenCalled();
+    }
+  });
+
+  it("looks the silence up with the accounts it already reads, and costs nothing more while none is open", async () => {
+    await processInstagramWebhook({
+      payload: messagingPayload({ sender: { id: READER }, recipient: { id: ACCOUNT }, read: { watermark: 1 } }),
+      provider: "META",
+    });
+    expect(mockPrisma.instagramAccount.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: expect.objectContaining({ messagingSilentSince: true, messagingSilenceCheckAt: true }),
+      })
+    );
+    expect(mockPrisma.instagramAccount.findUnique).not.toHaveBeenCalled();
+    expect(mockPrisma.instagramAccount.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("ends the account's open silence with a button tap, as soon as it is stored", async () => {
+    mockPrisma.instagramAccount.findMany.mockResolvedValue([
+      { id: "account_row_1", instagramId: ACCOUNT, workspaceId: "workspace_1", messagingSilentSince: SILENT_SINCE, messagingSilenceCheckAt: null },
+    ]);
+    mockPrisma.instagramAccount.findUnique.mockResolvedValue({
+      id: "account_row_1",
+      workspaceId: "workspace_1",
+      instagramId: ACCOUNT,
+      username: "thomas.tergan",
+      messagingSilentSince: SILENT_SINCE,
+      messagingSilenceCheckAt: new Date("2026-11-26T09:00:00.000Z"),
+    });
+
+    await processInstagramWebhook({
+      payload: messagingPayload({
+        sender: { id: READER },
+        recipient: { id: ACCOUNT },
+        postback: { mid: "tap_1", title: "Ja, schick ihn mir", payload: "reveal:campaign_1:open" },
+      }),
+      provider: "META",
+    });
+
+    expect(mockPrisma.webhookEvent.create.mock.invocationCallOrder[0]).toBeLessThan(
+      mockPrisma.instagramAccount.updateMany.mock.invocationCallOrder[0]
+    );
+    expect(mockPrisma.instagramAccount.updateMany).toHaveBeenCalledWith({
+      where: { id: "account_row_1", messagingSilentSince: SILENT_SINCE },
+      data: {
+        messagingSilentSince: null,
+        messagingSilenceCheckAt: null,
+        messagingAlertCount: 0,
+        messagingSilenceResult: {
+          v: 1,
+          since: SILENT_SINCE.toISOString(),
+          endedAt: ARRIVED.toISOString(),
+          via: "webhook",
+        },
+        messagingAllClearDueAt: ARRIVED,
+      },
+    });
+    // The tap itself is handled as always.
+    expect(queueAdd).toHaveBeenCalledWith("process-postback", expect.objectContaining({ userId: READER }), expect.anything());
+  });
+
+  it("never fails the webhook when the silence cannot be ended: the worker's next check ends it", async () => {
+    mockPrisma.instagramAccount.findMany.mockResolvedValue([
+      { id: "account_row_1", instagramId: ACCOUNT, workspaceId: "workspace_1", messagingSilentSince: SILENT_SINCE, messagingSilenceCheckAt: null },
+    ]);
+    mockPrisma.instagramAccount.findUnique.mockRejectedValue(new Error("connection reset"));
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await expect(
+      processInstagramWebhook({
+        payload: messagingPayload({ sender: { id: READER }, recipient: { id: ACCOUNT }, read: { watermark: 1 } }),
+        provider: "META",
+      })
+    ).resolves.toBeUndefined();
+    expect(error).toHaveBeenCalled();
+    error.mockRestore();
+  });
+
+  it("leaves the silence alone for an echo, which still costs no query", async () => {
+    await processInstagramWebhook({
+      payload: messagingPayload({
+        sender: { id: ACCOUNT },
+        recipient: { id: READER },
+        message: { mid: "echo_mid", text: "Here is your guide", is_echo: true },
+      }),
+      provider: "META",
+    });
+    expect(prismaCallCount()).toBe(0);
   });
 });

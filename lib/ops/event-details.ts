@@ -2,8 +2,8 @@
  * Operational events that Diagnostics shows in the reader's language.
  *
  * Events are stored with an English message. The ones about Meta's request
- * limits and about a lost Instagram connection (A1) also carry what a
- * translation needs in their payload (`kind` and the values), so Diagnostics
+ * limits, about a lost Instagram connection (A1) and about missing messaging
+ * events (A2) also carry what a translation needs in their payload (`kind` and the values), so Diagnostics
  * can say "paused until 14:05" in the reader's language and time zone rather
  * than in the worker's UTC. Only these values leave the server, never the
  * rest of a payload.
@@ -29,6 +29,14 @@ export const MAIL_UNCONFIGURED_EVENT = "mail-unconfigured";
 export const CONNECTION_CATCH_UP_EVENT = "connection-catch-up";
 /** The all-clear e-mail after an incident went out (lib/ops/connection-all-clear.ts). */
 export const CONNECTION_ALL_CLEAR_EVENT = "connection-all-clear";
+/** A2: Instagram passes on no messaging events; a silence opened (lib/instagram/messaging-silence-check.ts). */
+export const MESSAGING_SILENT_EVENT = "messaging-silent";
+/** A2: a button tap, DM, read receipt or reaction arrived again; the silence ended. */
+export const MESSAGING_BACK_EVENT = "messaging-back";
+/** A2: the alert e-mail (or its reminder) about a silence went out (lib/ops/messaging-silence-alert.ts). */
+export const MESSAGING_ALERT_EVENT = "messaging-alert";
+/** A2: the all-clear e-mail after a silence went out. */
+export const MESSAGING_ALL_CLEAR_EVENT = "messaging-all-clear";
 
 export type EventDetail =
   | { kind: typeof META_PAUSE_EVENT; resumeAt: string; account: string | null }
@@ -49,7 +57,16 @@ export type EventDetail =
       queued: number;
       answered: number;
     }
-  | { kind: typeof CONNECTION_ALL_CLEAR_EVENT; account: string | null; recipients: number };
+  | { kind: typeof CONNECTION_ALL_CLEAR_EVENT; account: string | null; recipients: number }
+  | { kind: typeof MESSAGING_SILENT_EVENT; since: string; account: string | null }
+  | { kind: typeof MESSAGING_BACK_EVENT; account: string | null }
+  | {
+      kind: typeof MESSAGING_ALERT_EVENT;
+      account: string | null;
+      recipients: number;
+      reminder: boolean;
+    }
+  | { kind: typeof MESSAGING_ALL_CLEAR_EVENT; account: string | null; recipients: number };
 
 function text(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
@@ -102,6 +119,26 @@ export function eventDetail(payload: unknown): EventDetail | null {
     case CONNECTION_ALL_CLEAR_EVENT:
       return isCount(p.recipients) && p.recipients > 0
         ? { kind: CONNECTION_ALL_CLEAR_EVENT, account, recipients: p.recipients }
+        : null;
+    case MESSAGING_SILENT_EVENT: {
+      const since = text(p.since);
+      if (!since || Number.isNaN(Date.parse(since))) return null;
+      return { kind: MESSAGING_SILENT_EVENT, since, account };
+    }
+    case MESSAGING_BACK_EVENT:
+      return { kind: MESSAGING_BACK_EVENT, account };
+    case MESSAGING_ALERT_EVENT:
+      return isCount(p.recipients) && p.recipients > 0
+        ? {
+            kind: MESSAGING_ALERT_EVENT,
+            account,
+            recipients: p.recipients,
+            reminder: p.reminder === true,
+          }
+        : null;
+    case MESSAGING_ALL_CLEAR_EVENT:
+      return isCount(p.recipients) && p.recipients > 0
+        ? { kind: MESSAGING_ALL_CLEAR_EVENT, account, recipients: p.recipients }
         : null;
     default:
       return null;

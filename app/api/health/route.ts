@@ -86,11 +86,13 @@ async function checkQueue(): Promise<HealthCheck & { counts?: unknown }> {
 }
 
 // A1: Instagram accounts whose connection Meta dropped (the worker's check,
-// lib/instagram/connection-check.ts). Degraded while any incident is open,
-// but it never changes the HTTP status or the top-level status: an external
-// monitor would flap with every incident, and the owners get an e-mail and
-// the dashboard's banner anyway. A monitor that wants to know reads
-// checks.instagram.status.
+// lib/instagram/connection-check.ts), and A2: accounts for which Instagram
+// passes on no button taps, DMs or read receipts
+// (lib/instagram/messaging-silence-check.ts), each with its own reason.
+// Degraded while any incident is open, but it never changes the HTTP status
+// or the top-level status: an external monitor would flap with every
+// incident, and the owners get an e-mail and the dashboard's banner anyway.
+// A monitor that wants to know reads checks.instagram.status.
 interface InstagramConnectionCheck {
   status: "ok" | "degraded" | "error";
   incidents?: {
@@ -100,13 +102,24 @@ interface InstagramConnectionCheck {
     code: string | null;
     alertSentAt: string | null;
   }[];
+  silences?: {
+    account: string;
+    since: string;
+    reason: typeof MESSAGING_SILENCE_REASON;
+    alertSentAt: string | null;
+  }[];
   detail?: string;
 }
 
+/** The reason of an A2 silence in checks.instagram.silences. */
+const MESSAGING_SILENCE_REASON = "messaging-silence";
+
 async function checkInstagramConnections(): Promise<InstagramConnectionCheck> {
   try {
-    const lost = await prisma.instagramAccount.findMany({
-      where: { connectionLostAt: { not: null } },
+    const open = await prisma.instagramAccount.findMany({
+      where: {
+        OR: [{ connectionLostAt: { not: null } }, { messagingSilentSince: { not: null } }],
+      },
       orderBy: { connectionLostAt: "asc" },
       take: 50,
       select: {
@@ -115,22 +128,50 @@ async function checkInstagramConnections(): Promise<InstagramConnectionCheck> {
         connectionLostReason: true,
         connectionAlertSentAt: true,
         connectionAlertCount: true,
+        messagingSilentSince: true,
+        messagingAlertSentAt: true,
+        messagingAlertCount: true,
       },
     });
-    if (lost.length === 0) return { status: "ok" };
+    const incidents = open.flatMap((account) =>
+      account.connectionLostAt
+        ? [
+            {
+              account: account.username,
+              lostAt: account.connectionLostAt.toISOString(),
+              reason: connectionLostKind(account.connectionLostReason),
+              code: connectionLostCode(account.connectionLostReason),
+              // Only an e-mail about this incident: the time stays from earlier ones.
+              alertSentAt:
+                account.connectionAlertCount > 0 && account.connectionAlertSentAt
+                  ? account.connectionAlertSentAt.toISOString()
+                  : null,
+            },
+          ]
+        : []
+    );
+    const silences = open
+      .flatMap((account): NonNullable<InstagramConnectionCheck["silences"]> =>
+        account.messagingSilentSince
+          ? [
+              {
+                account: account.username,
+                since: account.messagingSilentSince.toISOString(),
+                reason: MESSAGING_SILENCE_REASON,
+                alertSentAt:
+                  account.messagingAlertCount > 0 && account.messagingAlertSentAt
+                    ? account.messagingAlertSentAt.toISOString()
+                    : null,
+              },
+            ]
+          : []
+      )
+      .sort((a, b) => a.since.localeCompare(b.since));
+    if (incidents.length === 0 && silences.length === 0) return { status: "ok" };
     return {
       status: "degraded",
-      incidents: lost.map((account) => ({
-        account: account.username,
-        lostAt: account.connectionLostAt!.toISOString(),
-        reason: connectionLostKind(account.connectionLostReason),
-        code: connectionLostCode(account.connectionLostReason),
-        // Only an e-mail about this incident: the time stays from earlier ones.
-        alertSentAt:
-          account.connectionAlertCount > 0 && account.connectionAlertSentAt
-            ? account.connectionAlertSentAt.toISOString()
-            : null,
-      })),
+      ...(incidents.length > 0 ? { incidents } : {}),
+      ...(silences.length > 0 ? { silences } : {}),
     };
   } catch (error) {
     return {

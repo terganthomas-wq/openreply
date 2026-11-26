@@ -108,6 +108,11 @@ describe("Diagnostics and Meta's request limits", () => {
         // A1: its catch-up, running or finished.
         connectionCatchUpFrom: true,
         connectionCatchUpResult: true,
+        // A2: the messaging silence, open or ended.
+        messagingSilentSince: true,
+        messagingAlertSentAt: true,
+        messagingAlertCount: true,
+        messagingSilenceResult: true,
       },
     });
   });
@@ -347,6 +352,142 @@ describe("Diagnostics and a lost Instagram connection", () => {
       { accountId: "a2", username: "running", running: true, last: null },
     ]);
     expect(JSON.stringify(connectionCatchUps)).not.toContain("ig_");
+  });
+});
+
+// A2: accounts whose button taps, DMs and read receipts do not arrive.
+describe("Diagnostics and a messaging silence", () => {
+  it("lists no silence while messaging events arrive", async () => {
+    const data = await diagnostics();
+    expect(data.messagingSilences).toEqual([]);
+    expect(data.endedMessagingSilences).toEqual([]);
+  });
+
+  it("lists each open silence since when and whether the e-mail went out, not one a lost connection covers", async () => {
+    mockPrisma.instagramAccount.findMany.mockResolvedValue([
+      {
+        id: "a1",
+        instagramId: "ig_1",
+        username: "studio",
+        connectionLostAt: null,
+        messagingSilentSince: new Date("2026-11-20T13:15:16.000Z"),
+        messagingAlertSentAt: new Date("2026-11-21T09:30:00.000Z"),
+        messagingAlertCount: 1,
+      },
+      {
+        id: "a2",
+        instagramId: "ig_2",
+        username: "other",
+        connectionLostAt: null,
+        messagingSilentSince: new Date("2026-11-21T01:00:00.000Z"),
+        // An e-mail about an earlier silence: none about this one yet.
+        messagingAlertSentAt: new Date("2026-11-19T09:30:00.000Z"),
+        messagingAlertCount: 0,
+      },
+      {
+        id: "a3",
+        instagramId: "ig_3",
+        username: "lost",
+        connectionLostAt: new Date("2026-11-21T12:00:00.000Z"),
+        connectionLostReason: "missing (Meta 100/33)",
+        connectionAlertCount: 0,
+        messagingSilentSince: new Date("2026-11-21T02:00:00.000Z"),
+        messagingAlertCount: 0,
+      },
+    ]);
+
+    const data = await diagnostics();
+    expect(data.messagingSilences).toEqual([
+      {
+        username: "studio",
+        since: "2026-11-20T13:15:16.000Z",
+        alertSentAt: "2026-11-21T09:30:00.000Z",
+      },
+      { username: "other", since: "2026-11-21T01:00:00.000Z", alertSentAt: null },
+    ]);
+    expect(data.connectionIncidents.map((incident: { username: string }) => incident.username)).toEqual(["lost"]);
+    expect(JSON.stringify(data.messagingSilences)).not.toContain("ig_");
+  });
+
+  it("shows the last silence for 7 days after it ended", async () => {
+    const ended = (endedAt: string) => ({
+      v: 1,
+      since: "2026-11-19T13:15:16.000Z",
+      endedAt,
+      via: "webhook",
+    });
+    mockPrisma.instagramAccount.findMany.mockResolvedValue([
+      { id: "a1", instagramId: "ig_1", username: "studio", messagingSilentSince: null, messagingSilenceResult: ended("2026-11-20T10:30:57.000Z") },
+      { id: "a2", instagramId: "ig_2", username: "old", messagingSilentSince: null, messagingSilenceResult: ended("2026-11-10T10:30:57.000Z") },
+      // Silent again: the open silence is what to show.
+      { id: "a3", instagramId: "ig_3", username: "again", messagingSilentSince: new Date("2026-11-21T01:00:00.000Z"), messagingSilenceResult: ended("2026-11-20T10:30:57.000Z") },
+      { id: "a4", instagramId: "ig_4", username: "unreadable", messagingSilentSince: null, messagingSilenceResult: { v: 2 } },
+    ]);
+
+    expect((await diagnostics()).endedMessagingSilences).toEqual([
+      {
+        accountId: "a1",
+        username: "studio",
+        since: "2026-11-19T13:15:16.000Z",
+        endedAt: "2026-11-20T10:30:57.000Z",
+      },
+    ]);
+  });
+
+  it("hands the page what it needs to name the silence events", async () => {
+    mockPrisma.operationalEvent.findMany.mockResolvedValue([
+      {
+        id: "e1",
+        source: "WORKER",
+        level: "WARNING",
+        message: "Instagram passes on no button taps, DMs or read receipts for @studio since …",
+        createdAt: new Date(NOW),
+        resolvedAt: null,
+        payload: {
+          kind: "messaging-silent",
+          instagramAccountId: "ig_1",
+          account: "studio",
+          since: "2026-11-20T13:15:16.000Z",
+          firstDmAt: "2026-11-20T20:49:23.000Z",
+          people: 3,
+        },
+      },
+      {
+        id: "e2",
+        source: "SYSTEM",
+        level: "INFO",
+        message: "Instagram passes on button taps, DMs and read receipts for @studio again …",
+        createdAt: new Date(NOW),
+        resolvedAt: null,
+        payload: { kind: "messaging-back", account: "studio", since: "2026-11-20T13:15:16.000Z", via: "webhook" },
+      },
+      {
+        id: "e3",
+        source: "WORKER",
+        level: "INFO",
+        message: "Messaging silence alert e-mail for @studio sent to 2 people (resend)",
+        createdAt: new Date(NOW),
+        resolvedAt: null,
+        payload: { kind: "messaging-alert", account: "studio", reminder: false, recipients: 2 },
+      },
+      {
+        id: "e4",
+        source: "WORKER",
+        level: "INFO",
+        message: "Messaging all-clear e-mail for @studio sent to 2 people (resend)",
+        createdAt: new Date(NOW),
+        resolvedAt: null,
+        payload: { kind: "messaging-all-clear", account: "studio", recipients: 2 },
+      },
+    ]);
+    const { operationalEvents } = await diagnostics();
+    expect(operationalEvents.map((event: { detail: unknown }) => event.detail)).toEqual([
+      { kind: "messaging-silent", account: "studio", since: "2026-11-20T13:15:16.000Z" },
+      { kind: "messaging-back", account: "studio" },
+      { kind: "messaging-alert", account: "studio", recipients: 2, reminder: false },
+      { kind: "messaging-all-clear", account: "studio", recipients: 2 },
+    ]);
+    expect(JSON.stringify(operationalEvents)).not.toContain("ig_1");
   });
 });
 

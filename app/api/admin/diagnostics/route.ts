@@ -9,6 +9,10 @@ import {
   connectionLostKind,
 } from "@/lib/instagram/connection-incident";
 import { connectionCatchUpReports } from "@/lib/instagram/catch-up-report";
+import {
+  messagingSilenceOf,
+  messagingSilenceReports,
+} from "@/lib/instagram/messaging-silence-incident";
 import { getWorkerAlerts, getWorkerHealth } from "@/lib/ops/worker-health";
 import { canManageWorkspace, getCurrentWorkspaceContext } from "@/lib/workspace-access";
 
@@ -120,6 +124,10 @@ export async function GET() {
         connectionAlertCount: true,
         connectionCatchUpFrom: true,
         connectionCatchUpResult: true,
+        messagingSilentSince: true,
+        messagingAlertSentAt: true,
+        messagingAlertCount: true,
+        messagingSilenceResult: true,
       },
     }),
     prisma.serviceKey.findMany({
@@ -165,6 +173,27 @@ export async function GET() {
   // how many comments it queued, and the comments the owner had answered by
   // hand, which got no automatic DM.
   const connectionCatchUps = connectionCatchUpReports(accounts, now);
+  // A2: accounts whose button taps, DMs and read receipts no longer arrive
+  // (lib/instagram/messaging-silence-check.ts), since when, and whether the
+  // owners got an e-mail about it; and the last silence of each account for
+  // 7 days after it ended.
+  const messagingSilences = accounts.flatMap((account) => {
+    const silence = messagingSilenceOf(account);
+    return silence
+      ? [
+          {
+            username: silence.username,
+            since: silence.since,
+            // Only an e-mail about this silence: the time stays from earlier ones.
+            alertSentAt:
+              account.messagingAlertCount > 0 && account.messagingAlertSentAt
+                ? account.messagingAlertSentAt.toISOString()
+                : null,
+          },
+        ]
+      : [];
+  });
+  const endedMessagingSilences = messagingSilenceReports(accounts, now);
   // The keys by the same rule as the API & MCP page; when they were last
   // used stays on the server.
   const keyWarnings = expiringKeys.flatMap((key) => {
@@ -200,6 +229,8 @@ export async function GET() {
       accountPauses,
       connectionIncidents,
       connectionCatchUps,
+      messagingSilences,
+      endedMessagingSilences,
       keyWarnings,
       // Only owners and admins create and revoke keys (the keys route
       // refuses everyone else), and only they can reconnect an account: a

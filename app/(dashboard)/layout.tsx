@@ -10,6 +10,10 @@ import {
   connectionIncidentOf,
   type ConnectionIncident,
 } from "@/lib/instagram/connection-incident";
+import {
+  messagingSilenceOf,
+  type MessagingSilenceIncident,
+} from "@/lib/instagram/messaging-silence-incident";
 
 export async function generateMetadata() {
   const { t } = await getI18n();
@@ -36,12 +40,14 @@ export default async function DashboardLayout({
     prisma.instagramAccount.findMany({
       where: { workspaceId: workspace.id },
       orderBy: { connectedAt: "desc" },
-      // The incident fields feed the banner about a lost connection (A1).
+      // The incident fields feed the banners about a lost connection (A1)
+      // and about missing messaging events (A2).
       select: {
         id: true,
         username: true,
         connectionLostAt: true,
         connectionLostReason: true,
+        messagingSilentSince: true,
       },
     }),
     // The menu leaves out what only owners and admins can use. Without a
@@ -61,6 +67,11 @@ export default async function DashboardLayout({
   const connectionIncidents = accounts
     .map(connectionIncidentOf)
     .filter((incident): incident is ConnectionIncident => incident !== null);
+  // Accounts whose button taps, DMs and read receipts no longer arrive (A2),
+  // unless their connection is lost: that banner already covers them.
+  const messagingSilences = accounts
+    .map(messagingSilenceOf)
+    .filter((silence): silence is MessagingSilenceIncident => silence !== null);
 
   return (
     <I18nProvider locale={locale}>
@@ -70,6 +81,7 @@ export default async function DashboardLayout({
         instagramAccountCount={accounts.length}
         canManage={canManageWorkspace(membership?.role ?? "OWNER")}
         connectionIncidents={connectionIncidents}
+        messagingSilences={messagingSilences}
       >
         {children}
       </DashboardShell>
