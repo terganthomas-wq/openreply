@@ -112,7 +112,9 @@ vi.mock("bullmq", () => ({
   },
 }));
 
+import { LOST_TAP_SPACING_MS } from "../lib/instagram/lost-tap-state";
 import { RateLimitError } from "../lib/meta/client";
+import { pausedRunAt } from "../lib/queue/account-pause";
 import { createDMWorker } from "../lib/queue/dm-worker";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -413,6 +415,96 @@ describe.skipIf(!databaseUrl)("taps, DM replies and offer messages and Meta's re
     await run(tapJob("person_waiting", "unused", { fallback: true, mid: undefined }, "read_fallback_1"));
 
     expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+  });
+
+  // A2: a tap the search after a messaging silence found and continues
+  // (lib/instagram/lost-tap-search.ts), with the real stand-back of its job.
+  describe("a lost tap", () => {
+    const lostTap = (userId: string, mid: string, tappedAt: number, extra: Record<string, unknown> = {}) =>
+      tapJob(userId, mid, { lostTap: true, tappedAt, ...extra }, `losttap_${mid}`);
+
+    it("whose copy for the pause could not be queued is answered by its retry, once", async () => {
+      await pauseUntil(NOW + 20 * MINUTE);
+      mockQueueAdd.mockRejectedValueOnce(new Error("OOM command not allowed when used memory > 'maxmemory'"));
+      const job = lostTap("person_lost", "m_lost", NOW - 5 * HOUR);
+      await expect(run(job)).rejects.toThrow("OOM");
+      // No copy waits, and the link's row does not say one does.
+      expect(await dmLogRow("reveal:person_lost")).toMatchObject({
+        status: "FAILED",
+        errorMessage: expect.stringMatching(
+          /^Instagram request limit: the try after the account's pause could not be queued \(.*OOM/
+        ),
+      });
+
+      // BullMQ's retry after the pause: the link goes out, once.
+      await (state.redis as FakeRedis).del("meta:pause:ig_conv");
+      vi.setSystemTime(NOW + 21 * MINUTE);
+      await run({ ...job, attemptsMade: 1 });
+      await run({ ...job, attemptsMade: 2 });
+      expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+      expect(await state.db.postbackDelivery.count()).toBe(1);
+      expect(await dmLogRow("reveal:person_lost")).toMatchObject({ status: "SENT", errorMessage: null });
+    });
+
+    it("does not stand back on a link that waits for a pause without a copy, as a first attempt that died leaves it", async () => {
+      const job = lostTap("person_died", "m_died", NOW - 5 * HOUR);
+      // The worker died between writing the wait and queueing the copy.
+      await state.db.dmLog.create({
+        data: {
+          workspaceId: "workspace",
+          automationId: "automation",
+          instagramAccountId: "account",
+          commenterId: "person_died",
+          commentText: "(button tap)",
+          commentId: "reveal:person_died",
+          status: "PENDING",
+          errorMessage: "Instagram request limit; next try at 13:20 UTC",
+        },
+      });
+      vi.setSystemTime(NOW + 21 * MINUTE);
+      await run({ ...job, attemptsMade: 1 });
+      expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+      expect(await dmLogRow("reveal:person_died")).toMatchObject({ status: "SENT" });
+    });
+
+    it("keeps the lost taps' pace when their copies wait for a pause, and a plain tap does not", async () => {
+      const resumeAt = NOW + 20 * MINUTE;
+      await pauseUntil(resumeAt);
+      // Six taps the search planned one LOST_TAP_SPACING_MS apart, each
+      // meeting the pause when its slot comes.
+      const runAt: number[] = [];
+      for (let k = 0; k < 6; k += 1) {
+        const at = NOW + k * LOST_TAP_SPACING_MS;
+        vi.setSystemTime(at);
+        await run(lostTap(`person_pace_${k}`, `m_pace_${k}`, NOW - HOUR));
+        const copy = pauseCopies().at(-1)!;
+        expect(copy.data).toMatchObject({ lostTap: true, pauseRequeue: 1, tappedAt: NOW - HOUR });
+        runAt.push(at + copy.opts.delay);
+      }
+      expect(runAt[0]).toBeGreaterThanOrEqual(resumeAt);
+      for (let k = 1; k < runAt.length; k += 1) {
+        expect(runAt[k] - runAt[k - 1], `copy ${k}`).toBe(LOST_TAP_SPACING_MS);
+      }
+      // An ordinary tap's copy runs in the minute after the pause, as before.
+      vi.setSystemTime(NOW);
+      await run(tapJob("person_plain", "m_plain"));
+      const plain = pauseCopies().at(-1)!;
+      expect(NOW + plain.opts.delay).toBe(pausedRunAt(resumeAt, plain.opts.jobId));
+      expect(mockSendDirectMessage).not.toHaveBeenCalled();
+    });
+
+    it("runs right after the pause when the pace's next slot would come too late for its window", async () => {
+      const resumeAt = NOW + 20 * MINUTE;
+      await pauseUntil(resumeAt);
+      // The pace is booked for two more hours, and this tap's 24 hours end
+      // ten minutes after the pause.
+      await (state.redis as FakeRedis).set("pace:taps:ig_conv", String(resumeAt + 2 * HOUR), "PX", 3 * HOUR);
+      const tappedAt = resumeAt + 10 * MINUTE - 24 * HOUR;
+      await run(lostTap("person_late_window", "m_late_window", tappedAt));
+      const copy = pauseCopies().at(-1)!;
+      expect(NOW + copy.opts.delay).toBe(pausedRunAt(resumeAt, copy.opts.jobId));
+      expect(await dmLogRow("reveal:person_late_window")).toMatchObject({ status: "PENDING" });
+    });
   });
 
   it("gives a refused DM reply its claim back and answers the DM once", async () => {

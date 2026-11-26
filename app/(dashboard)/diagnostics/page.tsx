@@ -171,7 +171,7 @@ function eventMessage(
           });
     case "mail-unconfigured":
       return t(
-        "Alert e-mails about a lost Instagram connection cannot go out: the sending service has no e-mail settings (RESEND_API_KEY and EMAIL_FROM)."
+        "Warning e-mails about Instagram problems cannot go out: the sending service has no e-mail settings (RESEND_API_KEY and EMAIL_FROM)."
       );
     case "connection-catch-up":
       return detail.account

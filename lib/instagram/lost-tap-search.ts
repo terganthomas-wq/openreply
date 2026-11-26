@@ -9,22 +9,30 @@
  *
  * - The people: everyone who got an opening DM in the silence (a SENT comment
  *   row of a campaign whose DM has a button, sent after the silence's start
- *   and at the latest at its end) of a campaign that still answers taps
- *   (active, or paused but sent to this person by hand: M1), and who has no
- *   tap or link on record for that campaign since (lib/instagram/lost-tap-records.ts):
- *   whoever tapped again after the silence was answered the ordinary way. The
- *   newest opening DMs first, at most LOST_TAP_MAX_PEOPLE (50) people; the
- *   rest count as not checked.
+ *   and at the latest at its end), or in the LOST_TAP_LOOKBACK_MS (24 hours)
+ *   before it, of a campaign that still answers taps (active, or paused but
+ *   sent to this person by hand: M1), and who has no tap or link on record
+ *   for that campaign since (lib/instagram/lost-tap-records.ts): whoever
+ *   tapped again after the silence was answered the ordinary way. The newest
+ *   opening DMs first, at most LOST_TAP_MAX_PEOPLE (50) people; the rest of
+ *   the silence's count as not checked. Someone whose DM came before the
+ *   silence only counts with a lost tap: the all-clear's numbers are about
+ *   the people of the silence.
  * - Their conversations: the list of the account's conversations, newest
  *   first, a page at a time, each matched by participant id, until every
  *   person is found or the list reaches back before the oldest opening DM
- *   still wanted (a tap would have moved the conversation up), at most
- *   LOST_TAP_MAX_LIST_PAGES pages. A conversation that did not change after
- *   the person's opening DM holds no tap and is not read. The others are read
- *   once each (the 20 newest messages).
+ *   still wanted, or the silence's start for a DM from before it (a tap
+ *   would have moved the conversation up), at most LOST_TAP_MAX_LIST_PAGES
+ *   pages. A conversation that did not change after that holds no lost tap
+ *   and is not read. The others are read once each (the 20 newest messages).
  * - A lost tap is a message from the person whose text is the title of one
  *   of the campaign's buttons (the opening DM's, or a follow prompt's), newer
- *   than their opening DM of it (lib/instagram/lost-tap-state.ts). It is
+ *   than their opening DM of it and than the silence's start
+ *   (lib/instagram/lost-tap-state.ts); taps on buttons that say the same go
+ *   to distinct campaigns, and a campaign one of them was only maybe for is
+ *   listed ("unclear"). So is a tap after which someone wrote to the person
+ *   (by hand, maybe with the link) in a message that none of OpenReply's own
+ *   recorded DMs explains ("replied"). Any other lost tap is
  *   continued with exactly the postback job the tap would have produced: its
  *   payload rebuilt, tappedAt the message's time, mid the message's id, a
  *   deterministic job id, the oldest tap first, the first right away and
@@ -67,22 +75,27 @@ import {
 import { classifyConnectionError } from "@/lib/instagram/connection-check";
 import { createInstagramContext, type InstagramContext } from "@/lib/instagram/context";
 import { isMetaThrottle, throttlePauseMs } from "@/lib/instagram/delivery-errors";
-import { pairKey, recordedPairs } from "@/lib/instagram/lost-tap-records";
+import { ownSendsTo, pairKey, recordedPairs } from "@/lib/instagram/lost-tap-records";
 import {
   findLostTaps,
   LOST_TAP_FRESH_MS,
   LOST_TAP_LIST_PAGE_SIZE,
+  LOST_TAP_LOOKBACK_MS,
   LOST_TAP_MAX_LIST_PAGES,
   LOST_TAP_MAX_PEOPLE,
   LOST_TAP_READ_GAP_MS,
   LOST_TAP_SPACING_MS,
   lostTapSearchJobId,
+  mergeLostTapResults,
   readLostTapProgress,
   tapWindowOpen,
+  unexplainedReplies,
   type FoundTap,
+  type ListedReason,
   type LostTapPerson,
   type LostTapProgress,
   type LostTapResult,
+  type OwnSends,
   type TapCampaign,
 } from "@/lib/instagram/lost-tap-state";
 import {
@@ -445,9 +458,14 @@ async function search(run: Run): Promise<SearchStep> {
  * comment rows (not "reveal:" or "dm:" rows) of campaigns whose DM has a
  * button, sent after `from` and at the latest at `until`, of a campaign that
  * still answers taps (active, or paused but sent to this person by hand),
- * each with the first opening DM of each campaign. Whoever has a tap or a
- * link on record since for every one of them is left out (answered), and
- * the cap leaves out the rest.
+ * each with the first opening DM of each campaign. Then, the same way, the
+ * people who got theirs in the LOST_TAP_LOOKBACK_MS before the silence: a
+ * tap of theirs in it got lost as well. Whoever has a tap or a link on
+ * record since for every one of them is left out (answered, if they got one
+ * in the silence: someone who was answered before it simply had their flow),
+ * and the cap leaves out the rest. Only the people of the silence itself are
+ * counted (total, answered, over the cap, later no tap and not checked): the
+ * all-clear says what happened "in that time".
  */
 async function peopleOf(run: Run): Promise<{
   people: LostTapPerson[];
@@ -463,7 +481,7 @@ async function peopleOf(run: Run): Promise<{
       instagramAccountId: account.id,
       automationId: { in: ids },
       status: "SENT",
-      dmSentAt: { gt: run.from, lte: run.until },
+      dmSentAt: { gt: new Date(run.from.getTime() - LOST_TAP_LOOKBACK_MS), lte: run.until },
       NOT: [{ commentId: { startsWith: "reveal:" } }, { commentId: { startsWith: "dm:" } }],
     },
     orderBy: { dmSentAt: "desc" },
@@ -479,6 +497,7 @@ async function peopleOf(run: Run): Promise<{
   const sorted = rows
     .flatMap((row) => (row.dmSentAt ? [{ ...row, at: row.dmSentAt.getTime() }] : []))
     .sort((a, b) => b.at - a.at);
+  const fromMs = run.from.getTime();
 
   const byPerson = new Map<
     string,
@@ -498,8 +517,14 @@ async function peopleOf(run: Run): Promise<{
       byPerson.set(row.commenterId, person);
     }
     person.username ??= row.commenterName ?? null;
-    // Newest first: the last one written is the first of the silence.
-    person.campaigns.set(row.automationId, row.at);
+    // Newest first: the last one written is the first of the silence, and
+    // one from the hours before it only for a campaign without one in it.
+    // (A tap or link on record after the first DM of the silence settles
+    // the campaign; one between an earlier DM and the silence does not.)
+    const current = person.campaigns.get(row.automationId);
+    if (current === undefined || current <= fromMs || row.at > fromMs) {
+      person.campaigns.set(row.automationId, row.at);
+    }
   }
 
   const pairs = [...byPerson.values()].flatMap((person) =>
@@ -511,15 +536,18 @@ async function peopleOf(run: Run): Promise<{
   );
   const { recorded } = await recordedPairs(account, pairs);
   const people: LostTapPerson[] = [];
+  let total = 0;
   let answered = 0;
   for (const person of byPerson.values()) {
+    const ofSilence = [...person.campaigns.values()].some((at) => at > fromMs);
+    if (ofSilence) total += 1;
     const campaigns = [...person.campaigns].filter(
       ([automationId]) => !recorded.has(pairKey(person.userId, automationId))
     );
-    if (campaigns.length === 0) {
-      answered += 1;
-      continue;
-    }
+    // Answered for every opening DM of the silence: counted here, and only a
+    // campaign of the hours before it may still be looked at.
+    if (ofSilence && !campaigns.some(([, at]) => at > fromMs)) answered += 1;
+    if (campaigns.length === 0) continue;
     people.push({
       userId: person.userId,
       username: person.username,
@@ -532,22 +560,50 @@ async function peopleOf(run: Run): Promise<{
   const capped = people.slice(0, LOST_TAP_MAX_PEOPLE);
   return {
     people: capped,
-    total: byPerson.size,
+    total,
     answered,
-    overCap: people.length - capped.length,
+    overCap: people.slice(LOST_TAP_MAX_PEOPLE).filter((person) => inSilence(run, person)).length,
   };
 }
 
-/** The first opening DM of the silence among a person's campaigns (epoch ms). */
+/** The first opening DM among a person's campaigns that are looked at (epoch ms). */
 function firstOpeningDm(person: LostTapPerson): number {
   return Math.min(...person.campaigns.map((campaign) => Date.parse(campaign.openingDmAt)));
+}
+
+/**
+ * Whether the person got an opening DM in the silence itself, not only in
+ * the hours before it: only such people count in the result's numbers.
+ */
+function inSilence(run: Run, person: LostTapPerson): boolean {
+  const from = run.from.getTime();
+  return person.campaigns.some((campaign) => Date.parse(campaign.openingDmAt) > from);
+}
+
+/**
+ * The earliest a lost tap of the person can be: after their first opening
+ * DM, and in the silence (one before it arrived). Their conversation holds
+ * one only if it changed after this.
+ */
+function tapThreshold(run: Run, person: LostTapPerson): number {
+  return Math.max(firstOpeningDm(person), run.from.getTime());
+}
+
+/** The person was looked at and had no lost tap. */
+function countNoTap(run: Run, person: LostTapPerson): void {
+  if (inSilence(run, person)) run.progress.noTap += 1;
+}
+
+/** The person could not be looked at. */
+function countNotChecked(run: Run, person: LostTapPerson): void {
+  if (inSilence(run, person)) run.progress.notChecked += 1;
 }
 
 function notCheckRest(run: Run): void {
   for (const person of run.progress.people ?? []) {
     if (person.done) continue;
     person.done = true;
-    run.progress.notChecked += 1;
+    countNotChecked(run, person);
   }
 }
 
@@ -647,7 +703,7 @@ async function findConversations(
       // Not among the conversations the search reads: not checked.
       for (const person of wanted.values()) {
         person.done = true;
-        progress.notChecked += 1;
+        countNotChecked(run, person);
       }
       list.done = true;
       break;
@@ -710,13 +766,16 @@ async function findConversations(
     // An entry read without its participants may be the conversation of
     // someone still wanted: they cannot be told to have no tap.
     const oldestWanted =
-      wanted.size > 0 ? Math.min(...[...wanted.values()].map(firstOpeningDm)) : Infinity;
+      wanted.size > 0
+        ? Math.min(...[...wanted.values()].map((person) => tapThreshold(run, person)))
+        : Infinity;
     if (blind && page.data.some((conversation) => (timeOf(conversation.updated_time) ?? Infinity) > oldestWanted)) {
       list.blind = true;
     }
     // Newest first: once a page reaches back before the oldest opening DM
-    // still wanted, no later page holds a conversation that changed after
-    // it, as one with a tap would have.
+    // still wanted (or the silence's start, for a DM from before it), no
+    // later page holds a conversation that changed after it, as one with a
+    // lost tap would have.
     const times = page.data.flatMap((conversation) => {
       const at = timeOf(conversation.updated_time);
       return at === null ? [] : [at];
@@ -727,8 +786,8 @@ async function findConversations(
       // their opening DM: no tap.
       for (const person of wanted.values()) {
         person.done = true;
-        if (list.blind) progress.notChecked += 1;
-        else progress.noTap += 1;
+        if (list.blind) countNotChecked(run, person);
+        else countNoTap(run, person);
       }
       list.done = true;
     } else {
@@ -770,7 +829,7 @@ async function readConversations(run: Run, context: MetaContext): Promise<Search
   const settleRefused = () => {
     for (const person of refused) {
       person.done = true;
-      progress.notChecked += 1;
+      countNotChecked(run, person);
     }
     refused.length = 0;
   };
@@ -778,14 +837,15 @@ async function readConversations(run: Run, context: MetaContext): Promise<Search
     if (person.done) continue;
     if (!person.conversationId) {
       person.done = true;
-      progress.noTap += 1;
+      countNoTap(run, person);
       continue;
     }
     const updated = timeOf(person.conversationUpdatedAt);
-    if (updated !== null && updated <= firstOpeningDm(person)) {
-      // Nothing came after the opening DM: no tap, and no read needed.
+    if (updated !== null && updated <= tapThreshold(run, person)) {
+      // Nothing came after the opening DM (or in the silence, for a DM from
+      // before it): no lost tap, and no read needed.
       person.done = true;
-      progress.noTap += 1;
+      countNoTap(run, person);
       continue;
     }
 
@@ -815,14 +875,31 @@ async function readConversations(run: Run, context: MetaContext): Promise<Search
       );
       settleRefused();
       person.done = true;
-      progress.notChecked += 1;
+      countNotChecked(run, person);
       if (!(await saveProgress(run, { release: false }))) return { kind: "superseded" };
       continue;
     }
     settleRefused();
 
-    const taps = findLostTaps(person.userId, tapCampaignsOf(run, person), messages);
+    const taps = findLostTaps(person.userId, tapCampaignsOf(run, person), messages, {
+      after: run.from.getTime(),
+    });
+    // Someone wrote to the person after the tap, by hand in Instagram or in
+    // OpenReply's inbox, maybe with the link: the tap is listed, never
+    // continued. OpenReply's own DMs that the database knows of are no such
+    // message (another campaign's opening DM in the silence, say).
+    let own: OwnSends[] | null = null;
     for (const tap of taps) {
+      let replied = unexplainedReplies(person.userId, tap.tappedAt, messages, []).length > 0;
+      if (replied) {
+        own ??= await ownSendsTo(
+          run.account,
+          person.userId,
+          new Date(Math.min(...taps.map((item) => item.tappedAt)))
+        );
+        replied = unexplainedReplies(person.userId, tap.tappedAt, messages, own).length > 0;
+      }
+      const listOnly = replied ? "replied" : tap.unclear ? "unclear" : undefined;
       const entry = person.campaigns.find((campaign) => campaign.automationId === tap.automationId);
       progress.found.push({
         userId: person.userId,
@@ -833,9 +910,10 @@ async function readConversations(run: Run, context: MetaContext): Promise<Search
         messageId: tap.messageId,
         tappedAt: iso(tap.tappedAt),
         payload: tap.payload,
+        ...(listOnly ? { listOnly } : {}),
       });
     }
-    if (taps.length === 0) progress.noTap += 1;
+    if (taps.length === 0) countNoTap(run, person);
     person.done = true;
     if (!(await saveProgress(run, { release: false }))) return { kind: "superseded" };
   }
@@ -863,7 +941,7 @@ async function answersTaps(campaign: Campaign | undefined, userId: string): Prom
   return manual !== null;
 }
 
-function listTap(run: Run, tap: FoundTap, reason: "window" | "campaign"): void {
+function listTap(run: Run, tap: FoundTap, reason: ListedReason): void {
   const { listed } = run.progress;
   const entry = {
     username: tap.username,
@@ -889,7 +967,9 @@ function listTap(run: Run, tap: FoundTap, reason: "window" | "campaign"): void {
  * each as the postback job its tap would have produced, in the next slot of
  * the account's lost-tap pace, while Instagram's 24 hours from the tap leave
  * an hour; the others are listed. A tap the person made again in the
- * meantime, which arrived, was answered the ordinary way.
+ * meantime, which arrived, was answered the ordinary way. A tap after which
+ * someone wrote to the person, and a campaign a tap was only maybe for, are
+ * listed (FoundTap.listOnly), never continued.
  */
 async function continueTaps(run: Run): Promise<void> {
   const { account, progress } = run;
@@ -907,12 +987,23 @@ async function continueTaps(run: Run): Promise<void> {
   );
   for (const tap of found) {
     const jobId = lostTapJobId(account.instagramId, tap.userId, tap.messageId);
-    if (progress.continued.some((item) => item.jobId === jobId)) {
+    // Continued already (by a run before one more silence was merged into
+    // this search): that stands, whatever this run read.
+    const continued = tap.listOnly
+      ? progress.continued.some(
+          (item) => item.userId === tap.userId && item.automationId === tap.automationId
+        )
+      : progress.continued.some((item) => item.jobId === jobId);
+    if (continued) {
       progress.found = progress.found.filter((item) => item !== tap);
       continue;
     }
     if (recorded.has(pairKey(tap.userId, tap.automationId))) {
-      progress.answered += 1;
+      // Answered the ordinary way after the silence; a campaign the tap was
+      // only maybe for is no person more.
+      if (tap.listOnly !== "unclear") progress.answered += 1;
+    } else if (tap.listOnly) {
+      listTap(run, tap, tap.listOnly);
     } else if (!(await answersTaps(run.campaigns.get(tap.automationId), tap.userId))) {
       listTap(run, tap, "campaign");
     } else {
@@ -1050,7 +1141,7 @@ async function finish(run: Run, options: LostTapSearchOptions): Promise<LostTapO
     gaveUp: progress.gaveUp,
     complete: progress.notChecked === 0 && !progress.gaveUp,
   };
-  const silence: MessagingSilenceResult = readMessagingSilenceResult(
+  const { carried, ...silence }: MessagingSilenceResult = readMessagingSilenceResult(
     account.messagingSilenceResult
   ) ?? {
     v: 1,
@@ -1058,6 +1149,9 @@ async function finish(run: Run, options: LostTapSearchOptions): Promise<LostTapO
     endedAt: run.until.toISOString(),
     via: "check",
   };
+  // The result of an earlier silence's search whose all-clear never went out
+  // is reported with this one (lib/instagram/messaging-silence-state.ts).
+  const reported: LostTapResult = carried ? mergeLostTapResults(carried, taps) : taps;
   const { count } = await prisma.instagramAccount.updateMany({
     where: {
       id: account.id,
@@ -1070,7 +1164,7 @@ async function finish(run: Run, options: LostTapSearchOptions): Promise<LostTapO
       messagingTapSearchUntil: null,
       messagingTapSearchClaimedAt: null,
       messagingTapSearchProgress: Prisma.DbNull,
-      messagingSilenceResult: asJson({ ...silence, taps }),
+      messagingSilenceResult: asJson({ ...silence, taps: reported }),
       messagingAllClearDueAt: finishedAt,
     },
   });
@@ -1081,7 +1175,7 @@ async function finish(run: Run, options: LostTapSearchOptions): Promise<LostTapO
     return await supersede(run);
   }
 
-  const message = `Search for lost taps after the messaging silence of @${account.username}: ${taps.continued} taps continued (one every ${LOST_TAP_SPACING_MS / 1000} s), ${taps.listed.length} too late or for a paused campaign, ${taps.noTap} people without a tap, ${taps.answered} answered after the silence${taps.notChecked > 0 ? `, ${taps.notChecked} not checked` : ""}${taps.gaveUp ? ", stopped after 24 hours" : ""}; ${taps.reads} conversation reads`;
+  const message = `Search for lost taps after the messaging silence of @${account.username}: ${taps.continued} taps continued (one every ${LOST_TAP_SPACING_MS / 1000} s), ${taps.listed.length} not continued (too late, campaign paused, written to after the tap or the tap unclear), ${taps.noTap} people without a tap, ${taps.answered} answered after the silence${taps.notChecked > 0 ? `, ${taps.notChecked} not checked` : ""}${taps.gaveUp ? ", stopped after 24 hours" : ""}; ${taps.reads} conversation reads`;
   console.log(`[Lost taps] ${message}`);
   await logWorkerEvent({
     workspaceId: account.workspaceId,

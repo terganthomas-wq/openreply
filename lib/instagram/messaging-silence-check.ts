@@ -19,7 +19,10 @@
  * next one decides), while it is paused for a Meta limit (R1), or while it
  * has no active campaign whose DM has a button: such a check changes
  * nothing. Two silent checks in a row, at least one sweep interval apart (A1's
- * gap, connectionStrikeGapMs), open an incident: messagingSilentSince is the
+ * gap, connectionStrikeGapMs), open an incident; the second is judged on the
+ * first one's opening DMs with every inbound event up to now
+ * (silenceJudgedAt), so only an event that arrived meanwhile undoes the first.
+ * messagingSilentSince is the
  * time of the last inbound messaging event before it (or the first unanswered
  * opening DM when none arrived in the last 7 days). The owners and admins get
  * an e-mail (lib/ops/messaging-silence-alert.ts), and the dashboard,
@@ -43,6 +46,7 @@ import {
   messagingSilenceThresholds,
   nextSilenceStep,
   silenceDmBounds,
+  silenceJudgedAt,
   type MessagingSilenceThresholds,
   type OpeningDm,
 } from "@/lib/instagram/messaging-silence-signal";
@@ -243,11 +247,18 @@ export async function checkAccountMessagingSilence(
   const campaigns = await openingDmCampaigns(account.id);
   if (!campaigns.active) return "no-campaign";
 
-  const bounds = silenceDmBounds(now, thresholds, account.connectionRecoveredAt);
-  const dms = await openingDmsFor(account.id, campaigns.ids, bounds);
+  // While a first silent check waits for its second, the second is judged
+  // on its evidence: the opening DMs as they counted then, with every
+  // inbound event up to now. DMs that grew too old meanwhile undo nothing.
+  const judged = silenceJudgedAt(account.messagingSilenceCheckAt, now, account.connectionRecoveredAt);
+  const bounds = silenceDmBounds(judged.at, thresholds, account.connectionRecoveredAt, now);
+  const dms = await openingDmsFor(account.id, campaigns.ids, {
+    after: bounds.spreadAfter,
+    until: bounds.until,
+  });
   // Only with enough people is the newest inbound event worth a read.
   let lastInboundAt: Date | null = null;
-  if (new Set(dms.map((dm) => dm.recipientId)).size >= thresholds.minPeople) {
+  if (judgeMessagingSilence({ dms, lastInboundAt: null, bounds, thresholds }).silent) {
     const latest = await latestInboundMessagingAt(account.instagramId, {
       after: new Date(now - INBOUND_LOOKBACK_MS),
       until: new Date(now),
@@ -258,21 +269,21 @@ export async function checkAccountMessagingSilence(
     }
     lastInboundAt = latest.at;
   }
-  const judgment = judgeMessagingSilence({
-    dms,
-    lastInboundAt,
-    bounds,
-    minPeople: thresholds.minPeople,
-  });
-  const step = nextSilenceStep(account, judgment, now, strikeGapMs);
+  const judgment = judgeMessagingSilence({ dms, lastInboundAt, bounds, thresholds });
+  const step = nextSilenceStep(account, judgment, now, strikeGapMs, judged.strike);
 
   switch (step.kind) {
     case "none":
       return judgment.silent ? "strike" : "quiet";
 
     case "strike":
+      // In place of a first check that no longer counts, if one is stored.
       await prisma.instagramAccount.updateMany({
-        where: { id: account.id, messagingSilentSince: null, messagingSilenceCheckAt: null },
+        where: {
+          id: account.id,
+          messagingSilentSince: null,
+          messagingSilenceCheckAt: account.messagingSilenceCheckAt,
+        },
         data: { messagingSilenceCheckAt: new Date(now) },
       });
       console.warn(
@@ -322,6 +333,7 @@ export async function checkAccountMessagingSilence(
           since: since.toISOString(),
           firstDmAt: judgment.firstDmAt.toISOString(),
           people: judgment.people,
+          rule: judgment.rule,
         },
       });
       await sendMessagingSilenceAlert(

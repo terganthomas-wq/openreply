@@ -13,7 +13,9 @@
  * stand-in, the queue takes each job id once as BullMQ does, and the mail
  * transport records what it is given. Skipped without TEST_DATABASE_URL; each
  * run builds its own throwaway schema from prisma/migrations and drops it at
- * the end.
+ * the end. Also OpenReply's own DMs to a person as the database records them
+ * (DmLog rows, the person's offers by their contact), which tell a reply by
+ * hand after a lost tap from OpenReply's own messages.
  */
 import { randomBytes } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
@@ -53,7 +55,13 @@ vi.mock("@/lib/queue/client", () => ({
 }));
 vi.mock("@/lib/meta/oauth", () => ({ decryptToken: () => "local-test-token" }));
 
-import { lostTapAnswered, recordedPairs, recordedTapsSince, pairKey } from "../lib/instagram/lost-tap-records";
+import {
+  lostTapAnswered,
+  ownSendsTo,
+  recordedPairs,
+  recordedTapsSince,
+  pairKey,
+} from "../lib/instagram/lost-tap-records";
 import { resetLostTapSearches, runLostTapSearch } from "../lib/instagram/lost-tap-search";
 import { endMessagingSilence } from "../lib/instagram/messaging-silence-state";
 import { resetLatestMetaUsage } from "../lib/meta/usage";
@@ -424,16 +432,104 @@ describe.skipIf(!databaseUrl)("the search for lost taps on Postgres", () => {
       messagingTapSearchUntil: second,
     });
     expect(await run(Date.parse("2026-11-27T09:01:00.000Z"))).toBe("done");
-    // Both silences' people: p1's tap is too old by now, p2's goes on.
-    expect((await account()).messagingSilenceResult).toMatchObject({
+    // Both silences' people: p1's tap is too old by now, p2's goes on. The
+    // result names the earlier silence too, which the search covered.
+    expect((await account()).messagingSilenceResult).toEqual({
+      v: 1,
       since: "2026-11-26T20:00:00.000Z",
       endedAt: second.toISOString(),
-      taps: {
+      via: "check",
+      earlier: [{ since: SINCE.toISOString(), endedAt: ENDED.toISOString() }],
+      taps: expect.objectContaining({
         people: 2,
         continued: 1,
         listed: [{ username: "p1", campaign: "Guide", tappedAt: "2026-11-25T20:51:10.000Z", reason: "window" }],
-      },
+      }),
     });
     expect(state.adds.filter((add) => add.name === "process-postback").map((add) => add.data.userId)).toEqual(["p2"]);
+    // The all-clear names each silence by its own time, not one span over
+    // the day in between, when taps arrived.
+    expect(sent[0].text).toContain(
+      "Die Störung dauerte etwa 13 Stunden: vom 26.11.2026 um 21:00 Uhr bis zum 27.11.2026 um 10:00 Uhr."
+    );
+    expect(sent[0].text).toContain(
+      "Schon davor kam einmal nichts an: vom 25.11.2026 um 14:15 Uhr bis zum 26.11.2026 um 11:30 Uhr"
+    );
+    expect(sent[0].text).toContain("Bei 1 Person, die in diesen Zeiten getippt hat, konnte OpenReply nicht mehr weitermachen:");
+  });
+
+  it("knows OpenReply's own DMs to a person: every DmLog row of theirs, and their offers by their contact", async () => {
+    const since = new Date("2026-11-25T20:00:00.000Z");
+    // Another campaign's opening DM in the silence, an old one, someone else's.
+    await openingDm("p_own", "2026-11-26T07:00:01.000Z", { commentId: "comment_other" });
+    await openingDm("p_own", "2026-11-20T07:00:01.000Z", { commentId: "comment_old" });
+    await openingDm("p_else", "2026-11-26T07:30:00.000Z");
+    // A link that may have gone out.
+    await state.db.dmLog.create({
+      data: {
+        workspaceId: "workspace_db",
+        automationId: "campaign_db",
+        instagramAccountId: "account_db",
+        commenterId: "p_own",
+        commentText: "(button tap)",
+        commentId: "reveal:p_own",
+        status: "FAILED",
+        dmDeliveryUnconfirmed: true,
+      },
+    });
+    const contact = await state.db.contact.create({
+      data: {
+        workspaceId: "workspace_db",
+        instagramAccountId: "account_db",
+        igsid: "p_own",
+        recipientHash: "hash_p_own",
+      },
+    });
+    await state.db.offer.create({
+      data: {
+        id: "offer_db",
+        workspaceId: "workspace_db",
+        name: "Prompt-Guide",
+        offerMessages: ["Hey, noch was für dich!", "Magst du den Prompt-Guide?"],
+        offerDelaysSeconds: [0, 10],
+        offerButtonLabel: "Ja, gerne!",
+        confirmationMessages: ["Super!"],
+        confirmationDelaysSeconds: [2],
+        cardTitle: "Prompt-Guide",
+        cardButtonLabel: "Holen",
+        destinationUrl: "https://example.test/guide",
+        linkSlug: "slug_lost_taps_db",
+        tagOffered: "a",
+        tagInterested: "b",
+        tagSent: "c",
+        tagClicked: "d",
+      },
+    });
+    await state.db.contactOffer.create({
+      data: {
+        workspaceId: "workspace_db",
+        contactId: contact.id,
+        offerId: "offer_db",
+        offeredAt: new Date("2026-11-26T08:00:00.000Z"),
+        pitchSentAt: new Date("2026-11-26T08:00:10.000Z"),
+        interestedAt: new Date("2026-11-26T08:30:00.000Z"),
+        sentAt: new Date("2026-11-26T08:30:03.000Z"),
+        signupMessageSentAt: new Date("2026-11-26T09:00:00.000Z"),
+      },
+    });
+
+    const sends = await ownSendsTo({ id: "account_db" }, "p_own", since);
+    expect(sends.sort((a, b) => a.from - b.from)).toEqual([
+      { from: Date.parse("2026-11-26T07:00:01.000Z"), until: Date.parse("2026-11-26T07:00:01.000Z"), count: 1 },
+      { from: Date.parse("2026-11-26T08:00:00.000Z"), until: Date.parse("2026-11-26T08:00:10.000Z"), count: 2 },
+      { from: Date.parse("2026-11-26T08:30:00.000Z"), until: Date.parse("2026-11-26T08:30:03.000Z"), count: 2 },
+      { from: Date.parse("2026-11-26T09:00:00.000Z"), until: Date.parse("2026-11-26T09:00:00.000Z"), count: 1 },
+      // The unconfirmed link, at the time its row was written.
+      { from: expect.any(Number), until: expect.any(Number), count: 1 },
+    ]);
+    expect(await ownSendsTo({ id: "account_db" }, "p_nobody", since)).toEqual([]);
+    await state.db.contactOffer.deleteMany({});
+    await state.db.offer.deleteMany({});
+    await state.db.contact.deleteMany({});
   });
 });

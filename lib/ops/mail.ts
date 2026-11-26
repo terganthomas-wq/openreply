@@ -174,15 +174,17 @@ let warnedNotConfigured = false;
 
 /**
  * One WARNING per process start that the worker cannot send e-mail: it
- * shows in every workspace's Diagnostics. The alert itself is skipped, not
- * used up: after the settings are added and the worker restarted, the next
- * check sends it.
+ * shows in every workspace's Diagnostics. Any warning e-mail about
+ * Instagram may be the first to meet it (lib/ops/incident-mail.ts): about a
+ * lost connection (A1) or about missing button taps (A2), an alert or an
+ * all-clear. The e-mail itself is skipped, not used up: after the settings
+ * are added and the worker restarted, the next check sends it.
  */
 export async function warnMailNotConfigured(): Promise<void> {
   if (warnedNotConfigured) return;
   warnedNotConfigured = true;
   const message =
-    "No alert e-mail about a lost Instagram connection can go out: the worker has no e-mail settings (RESEND_API_KEY and EMAIL_FROM, or EMAIL_SERVER and EMAIL_FROM, in its .env)";
+    "No warning e-mail about Instagram (a lost connection or missing button taps) can go out: the worker has no e-mail settings (RESEND_API_KEY and EMAIL_FROM, or EMAIL_SERVER and EMAIL_FROM, in its .env)";
   console.warn(`[Mail] ${message}`);
   await logWorkerEvent({
     workspaceId: null,

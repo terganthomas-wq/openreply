@@ -2,11 +2,12 @@
 
 /**
  * The last messaging silence (A2) in Diagnostics, for 7 days after it ended:
- * from when to when nothing arrived and how long that was, and what the
- * search for lost taps after it found (lib/instagram/lost-tap-search.ts):
- * how many taps it continued, the people it could not help any more (name,
- * campaign, time, why), how many got the first DM without tapping, and how
- * many it could not look at. While the search runs, it says so.
+ * from when to when nothing arrived and how long that was (and any earlier
+ * silence reported with it), and what the search for lost taps after it
+ * found (lib/instagram/lost-tap-search.ts): how many taps it continued, the
+ * people it could not help any more (name, campaign, time, why), how many
+ * got the first DM without tapping, and how many it could not look at. While
+ * the search runs, it says so.
  */
 
 import type { StaticMessageKey } from "@/lib/i18n";
@@ -17,11 +18,26 @@ import type { MessagingSilenceReport } from "@/lib/instagram/messaging-silence-i
 
 const HOUR = 60 * 60_000;
 
+/** How long a silence lasted, in whole hours, at least one. */
+function hoursBetween(since: string, endedAt: string): number {
+  return Math.max(1, Math.round((Date.parse(endedAt) - Date.parse(since)) / HOUR));
+}
+
 /** Why a tap was not continued, in the reader's language. */
 export const LISTED_REASON_TEXT = {
   window: "Instagram allows an answer only within 24 hours of the tap.",
   campaign: "The campaign is paused.",
+  replied:
+    "After the tap a message came from your account that OpenReply did not send. So that nothing arrives twice, OpenReply does not continue here.",
+  unclear:
+    "Several of your campaigns have a button with this text. OpenReply cannot tell whether the tap was meant for this campaign.",
 } as const satisfies Record<ListedTap["reason"], StaticMessageKey>;
+
+/** What to do about the people listed: one, or several. */
+export const LOOK_YOURSELF_TEXT = {
+  one: "Best look at this conversation yourself in Instagram and send the person what they asked for, if they do not have it yet.",
+  many: "Best look at these conversations yourself in Instagram and send each person what they asked for, if they do not have it yet.",
+} as const satisfies Record<"one" | "many", StaticMessageKey>;
 
 function SearchResult({ taps }: { taps: LostTapResult }) {
   const { t, locale } = useI18n();
@@ -60,7 +76,9 @@ function SearchResult({ taps }: { taps: LostTapResult }) {
               </li>
             ))}
           </ul>
-          <p className="mt-2 text-muted">{t("Best write to them yourself in Instagram.")}</p>
+          <p className="mt-2 text-muted">
+            {t(taps.listed.length === 1 ? LOOK_YOURSELF_TEXT.one : LOOK_YOURSELF_TEXT.many)}
+          </p>
         </div>
       )}
       {taps.answered > 0 && (
@@ -99,10 +117,7 @@ export default function MessagingSilenceReports({
       </h2>
       <ul className="mt-3 space-y-5 text-sm text-foreground">
         {reports.map((report) => {
-          const hours = Math.max(
-            1,
-            Math.round((Date.parse(report.endedAt) - Date.parse(report.since)) / HOUR)
-          );
+          const hours = hoursBetween(report.since, report.endedAt);
           return (
             <li key={report.accountId} className="min-w-0 break-words">
               <p className="font-semibold">
@@ -118,6 +133,15 @@ export default function MessagingSilenceReports({
                 })}{" "}
                 {t("That was about {hours} hours.", { hours })}
               </p>
+              {report.earlier.map((silence) => (
+                <p key={silence.since} className="mt-0.5 text-muted">
+                  {t("Before that, nothing arrived either from {from} to {to}: about {hours} hours.", {
+                    from: formatIncidentTime(silence.since, locale),
+                    to: formatIncidentTime(silence.endedAt, locale),
+                    hours: hoursBetween(silence.since, silence.endedAt),
+                  })}
+                </p>
+              ))}
               {report.searching ? (
                 <p className="mt-2">
                   {t("@{account}: looking for button taps that got lost in that time …", {

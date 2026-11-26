@@ -2,9 +2,11 @@
  * The rules of the search for lost taps after a messaging silence (A2
  * requirement 4) that need no database: which message of a conversation is a
  * lost tap (the button's title, from the person, newer than their opening
- * DM; not someone else's, never the account's own), what the tap would have
- * set off (the payload the worker sends with each button), the 24-hour
- * window with its hour of margin, and the stored shapes read back.
+ * DM and the silence's start; not someone else's, never the account's own),
+ * which campaign it goes to when buttons say the same, which messages after
+ * it someone else wrote, what the tap would have set off (the payload the
+ * worker sends with each button), the 24-hour window with its hour of margin,
+ * and the stored shapes read back.
  */
 import { describe, expect, it } from "vitest";
 import {
@@ -13,12 +15,16 @@ import {
   LOST_TAP_READ_GAP_MS,
   LOST_TAP_SPACING_MS,
   lostTapSearchJobId,
+  mergeLostTapResults,
+  OWN_SEND_TOLERANCE_MS,
   readLostTapProgress,
   readLostTapResult,
   tapButton,
   tapPayload,
   tapWindowOpen,
+  unexplainedReplies,
   type ConversationMessage,
+  type LostTapResult,
   type TapCampaign,
 } from "../lib/instagram/lost-tap-state";
 import { CATCH_UP_SPACING_MS } from "../lib/instagram/catch-up-state";
@@ -160,6 +166,122 @@ describe("a lost tap in a conversation", () => {
       ["c_second", "m_late"],
     ]);
   });
+
+  it("gives two taps after two opening DMs whose buttons say the same one campaign each, the newest to the latest DM", () => {
+    const first = campaign({ automationId: "c_first", openingDmAt: OPENING });
+    const second = campaign({ automationId: "c_second", openingDmAt: OPENING + 16 * MINUTE });
+    const taps = findLostTaps(PERSON, [first, second], [
+      message("m_2", "Ja, schick ihn mir", "2026-11-26T07:31:00.000Z"),
+      message("m_1", "Ja, schick ihn mir", "2026-11-26T07:30:00.000Z"),
+    ]);
+    expect(taps).toEqual([
+      {
+        automationId: "c_first",
+        messageId: "m_1",
+        tappedAt: Date.parse("2026-11-26T07:30:00.000Z"),
+        payload: "reveal:c_first:open",
+      },
+      {
+        automationId: "c_second",
+        messageId: "m_2",
+        tappedAt: Date.parse("2026-11-26T07:31:00.000Z"),
+        payload: "reveal:c_second:open",
+      },
+    ]);
+  });
+
+  it("gives one tap after two such DMs to the latest, and marks the other campaign as unclear instead of dropping it", () => {
+    const first = campaign({ automationId: "c_first", openingDmAt: OPENING });
+    const second = campaign({ automationId: "c_second", openingDmAt: OPENING + 16 * MINUTE });
+    const taps = findLostTaps(PERSON, [first, second], [
+      message("m_1", "Ja, schick ihn mir", "2026-11-26T07:30:00.000Z"),
+    ]);
+    expect(taps).toEqual([
+      {
+        automationId: "c_second",
+        messageId: "m_1",
+        tappedAt: Date.parse("2026-11-26T07:30:00.000Z"),
+        payload: "reveal:c_second:open",
+      },
+      {
+        automationId: "c_first",
+        messageId: "m_1",
+        tappedAt: Date.parse("2026-11-26T07:30:00.000Z"),
+        payload: "reveal:c_first:open",
+        unclear: true,
+      },
+    ]);
+    // Three taps for two campaigns: the oldest is a repeat, nothing unclear.
+    expect(
+      findLostTaps(PERSON, [first, second], [
+        message("m_3", "Ja, schick ihn mir", "2026-11-26T07:32:00.000Z"),
+        message("m_2", "Ja, schick ihn mir", "2026-11-26T07:31:00.000Z"),
+        message("m_1", "Ja, schick ihn mir", "2026-11-26T07:30:00.000Z"),
+      ]).map((tap) => [tap.automationId, tap.messageId, tap.unclear ?? false])
+    ).toEqual([
+      ["c_first", "m_2", false],
+      ["c_second", "m_3", false],
+    ]);
+  });
+
+  it("counts only taps in the silence, for an opening DM from before it", () => {
+    const before = campaign({ openingDmAt: Date.parse("2026-11-24T22:17:34.000Z") });
+    const messages = [
+      message("m_in", "Ja, schick ihn mir", "2026-11-25T16:02:00.000Z"),
+      message("m_before", "Ja, schick ihn mir", "2026-11-25T10:00:00.000Z"),
+    ];
+    const silenceFrom = Date.parse("2026-11-25T13:15:16.000Z");
+    expect(findLostTaps(PERSON, [before], messages, { after: silenceFrom }).map((tap) => tap.messageId)).toEqual([
+      "m_in",
+    ]);
+    expect(findLostTaps(PERSON, [before], messages.slice(1), { after: silenceFrom })).toEqual([]);
+  });
+});
+
+describe("who wrote after a tap", () => {
+  const TAP = Date.parse("2026-11-25T20:51:10.000Z");
+  const at = (iso: string) => Date.parse(iso);
+
+  it("is anyone but the person, newer than the tap, that OpenReply's own sends do not explain", () => {
+    const messages = [
+      message("m_hand", "Sorry, hier ist dein Guide", "2026-11-26T09:41:00.000Z", ACCOUNT),
+      message("m_dm", "Magst du den Dach-Guide?", "2026-11-26T07:00:00.000Z", ACCOUNT),
+      message("m_person", "Hallo? Der Link kommt nicht", "2026-11-26T08:10:00.000Z"),
+      message("m_tap", "Ja, schick ihn mir", "2026-11-25T20:51:10.000Z"),
+      message("m_opening", "Hey! Magst du den Guide?", "2026-11-25T20:49:23.000Z", ACCOUNT),
+    ];
+    // Another campaign's opening DM, recorded a second after Instagram took it.
+    const own = [{ from: at("2026-11-26T07:00:01.000Z"), until: at("2026-11-26T07:00:01.000Z"), count: 1 }];
+    expect(unexplainedReplies(PERSON, TAP, messages, own).map((item) => item.id)).toEqual(["m_hand"]);
+    expect(unexplainedReplies(PERSON, TAP, messages.slice(1), own)).toEqual([]);
+    // Without any record, both are someone else's.
+    expect(unexplainedReplies(PERSON, TAP, messages, []).map((item) => item.id)).toEqual(["m_dm", "m_hand"]);
+  });
+
+  it("explains each message once: a stretch of own sends explains at most as many as it sent, within two minutes of it", () => {
+    const offer = { from: at("2026-11-26T08:00:00.000Z"), until: at("2026-11-26T08:00:10.000Z"), count: 2 };
+    const three = [
+      message("m_3", "Magst du den Prompt-Guide?", "2026-11-26T08:00:10.000Z", ACCOUNT),
+      message("m_2", "Hier ist dein Guide", "2026-11-26T08:00:05.000Z", ACCOUNT),
+      message("m_1", "Hey, noch was für dich!", "2026-11-26T08:00:00.000Z", ACCOUNT),
+    ];
+    expect(unexplainedReplies(PERSON, TAP, three, [offer])).toHaveLength(1);
+    expect(unexplainedReplies(PERSON, TAP, three.slice(0, 2), [offer])).toEqual([]);
+    expect(OWN_SEND_TOLERANCE_MS).toBe(2 * MINUTE);
+    const late = [message("m_late", "Hey", new Date(offer.until + OWN_SEND_TOLERANCE_MS + 1_000).toISOString(), ACCOUNT)];
+    expect(unexplainedReplies(PERSON, TAP, late, [offer])).toHaveLength(1);
+  });
+
+  it("takes a message without its time or its sender for someone else's", () => {
+    const odd: ConversationMessage[] = [
+      { id: "m_no_time", message: "Hier", from: { id: ACCOUNT } },
+      { id: "m_no_from", message: "Hier", created_time: "2026-11-26T09:00:00+0000" },
+    ];
+    expect(unexplainedReplies(PERSON, TAP, odd, [{ from: 0, until: Infinity, count: 10 }]).map((item) => item.id)).toEqual([
+      "m_no_time",
+    ]);
+    expect(unexplainedReplies(PERSON, TAP, odd, []).map((item) => item.id).sort()).toEqual(["m_no_from", "m_no_time"]);
+  });
 });
 
 describe("the window a tap opened", () => {
@@ -245,5 +367,85 @@ describe("what is stored", () => {
     expect(readLostTapResult({ v: 1, finishedAt: "2026-11-26T10:40:00.000Z" })?.complete).toBe(true);
     expect(readLostTapResult({ v: 1, finishedAt: "2026-11-26T10:40:00.000Z", gaveUp: true })?.complete).toBe(false);
     expect(readLostTapResult({ v: 1 })).toBeNull();
+  });
+
+  it("reads back the reasons and the taps that are only listed", () => {
+    for (const reason of ["window", "campaign", "replied", "unclear"] as const) {
+      expect(
+        readLostTapResult({
+          v: 1,
+          finishedAt: "2026-11-26T10:40:00.000Z",
+          listed: [{ campaign: "Guide", tappedAt: "2026-11-25T20:51:10.000Z", reason }],
+        })?.listed[0].reason
+      ).toBe(reason);
+    }
+    const found = {
+      userId: "p1",
+      automationId: "c1",
+      messageId: "m1",
+      payload: "reveal:c1:open",
+      tappedAt: "2026-11-25T20:51:10.000Z",
+      openingDmAt: "2026-11-25T20:49:23.000Z",
+    };
+    const progress = (listOnly: unknown) =>
+      readLostTapProgress({
+        v: 1,
+        from: "2026-11-25T13:15:16.000Z",
+        until: "2026-11-26T10:30:57.000Z",
+        startedAt: "2026-11-26T10:31:00.000Z",
+        found: [{ ...found, listOnly }],
+      })?.found[0];
+    expect(progress("replied")?.listOnly).toBe("replied");
+    expect(progress("unclear")?.listOnly).toBe("unclear");
+    expect(progress("other")).not.toHaveProperty("listOnly");
+  });
+
+  it("joins two finished searches for one report", () => {
+    const result = (overrides: Partial<LostTapResult>): LostTapResult => ({
+      v: 1,
+      finishedAt: "2026-11-26T14:00:00.000Z",
+      people: 2,
+      continued: 1,
+      firstJobAt: "2026-11-26T14:00:00.000Z",
+      lastJobAt: "2026-11-26T14:00:00.000Z",
+      listed: [{ username: "gerd", campaign: "Guide", tappedAt: "2026-11-25T13:21:00.000Z", reason: "window" }],
+      noTap: 1,
+      answered: 0,
+      notChecked: 0,
+      reads: 3,
+      gaveUp: false,
+      complete: true,
+      ...overrides,
+    });
+    const earlier = result({});
+    const later = result({
+      finishedAt: "2026-11-27T09:01:00.000Z",
+      firstJobAt: "2026-11-27T09:01:00.000Z",
+      lastJobAt: "2026-11-27T09:03:30.000Z",
+      listed: [
+        { username: "gerd", campaign: "Guide", tappedAt: "2026-11-25T13:21:00.000Z", reason: "window" },
+        { username: "ida", campaign: "Guide", tappedAt: "2026-11-27T01:00:00.000Z", reason: "replied" },
+      ],
+      notChecked: 1,
+      complete: false,
+    });
+    expect(mergeLostTapResults(earlier, later)).toEqual({
+      v: 1,
+      finishedAt: "2026-11-27T09:01:00.000Z",
+      people: 4,
+      continued: 2,
+      firstJobAt: "2026-11-26T14:00:00.000Z",
+      lastJobAt: "2026-11-27T09:03:30.000Z",
+      listed: [
+        { username: "gerd", campaign: "Guide", tappedAt: "2026-11-25T13:21:00.000Z", reason: "window" },
+        { username: "ida", campaign: "Guide", tappedAt: "2026-11-27T01:00:00.000Z", reason: "replied" },
+      ],
+      noTap: 2,
+      answered: 0,
+      notChecked: 1,
+      reads: 6,
+      gaveUp: false,
+      complete: false,
+    });
   });
 });

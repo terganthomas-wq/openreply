@@ -6,7 +6,8 @@
  * messaging silence check (A2) adds WebhookEvent rows themselves (its
  * findMany, with Postgres's JSON containment for `path` + `array_contains`),
  * and the search for lost taps after a silence DmLog's findFirst and
- * findUnique (by automationId_commentId).
+ * findUnique (by automationId_commentId) and a person's offers (ContactOffer
+ * by its contact, with the offer's messages).
  *
  * Unlike a plain mock it evaluates the where clauses of updateMany, because
  * that is where the check's, the e-mail's and the catch-up's guarantees live:
@@ -102,6 +103,25 @@ export interface FakeDmLog {
   /** When the row was written and last changed; both default to dmSentAt (or long ago). */
   createdAt?: Date;
   updatedAt?: Date;
+}
+
+/** One offer to a person: the times its messages went out, and the offer's messages. */
+export interface FakeContactOffer {
+  /** The contact's account row and Instagram-scoped id. */
+  instagramAccountId: string;
+  igsid: string;
+  offeredAt: Date;
+  pitchSentAt?: Date | null;
+  interestedAt?: Date | null;
+  sentAt?: Date | null;
+  reminderSentAt?: Date | null;
+  signupMessageSentAt?: Date | null;
+  offer?: {
+    offerMessages: string[];
+    offerDelaysSeconds: number[];
+    confirmationMessages: string[];
+    confirmationDelaysSeconds: number[];
+  };
 }
 
 /** A stored webhook, as the webhook route keeps it. */
@@ -284,6 +304,7 @@ export class FakeConnectionDb {
   }[] = [];
   campaigns: FakeCampaign[] = [];
   dmLogs: FakeDmLog[] = [];
+  contactOffers: FakeContactOffer[] = [];
   webhookEvents: FakeWebhookEvent[] = [];
   /** Every webhookEvent.findMany, for tests that check what was read. */
   webhookReads: { where: Record<string, unknown>; skip: number; take: number }[] = [];
@@ -410,6 +431,30 @@ export class FakeConnectionDb {
         const row = this.dmLogRows().find((log) => matches(log, where.automationId_commentId));
         return row ? copy(row) : null;
       },
+    },
+    // A person's offers, by the contact (lib/instagram/lost-tap-records.ts, ownSendsTo).
+    contactOffer: {
+      findMany: async ({ where }: { where: { contact?: Record<string, unknown> } }) =>
+        this.contactOffers
+          .filter((row) =>
+            matches({ instagramAccountId: row.instagramAccountId, igsid: row.igsid }, where.contact)
+          )
+          .map((row) =>
+            copy({
+              pitchSentAt: null,
+              interestedAt: null,
+              sentAt: null,
+              reminderSentAt: null,
+              signupMessageSentAt: null,
+              ...row,
+              offer: row.offer ?? {
+                offerMessages: ["Magst du noch etwas?"],
+                offerDelaysSeconds: [0],
+                confirmationMessages: [],
+                confirmationDelaysSeconds: [],
+              },
+            } as unknown as Row)
+          ),
     },
     // Newest first, then by id, as the silence check (A2) asks; a page of them.
     webhookEvent: {

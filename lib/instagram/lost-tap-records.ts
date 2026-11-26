@@ -13,12 +13,21 @@
  * job stands back when one appears after the tap it continues, so nobody
  * gets the link twice.
  *
+ * OpenReply's own DMs to the person that the database records
+ * (ownSendsTo) tell the search which messages in their conversation it sent
+ * itself: any other one after a lost tap was written by someone else.
+ *
  * Database only, no Meta or queue import.
  */
 
 import { prisma } from "@/lib/db/client";
-import { campaignOfTapPayload } from "@/lib/instagram/lost-tap-state";
+import {
+  campaignOfTapPayload,
+  OWN_SEND_TOLERANCE_MS,
+  type OwnSends,
+} from "@/lib/instagram/lost-tap-state";
 import { parsePostbackEvents } from "@/lib/meta/webhook";
+import { CARD_DELAY_MS } from "@/lib/offers/schedule";
 
 // Stored webhooks with a button tap are read a page at a time, oldest
 // first; after this many the look is incomplete (and says so).
@@ -141,7 +150,7 @@ export async function recordedPairs(
 
 /** What made a lost tap's job stand back. */
 export type LostTapAnswer =
-  /** The campaign's link went out to the person after the tap, may have, or waits for a pause. */
+  /** The campaign's link went out to the person after the tap, or may have. */
   | "link"
   /** The campaign answered a DM of theirs (a keyword) after the tap. */
   | "dm"
@@ -151,13 +160,17 @@ export type LostTapAnswer =
 /**
  * Whether the person was answered since the lost tap a job continues
  * (lib/queue/dm-worker.ts): the campaign's link reached them after the tap
- * (SENT later than it), may have (unconfirmed) or waits for a pause
- * (PENDING), each written after the tap; the campaign answered a keyword DM
- * of theirs after it; or a tap of theirs on the campaign's buttons arrived
- * as a webhook after it, other than this one (a webhook with the same mid is
- * this very tap, delivered late: its job and this one take the same claim).
- * A FAILED link is no answer: the job's own retry after a refusal must go
- * on. Null when none of these holds.
+ * (SENT later than it) or may have (unconfirmed, written after it); the
+ * campaign answered a keyword DM of theirs after it; or a tap of theirs on
+ * the campaign's buttons arrived as a webhook after it, other than this one
+ * (a webhook with the same mid is this very tap, delivered late: its job and
+ * this one take the same claim). A FAILED link is no answer: the job's own
+ * retry after a refusal must go on. Nor is a link that waits for an R1 pause
+ * (PENDING): that may be this job's own first attempt, whose copy never
+ * reached the queue, and nothing would ever answer the tap then. A link of
+ * another tap that waits is no reason either: that tap arrived (the stored
+ * webhook above), and its copy stands back on the link this job sends
+ * (processPostback's pause copy check). Null when none of these holds.
  */
 export async function lostTapAnswered({
   instagramId,
@@ -182,12 +195,7 @@ export async function lostTapAnswered({
     if (reveal.status === "SENT" && reveal.dmSentAt && reveal.dmSentAt.getTime() > tappedAt) {
       return "link";
     }
-    if (
-      (reveal.status === "PENDING" || reveal.dmDeliveryUnconfirmed) &&
-      reveal.updatedAt.getTime() > tappedAt
-    ) {
-      return "link";
-    }
+    if (reveal.dmDeliveryUnconfirmed && reveal.updatedAt.getTime() > tappedAt) return "link";
   }
 
   const answeredDm = await prisma.dmLog.findFirst({
@@ -206,4 +214,94 @@ export async function lostTapAnswered({
   return taps.some((tap) => tap.automationId === automationId && tap.mid !== mid)
     ? "tap"
     : null;
+}
+
+const SECOND = 1_000;
+
+function sum(values: readonly number[]): number {
+  return values.reduce((total, value) => total + Math.max(0, value), 0);
+}
+
+/**
+ * OpenReply's own DMs to a person on the account since `after`, as the
+ * database records them, for telling them apart from messages someone wrote
+ * by hand (unexplainedReplies, lib/instagram/lost-tap-state.ts):
+ * - every DmLog row of the person, of any campaign: a comment's DM (an
+ *   opening DM of another campaign, say), the link after a tap (its last
+ *   one) and the answer to a DM keyword, at its send time; one that may have
+ *   gone out at the time it was last written;
+ * - the person's offers (lib/offers/worker.ts): the offer messages from its
+ *   start to the one with the button, the confirmations and the card after
+ *   the tap on it, the reminder and the message after a sign-up.
+ * What the database does not record (a follow prompt, its second request,
+ * the note before a follow re-check, the follow-up after a link) is not
+ * known: a message like that counts as written by someone else, and the
+ * tap it follows is listed rather than continued. A guess could hide a
+ * reply by hand, and with it a link the person already has.
+ */
+export async function ownSendsTo(
+  account: { id: string },
+  userId: string,
+  after: Date
+): Promise<OwnSends[]> {
+  const since = new Date(after.getTime() - OWN_SEND_TOLERANCE_MS);
+  const rows = await prisma.dmLog.findMany({
+    where: {
+      instagramAccountId: account.id,
+      commenterId: userId,
+      OR: [{ dmSentAt: { gt: since } }, { dmDeliveryUnconfirmed: true, updatedAt: { gt: since } }],
+    },
+    select: { dmSentAt: true, dmDeliveryUnconfirmed: true, updatedAt: true },
+  });
+  const sends: OwnSends[] = rows.flatMap((row) => {
+    const at = row.dmSentAt ?? (row.dmDeliveryUnconfirmed ? row.updatedAt : null);
+    return at ? [{ from: at.getTime(), until: at.getTime(), count: 1 }] : [];
+  });
+
+  const offers = await prisma.contactOffer.findMany({
+    where: { contact: { instagramAccountId: account.id, igsid: userId } },
+    select: {
+      offeredAt: true,
+      pitchSentAt: true,
+      interestedAt: true,
+      sentAt: true,
+      reminderSentAt: true,
+      signupMessageSentAt: true,
+      offer: {
+        select: {
+          offerMessages: true,
+          offerDelaysSeconds: true,
+          confirmationMessages: true,
+          confirmationDelaysSeconds: true,
+        },
+      },
+    },
+  });
+  for (const row of offers) {
+    const { offer } = row;
+    const started = row.offeredAt.getTime();
+    sends.push({
+      from: started,
+      until: row.pitchSentAt?.getTime() ?? started + sum(offer.offerDelaysSeconds) * SECOND,
+      count: Math.max(1, offer.offerMessages.length),
+    });
+    if (row.interestedAt) {
+      // The confirmations and the card after the tap on the offer's button.
+      // sentAt is the card's time, unless the reminder came first and keeps it.
+      const tapped = row.interestedAt.getTime();
+      const card = row.sentAt?.getTime() ?? null;
+      sends.push({
+        from: tapped,
+        until:
+          card !== null && card >= tapped
+            ? card
+            : tapped + sum(offer.confirmationDelaysSeconds) * SECOND + CARD_DELAY_MS,
+        count: offer.confirmationMessages.length + 1,
+      });
+    }
+    for (const at of [row.reminderSentAt, row.signupMessageSentAt]) {
+      if (at) sends.push({ from: at.getTime(), until: at.getTime(), count: 1 });
+    }
+  }
+  return sends.filter((send) => send.until >= since.getTime());
 }

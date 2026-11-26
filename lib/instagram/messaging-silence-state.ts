@@ -22,11 +22,13 @@
 
 import type { Prisma } from "@/app/generated/prisma/client";
 import { prisma } from "@/lib/db/client";
-import type {
-  MessagingSilenceEnd,
-  MessagingSilenceResult,
+import {
+  MESSAGING_SILENCE_REPORT_MS,
+  readMessagingSilenceResult,
+  type MessagingSilenceEnd,
+  type MessagingSilenceResult,
 } from "@/lib/instagram/messaging-silence-incident";
-import { lostTapSearchJobId } from "@/lib/instagram/lost-tap-state";
+import { lostTapSearchJobId, mergeLostTapResults } from "@/lib/instagram/lost-tap-state";
 import { inboundMessagingAccountIds } from "@/lib/meta/webhook";
 import { MESSAGING_BACK_EVENT } from "@/lib/ops/event-details";
 import {
@@ -59,23 +61,67 @@ export interface EndedSilence {
   searchFrom: Date;
 }
 
+/** What the end of a silence knows of the one before it (the account row). */
+interface BeforeSilence {
+  /** The last silence that ended before this one, as stored. */
+  result: unknown;
+  /** Its search is still owed: this one is searched with it. */
+  searchOwed: boolean;
+  /** When the last all-clear about a silence reached someone. */
+  allClearSentAt: Date | null;
+}
+
+/**
+ * The earlier silence this one's all-clear and Diagnostics report as well,
+ * or none. One whose search is still owed is searched with this one: its
+ * window is named next to this one's, which the search's numbers cover. One
+ * whose search finished while this silence was open got no all-clear (it
+ * was dropped: messaging events were missing again) and left Diagnostics
+ * when this one began: its window and what its search found (above all the
+ * people to write to) are carried into this one's report, if it ended within
+ * the 7 days Diagnostics shows a silence. One that was reported is not.
+ */
+function earlierToReport(
+  before: BeforeSilence,
+  now: number
+): Pick<MessagingSilenceResult, "earlier" | "carried"> {
+  const previous = readMessagingSilenceResult(before.result);
+  if (!previous) return {};
+  const span = { since: previous.since, endedAt: previous.endedAt };
+  const earlier = [...(previous.earlier ?? []), span];
+  if (before.searchOwed) {
+    return { earlier, ...(previous.carried ? { carried: previous.carried } : {}) };
+  }
+  const found = previous.taps;
+  const reported =
+    !found ||
+    (before.allClearSentAt !== null && before.allClearSentAt.getTime() >= Date.parse(found.finishedAt));
+  if (reported || now - Date.parse(previous.endedAt) > MESSAGING_SILENCE_REPORT_MS) return {};
+  return {
+    earlier,
+    carried: previous.carried ? mergeLostTapResults(previous.carried, found) : found,
+  };
+}
+
 /**
  * What the end of a silence writes besides closing it, in the same update:
  * the silence as the account's last one, and the search for the taps that
  * got lost in it (A2 requirement 4), from its start (or an earlier start
  * whose search is still owed, like A1's connectionCatchUpFrom) up to its
  * end. The all-clear waits for that search, which makes it due once it has
- * finished; an all-clear of an earlier silence that is still owed would only
- * tell old news now.
+ * finished; an all-clear of an earlier silence that is still owed is not
+ * sent on its own, it is told with this one's (earlierToReport).
  */
 function afterSilence(
-  ended: Pick<EndedSilence, "since" | "endedAt" | "via" | "searchFrom">
+  ended: Pick<EndedSilence, "since" | "endedAt" | "via" | "searchFrom">,
+  before: BeforeSilence
 ) {
   const result: MessagingSilenceResult = {
     v: 1,
     since: ended.since.toISOString(),
     endedAt: ended.endedAt.toISOString(),
     via: ended.via,
+    ...earlierToReport(before, ended.endedAt.getTime()),
   };
   return {
     messagingSilenceResult: result as unknown as Prisma.InputJsonValue,
@@ -198,6 +244,8 @@ export async function endMessagingSilence(
         messagingSilentSince: true,
         messagingSilenceCheckAt: true,
         messagingTapSearchFrom: true,
+        messagingSilenceResult: true,
+        messagingAllClearSentAt: true,
       },
     });
     if (!current) return null;
@@ -233,7 +281,14 @@ export async function endMessagingSilence(
         messagingSilentSince: null,
         messagingSilenceCheckAt: null,
         messagingAlertCount: 0,
-        ...afterSilence({ since, endedAt, via, searchFrom }),
+        ...afterSilence(
+          { since, endedAt, via, searchFrom },
+          {
+            result: current.messagingSilenceResult,
+            searchOwed: pending !== null,
+            allClearSentAt: current.messagingAllClearSentAt,
+          }
+        ),
       },
     });
     if (ended.count === 1) {

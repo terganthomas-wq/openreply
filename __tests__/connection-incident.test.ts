@@ -225,7 +225,7 @@ describe("the texts", () => {
     "Instagram connection of @{account} is back.",
     "Alert e-mail about the lost connection of @{account} sent. Recipients: {count}",
     "Reminder about the lost connection of @{account} sent. Recipients: {count}",
-    "Alert e-mails about a lost Instagram connection cannot go out: the sending service has no e-mail settings (RESEND_API_KEY and EMAIL_FROM).",
+    "Warning e-mails about Instagram problems cannot go out: the sending service has no e-mail settings (RESEND_API_KEY and EMAIL_FROM).",
   ] as const;
 
   it("exist in every language", () => {

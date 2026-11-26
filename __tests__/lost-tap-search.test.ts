@@ -71,6 +71,7 @@ import {
   readLostTapResult,
 } from "../lib/instagram/lost-tap-state";
 import { readMessagingSilenceResult } from "../lib/instagram/messaging-silence-incident";
+import { endMessagingSilence } from "../lib/instagram/messaging-silence-state";
 import { resetLatestMetaUsage } from "../lib/meta/usage";
 import type { MailMessage, MailTransport } from "../lib/ops/mail";
 import { resetMailWarnings } from "../lib/ops/mail";
@@ -242,12 +243,17 @@ function openingDm(person: string, iso: string, overrides: Record<string, unknow
 function conversation(
   person: string,
   openingAt: string,
-  after: { text: string; at: string }[] = [],
+  after: { text: string; at: string; from?: string }[] = [],
   extra: Partial<FakeConversation> = {}
 ) {
   const messages: FakeMessage[] = [
     { id: `m_${++sequence}`, text: "Hey! Magst du den Guide?", at: openingAt, from: IG },
-    ...after.map((message) => ({ id: `m_${++sequence}`, text: message.text, at: message.at, from: person })),
+    ...after.map((message) => ({
+      id: `m_${++sequence}`,
+      text: message.text,
+      at: message.at,
+      from: message.from ?? person,
+    })),
   ].reverse();
   conversations.push({
     id: `conv_${person}`,
@@ -412,7 +418,7 @@ describe("whom the search looks at", () => {
     });
   });
 
-  it("not opening DMs before the silence or after its end, the links a tap delivered, DM answers, or campaigns without a button", async () => {
+  it("not counting opening DMs before the silence (looked at for a tap in it only) and not after its end, the links a tap delivered, DM answers, or campaigns without a button", async () => {
     state.db.campaigns.push(fakeCampaign({ id: "c_plain", name: "Ohne Button" }));
     openingDm("p_before", "2026-11-25T13:15:16.000Z");
     openingDm("p_after", "2026-11-26T10:30:58.000Z");
@@ -495,6 +501,178 @@ describe("whom the search looks at", () => {
     expect(readConversations()[0]).toBe("conv_p_59");
     expect(readConversations().at(-1)).toBe("conv_p_10");
     expect(taps()).toMatchObject({ people: 60, noTap: 50, notChecked: 10, complete: false });
+  });
+});
+
+describe("taps answered by hand, buttons that say the same, and DMs from before the silence", () => {
+  /** The id of the person's message at `iso` in their conversation. */
+  function messageAt(person: string, iso: string) {
+    return conversations.find((item) => item.person === person)!.messages.find((message) => message.at === iso)!.id;
+  }
+
+  it("lists a tap after which someone wrote to the person, maybe with the link, instead of continuing it", async () => {
+    openingDm("p_anna", "2026-11-25T20:49:23.000Z");
+    conversation("p_anna", "2026-11-25T20:49:23.000Z", [
+      { text: LABEL, at: "2026-11-25T20:51:10.000Z" },
+      { text: "Hallo? Der Link kommt nicht", at: "2026-11-26T08:10:00.000Z" },
+      // Written by hand in Instagram: no record of it anywhere.
+      { text: "Sorry, hier ist dein Guide: https://example.test/guide", at: "2026-11-26T09:41:00.000Z", from: IG },
+    ]);
+    expect(await run()).toBe("done");
+    expect(tapJobs()).toEqual([]);
+    expect(taps()).toMatchObject({
+      people: 1,
+      continued: 0,
+      noTap: 0,
+      listed: [{ username: "anna", campaign: "Guide Schimmel", tappedAt: "2026-11-25T20:51:10.000Z", reason: "replied" }],
+    });
+    expect(sent[0].text).toContain(
+      "- @anna, Kampagne „Guide Schimmel“, getippt am 25.11.2026 um 21:51 Uhr: Danach kam von deinem Konto eine Nachricht, die nicht OpenReply geschickt hat. Damit nichts doppelt ankommt, macht OpenReply hier nicht weiter."
+    );
+  });
+
+  it("continues it when what came after the tap is OpenReply's own: another campaign's opening DM, an offer's messages", async () => {
+    state.db.campaigns.push(
+      fakeCampaign({
+        id: "c_dach",
+        name: "Guide Dach",
+        openingDmEnabled: true,
+        openingDmMessage: "Magst du den Dach-Guide?",
+        openingDmButtonLabel: "Klar!",
+      })
+    );
+    openingDm("p_anna", "2026-11-25T20:49:23.000Z");
+    // Her comment on another reel brought that campaign's opening DM.
+    openingDm("p_anna", "2026-11-26T07:00:01.000Z", { automationId: "c_dach" });
+    // The offer after a guide she got before the silence: two messages.
+    state.db.contactOffers.push({
+      instagramAccountId: "account_1",
+      igsid: "p_anna",
+      offeredAt: new Date("2026-11-26T08:00:00.000Z"),
+      pitchSentAt: new Date("2026-11-26T08:00:10.000Z"),
+      offer: {
+        offerMessages: ["Hey, noch was für dich!", "Magst du den Prompt-Guide?"],
+        offerDelaysSeconds: [0, 10],
+        confirmationMessages: [],
+        confirmationDelaysSeconds: [],
+      },
+    });
+    conversation("p_anna", "2026-11-25T20:49:23.000Z", [
+      { text: LABEL, at: "2026-11-25T20:51:10.000Z" },
+      { text: "Magst du den Dach-Guide?", at: "2026-11-26T07:00:00.000Z", from: IG },
+      { text: "Hey, noch was für dich!", at: "2026-11-26T08:00:00.000Z", from: IG },
+      { text: "Magst du den Prompt-Guide?", at: "2026-11-26T08:00:10.000Z", from: IG },
+    ]);
+    expect(await run()).toBe("done");
+    expect(tapJobs().map((job) => [job.data.userId, job.data.payload])).toEqual([["p_anna", "followcheck:c_guide:open"]]);
+    expect(taps()?.listed).toEqual([]);
+  });
+
+  it("but a message more than OpenReply sent in that stretch is someone else's", async () => {
+    openingDm("p_anna", "2026-11-25T20:49:23.000Z");
+    state.db.contactOffers.push({
+      instagramAccountId: "account_1",
+      igsid: "p_anna",
+      offeredAt: new Date("2026-11-26T08:00:00.000Z"),
+      pitchSentAt: new Date("2026-11-26T08:00:10.000Z"),
+      offer: {
+        offerMessages: ["Hey, noch was für dich!", "Magst du den Prompt-Guide?"],
+        offerDelaysSeconds: [0, 10],
+        confirmationMessages: [],
+        confirmationDelaysSeconds: [],
+      },
+    });
+    conversation("p_anna", "2026-11-25T20:49:23.000Z", [
+      { text: LABEL, at: "2026-11-25T20:51:10.000Z" },
+      { text: "Hey, noch was für dich!", at: "2026-11-26T08:00:00.000Z", from: IG },
+      { text: "Hier ist übrigens dein Guide: https://example.test/guide", at: "2026-11-26T08:00:05.000Z", from: IG },
+      { text: "Magst du den Prompt-Guide?", at: "2026-11-26T08:00:10.000Z", from: IG },
+    ]);
+    expect(await run()).toBe("done");
+    expect(tapJobs()).toEqual([]);
+    expect(taps()?.listed.map((entry) => entry.reason)).toEqual(["replied"]);
+  });
+
+  it("gives two taps on two buttons that say the same one campaign each", async () => {
+    state.db.campaigns.push(
+      fakeCampaign({
+        id: "c_second",
+        name: "Guide Dach",
+        openingDmEnabled: true,
+        openingDmMessage: "Magst du den Dach-Guide?",
+        openingDmButtonLabel: LABEL,
+        requireFollow: true,
+      })
+    );
+    openingDm("p_anna", "2026-11-25T20:49:23.000Z");
+    openingDm("p_anna", "2026-11-25T21:05:00.000Z", { automationId: "c_second" });
+    conversation("p_anna", "2026-11-25T20:49:23.000Z", [
+      { text: "Magst du den Dach-Guide?", at: "2026-11-25T21:05:00.000Z", from: IG },
+      { text: LABEL, at: "2026-11-26T07:30:00.000Z" },
+      { text: LABEL, at: "2026-11-26T07:31:00.000Z" },
+    ]);
+    expect(await run()).toBe("done");
+    // The newest tap to the latest opening DM, the one before it to the other.
+    expect(tapJobs().map((job) => [job.data.payload, job.data.mid])).toEqual([
+      ["followcheck:c_guide:open", messageAt("p_anna", "2026-11-26T07:30:00.000Z")],
+      ["followcheck:c_second:open", messageAt("p_anna", "2026-11-26T07:31:00.000Z")],
+    ]);
+    expect(new Set(tapJobs().map((job) => job.opts.jobId)).size).toBe(2);
+    expect(taps()).toMatchObject({ continued: 2, listed: [], noTap: 0 });
+  });
+
+  it("continues one tap on such buttons for the latest opening DM and lists the other campaign as unclear", async () => {
+    state.db.campaigns.push(
+      fakeCampaign({
+        id: "c_second",
+        name: "Guide Dach",
+        openingDmEnabled: true,
+        openingDmMessage: "Magst du den Dach-Guide?",
+        openingDmButtonLabel: LABEL,
+        requireFollow: true,
+      })
+    );
+    openingDm("p_anna", "2026-11-25T20:49:23.000Z");
+    openingDm("p_anna", "2026-11-25T21:05:00.000Z", { automationId: "c_second" });
+    conversation("p_anna", "2026-11-25T20:49:23.000Z", [
+      { text: "Magst du den Dach-Guide?", at: "2026-11-25T21:05:00.000Z", from: IG },
+      { text: LABEL, at: "2026-11-26T07:30:00.000Z" },
+    ]);
+    expect(await run()).toBe("done");
+    expect(tapJobs().map((job) => job.data.payload)).toEqual(["followcheck:c_second:open"]);
+    expect(taps()).toMatchObject({
+      continued: 1,
+      noTap: 0,
+      listed: [{ username: "anna", campaign: "Guide Schimmel", tappedAt: "2026-11-26T07:30:00.000Z", reason: "unclear" }],
+    });
+  });
+
+  it("looks at opening DMs of the day before the silence for a tap in it, without counting their people", async () => {
+    // Got hers the evening before and tapped in the silence: lost as well.
+    openingDm("p_ella", "2026-11-24T22:17:34.000Z");
+    conversation("p_ella", "2026-11-24T22:17:34.000Z", [{ text: LABEL, at: "2026-11-25T16:02:00.000Z" }]);
+    // Did nothing: not read, not counted.
+    openingDm("p_fiona", "2026-11-24T20:49:35.000Z");
+    conversation("p_fiona", "2026-11-24T20:49:35.000Z");
+    // Tapped before the silence and the tap arrived: her flow went on.
+    openingDm("p_gina", "2026-11-24T19:35:06.000Z");
+    conversation("p_gina", "2026-11-24T19:35:06.000Z", [{ text: LABEL, at: "2026-11-25T07:16:57.000Z" }]);
+    storedTap("p_gina", "2026-11-25T07:16:57.000Z");
+    // A tap before the silence is no lost tap, even without its webhook.
+    openingDm("p_ivy", "2026-11-24T21:00:00.000Z");
+    conversation("p_ivy", "2026-11-24T21:00:00.000Z", [{ text: LABEL, at: "2026-11-25T10:00:00.000Z" }]);
+    // More than a day before the silence: not looked at.
+    openingDm("p_hanna", "2026-11-24T12:06:55.000Z");
+    conversation("p_hanna", "2026-11-24T12:06:55.000Z", [{ text: LABEL, at: "2026-11-25T18:00:00.000Z" }]);
+
+    expect(await run()).toBe("done");
+    expect(listReads()).toHaveLength(1);
+    expect(readConversations()).toEqual(["conv_p_ella"]);
+    expect(tapJobs().map((job) => [job.data.userId, job.data.tappedAt])).toEqual([
+      ["p_ella", Date.parse("2026-11-25T16:02:00.000Z")],
+    ]);
+    expect(taps()).toMatchObject({ people: 0, continued: 1, noTap: 0, answered: 0, notChecked: 0, listed: [] });
+    expect(sent[0].text).toContain("1 Person hat in dieser Zeit auf den Button in deiner ersten DM getippt");
   });
 });
 
@@ -1023,9 +1201,9 @@ describe("the end", () => {
     for (const line of [
       "Die Störung dauerte etwa 21 Stunden und 15 Minuten: vom 25.11.2026 um 14:15 Uhr bis zum 26.11.2026 um 11:30 Uhr.",
       "2 Leute haben in dieser Zeit auf den Button in deiner ersten DM getippt, ohne dass der Tipp ankam. OpenReply hat das in den Unterhaltungen gefunden und macht bei ihnen jetzt nach und nach weiter, als wäre der Tipp gleich angekommen, etwa bei einer Person alle 2,5 Minuten.",
-      "Bei 1 Person ging das nicht mehr:",
+      "Bei 1 Person, die in dieser Zeit getippt hat, konnte OpenReply nicht mehr weitermachen:",
       "- @gerd, Kampagne „Guide Schimmel“, getippt am 25.11.2026 um 14:21 Uhr: Instagram erlaubt eine Antwort nur bis 24 Stunden nach dem Tipp.",
-      "Schreib ihnen am besten selbst in Instagram, damit sie bekommen, worum sie gebeten haben.",
+      "Schau dir die Unterhaltung am besten selbst in Instagram an und schick der Person, worum sie gebeten hat, falls sie es noch nicht hat.",
       "Bei 1 Person ging es nach der Störung von selbst weiter, zum Beispiel weil sie noch einmal getippt hat.",
       "2 Leute haben in dieser Zeit deine erste DM bekommen, aber nicht auf den Button getippt.",
     ]) {
@@ -1057,6 +1235,86 @@ describe("the end", () => {
     expect(sent[0].text).toContain("50 people got your first DM in that time but did not tap the button.");
     expect(sent[0].text).toContain("OpenReply could not look at the conversations of 2 people. Check them yourself in Instagram.");
     expect(state.db.events.find((item) => item.payload?.kind === "messaging-tap-search")?.level).toBe("WARNING");
+  });
+});
+
+describe("two silences close together", () => {
+  it("names both when one more ended while the search was owed, which searches them together", async () => {
+    silencePeople();
+    // A new silence opened, and it ends before the search ran.
+    Object.assign(account(), { messagingSilentSince: new Date("2026-11-26T20:00:00.000Z") });
+    const later = new Date("2026-11-27T09:00:00.000Z");
+    await endMessagingSilence("account_1", { via: "check", at: later });
+    expect(account()).toMatchObject({ messagingTapSearchFrom: FROM, messagingTapSearchUntil: later });
+    const earlier = [{ since: FROM.toISOString(), endedAt: UNTIL.toISOString() }];
+    expect(readMessagingSilenceResult(account().messagingSilenceResult)).toEqual({
+      v: 1,
+      since: "2026-11-26T20:00:00.000Z",
+      endedAt: later.toISOString(),
+      via: "check",
+      earlier,
+    });
+
+    expect(await run(Date.parse("2026-11-27T09:01:00.000Z"))).toBe("done");
+    expect(readMessagingSilenceResult(account().messagingSilenceResult)).toMatchObject({
+      since: "2026-11-26T20:00:00.000Z",
+      earlier,
+      taps: { people: 5 },
+    });
+    const { text } = sent[0];
+    expect(text).toContain(
+      "Die Störung dauerte etwa 13 Stunden: vom 26.11.2026 um 21:00 Uhr bis zum 27.11.2026 um 10:00 Uhr."
+    );
+    expect(text).toContain(
+      "Schon davor kam einmal nichts an: vom 25.11.2026 um 14:15 Uhr bis zum 26.11.2026 um 11:30 Uhr, etwa 21 Stunden und 15 Minuten."
+    );
+    // Its taps are from the first silence: "in these times", not "in this one".
+    expect(text).toContain("Bei 2 Leuten, die in diesen Zeiten getippt haben, konnte OpenReply nicht mehr weitermachen:");
+    expect(text).not.toContain("in dieser Zeit");
+  });
+
+  it("carries what a search found into the next silence's all-clear when its own was dropped because that silence had begun", async () => {
+    openingDm("p_gerd", "2026-11-25T13:20:00.000Z");
+    conversation("p_gerd", "2026-11-25T13:20:00.000Z", [{ text: LABEL, at: "2026-11-25T13:21:00.000Z" }]);
+    // Meta's limits held the search up; a new silence opened meanwhile.
+    Object.assign(account(), { messagingSilentSince: new Date("2026-11-26T12:00:00.000Z") });
+    expect(await run(Date.parse("2026-11-26T14:00:00.000Z"))).toBe("done");
+    // Its all-clear would tell the owner that taps arrive again: dropped.
+    expect(sent).toHaveLength(0);
+    expect(account().messagingAllClearDueAt).toBeNull();
+
+    const end = new Date("2026-11-27T09:00:00.000Z");
+    await endMessagingSilence("account_1", { via: "webhook", at: end });
+    expect(readMessagingSilenceResult(account().messagingSilenceResult)).toMatchObject({
+      since: "2026-11-26T12:00:00.000Z",
+      endedAt: end.toISOString(),
+      earlier: [{ since: FROM.toISOString(), endedAt: UNTIL.toISOString() }],
+      carried: { listed: [{ username: "gerd", reason: "window" }] },
+    });
+
+    // The next search finds nothing more, and its all-clear names Gerd.
+    expect(await run(Date.parse("2026-11-27T09:01:00.000Z"))).toBe("done");
+    const result = readMessagingSilenceResult(account().messagingSilenceResult);
+    expect(result).not.toHaveProperty("carried");
+    expect(result?.taps?.listed).toEqual([
+      { username: "gerd", campaign: "Guide Schimmel", tappedAt: "2026-11-25T13:21:00.000Z", reason: "window" },
+    ]);
+    expect(sent[0].text).toContain(
+      "- @gerd, Kampagne „Guide Schimmel“, getippt am 25.11.2026 um 14:21 Uhr: Instagram erlaubt eine Antwort nur bis 24 Stunden nach dem Tipp."
+    );
+    expect(sent[0].text).toContain("Schon davor kam einmal nichts an: vom 25.11.2026 um 14:15 Uhr");
+  });
+
+  it("carries nothing once the earlier all-clear went out", async () => {
+    openingDm("p_gerd", "2026-11-25T13:20:00.000Z");
+    conversation("p_gerd", "2026-11-25T13:20:00.000Z", [{ text: LABEL, at: "2026-11-25T13:21:00.000Z" }]);
+    expect(await run(Date.parse("2026-11-26T14:00:00.000Z"))).toBe("done");
+    expect(sent).toHaveLength(2);
+    Object.assign(account(), { messagingSilentSince: new Date("2026-11-26T16:00:00.000Z") });
+    await endMessagingSilence("account_1", { via: "webhook", at: new Date("2026-11-27T09:00:00.000Z") });
+    const result = readMessagingSilenceResult(account().messagingSilenceResult);
+    expect(result).not.toHaveProperty("earlier");
+    expect(result).not.toHaveProperty("carried");
   });
 });
 
@@ -1113,7 +1371,7 @@ describe("a lost tap's job stands back", () => {
       ...overrides,
     });
 
-  it("for the campaign's link sent after the tap, one that may have gone out or waits; not a failed one or an old one", async () => {
+  it("for the campaign's link sent after the tap or one that may have gone out; not a failed one, an old one or one that waits", async () => {
     expect(await ask()).toBeNull();
     reveal({ dmSentAt: new Date("2026-11-20T10:00:00.000Z") });
     expect(await ask()).toBeNull();
@@ -1121,8 +1379,11 @@ describe("a lost tap's job stands back", () => {
     expect(await ask()).toBeNull();
     state.db.dmLogs[0] = { ...state.db.dmLogs[0], status: "SENT", dmSentAt: new Date(NOW) };
     expect(await ask()).toBe("link");
+    // A link that waits for an R1 pause may be this job's own first attempt,
+    // whose copy never reached the queue: its retry must go on
+    // (conversation-pause.db.test.ts).
     state.db.dmLogs[0] = { ...state.db.dmLogs[0], status: "PENDING", dmSentAt: null, updatedAt: new Date(NOW) };
-    expect(await ask()).toBe("link");
+    expect(await ask()).toBeNull();
     state.db.dmLogs[0] = { ...state.db.dmLogs[0], status: "FAILED", dmDeliveryUnconfirmed: true };
     expect(await ask()).toBe("link");
   });

@@ -59,6 +59,13 @@ export const LOST_TAP_SPACING_MS = CATCH_UP_SPACING_MS;
 export const LOST_TAP_FRESH_MS = 2 * MINUTE;
 /** How long Diagnostics shows a finished search: as the silence, 7 days. */
 export const LOST_TAP_REPORT_MS = 7 * 24 * HOUR;
+/**
+ * Opening DMs this long before the silence began are searched as well: a
+ * tap on one of them in the silence got lost the same way, and people do tap
+ * the next day (of the first taps on an opening DM from 2026-11-20 to 25, two
+ * came 15 and 25 hours after it). Only taps in the silence count for them.
+ */
+export const LOST_TAP_LOOKBACK_MS = 24 * HOUR;
 
 /** The follow prompt's button when the campaign names none (lib/queue/dm-worker.ts). */
 export const DEFAULT_FOLLOW_BUTTON = "i'm following";
@@ -94,6 +101,12 @@ export interface LostTap {
   tappedAt: number;
   /** The button's postback payload, as the campaign sends it. */
   payload: string;
+  /**
+   * Not this campaign's for sure: a button of another campaign says the
+   * same, and the tap went to that one (findLostTaps). Listed, never
+   * continued.
+   */
+  unclear?: true;
 }
 
 function normalized(text: string): string {
@@ -158,47 +171,131 @@ export function campaignOfTapPayload(payload: unknown): string | null {
   return match ? match[1] : null;
 }
 
+function timeOfMessage(message: ConversationMessage): number {
+  return message.created_time ? Date.parse(message.created_time) : Number.NaN;
+}
+
 /**
  * The lost taps in one person's conversation, oldest first, at most one per
  * campaign: a message from the person (no one else's, never the account's
  * own) whose text is the title of one of the campaign's buttons and that is
- * newer than the person's opening DM of that campaign. Of several, the
- * newest: it opened the latest window, and every tap asked for the same.
- * A text that two campaigns' buttons share is the tap on the one whose
- * opening DM came last before it.
+ * newer than the person's opening DM of that campaign, and than `after`
+ * (epoch ms: the silence's start; a tap before it arrived, or would have).
+ *
+ * The resource campaigns all say "Ja, schick ihn mir", so one text may be a
+ * tap on the buttons of several campaigns whose opening DMs the person got.
+ * The taps go to distinct campaigns, the newest first, each to the campaign
+ * with the latest opening DM before it that has none yet: two taps after two
+ * such DMs are one for each, and of several taps on one campaign the newest
+ * counts (it opened the latest window, and every tap asked for the same). A
+ * campaign that one of the taps may have been for but that got none is
+ * returned too, marked `unclear`, with the newest such tap: it is listed,
+ * never continued, as nothing tells whether the person meant it.
  */
 export function findLostTaps(
   userId: string,
   campaigns: readonly TapCampaign[],
-  messages: readonly ConversationMessage[]
+  messages: readonly ConversationMessage[],
+  { after = -Infinity }: { after?: number } = {}
 ): LostTap[] {
-  const newest = new Map<string, LostTap>();
-  for (const message of messages) {
-    if (message.from?.id !== userId || !message.id || typeof message.message !== "string") {
-      continue;
+  const taps = messages
+    .flatMap((message) => {
+      const text = message.message;
+      if (message.from?.id !== userId || !message.id || typeof text !== "string") return [];
+      const at = timeOfMessage(message);
+      if (!Number.isFinite(at) || at <= after) return [];
+      const candidates = campaigns.flatMap((campaign) => {
+        if (at <= campaign.openingDmAt) return [];
+        const button = tapButton(campaign, text);
+        return button ? [{ campaign, button }] : [];
+      });
+      return candidates.length > 0 ? [{ id: message.id, at, candidates }] : [];
+    })
+    // Newest first; the same second in the conversation's order.
+    .sort((a, b) => b.at - a.at);
+
+  const given = new Map<string, LostTap>();
+  const maybe = new Map<string, LostTap>();
+  for (const tap of taps) {
+    const free = tap.candidates
+      .filter((candidate) => !given.has(candidate.campaign.automationId))
+      .sort((a, b) => b.campaign.openingDmAt - a.campaign.openingDmAt);
+    const chosen = free[0];
+    if (chosen) {
+      given.set(chosen.campaign.automationId, {
+        automationId: chosen.campaign.automationId,
+        messageId: tap.id,
+        tappedAt: tap.at,
+        payload: tapPayload(chosen.campaign, chosen.button),
+      });
     }
-    const at = message.created_time ? Date.parse(message.created_time) : Number.NaN;
-    if (!Number.isFinite(at)) continue;
-    let chosen: { campaign: TapCampaign; button: TapButton } | null = null;
-    for (const campaign of campaigns) {
-      if (at <= campaign.openingDmAt) continue;
-      const button = tapButton(campaign, message.message);
-      if (!button) continue;
-      if (!chosen || campaign.openingDmAt > chosen.campaign.openingDmAt) {
-        chosen = { campaign, button };
-      }
+    for (const candidate of tap.candidates) {
+      const id = candidate.campaign.automationId;
+      if (candidate === chosen || maybe.has(id)) continue;
+      maybe.set(id, {
+        automationId: id,
+        messageId: tap.id,
+        tappedAt: tap.at,
+        payload: tapPayload(candidate.campaign, candidate.button),
+        unclear: true,
+      });
     }
-    if (!chosen) continue;
-    const current = newest.get(chosen.campaign.automationId);
-    if (current && current.tappedAt >= at) continue;
-    newest.set(chosen.campaign.automationId, {
-      automationId: chosen.campaign.automationId,
-      messageId: message.id,
-      tappedAt: at,
-      payload: tapPayload(chosen.campaign, chosen.button),
-    });
   }
-  return [...newest.values()].sort((a, b) => a.tappedAt - b.tappedAt);
+  const unclear = [...maybe.values()].filter((tap) => !given.has(tap.automationId));
+  return [...given.values(), ...unclear].sort((a, b) => a.tappedAt - b.tappedAt);
+}
+
+/** A stretch in which OpenReply itself sent the person up to `count` messages (epoch ms). */
+export interface OwnSends {
+  from: number;
+  until: number;
+  count: number;
+}
+
+/**
+ * How far from a send of OpenReply's own that the database records a
+ * message may be and still be that send: the record is written right after
+ * Instagram took the message.
+ */
+export const OWN_SEND_TOLERANCE_MS = 2 * MINUTE;
+
+/**
+ * The messages of a conversation newer than `after` (epoch ms) that are not
+ * from the person and that none of OpenReply's own sends to them explains:
+ * someone wrote to them, by hand in Instagram or in OpenReply's inbox, or
+ * another tool. Each stretch of own sends explains at most its `count`
+ * messages within OWN_SEND_TOLERANCE_MS of it, each message the stretch that
+ * ends first (which explains as many as can be). A message without its time
+ * or its sender counts as such a message: a tap answered by hand must never
+ * be answered once more.
+ */
+export function unexplainedReplies(
+  userId: string,
+  after: number,
+  messages: readonly ConversationMessage[],
+  own: readonly OwnSends[]
+): ConversationMessage[] {
+  const replies = messages
+    .filter((message) => message.from?.id !== userId)
+    .map((message) => ({ message, at: timeOfMessage(message) }))
+    .filter(({ at }) => !Number.isFinite(at) || at > after)
+    .sort((a, b) => (Number.isFinite(a.at) ? a.at : Infinity) - (Number.isFinite(b.at) ? b.at : Infinity));
+  const stretches = own.map((send) => ({
+    from: send.from - OWN_SEND_TOLERANCE_MS,
+    until: send.until + OWN_SEND_TOLERANCE_MS,
+    left: send.count,
+  }));
+  const unexplained: ConversationMessage[] = [];
+  for (const { message, at } of replies) {
+    const stretch = Number.isFinite(at)
+      ? stretches
+          .filter((item) => item.left > 0 && item.from <= at && at <= item.until)
+          .sort((a, b) => a.until - b.until)[0]
+      : undefined;
+    if (stretch) stretch.left -= 1;
+    else unexplained.push(message);
+  }
+  return unexplained;
 }
 
 /**
@@ -261,6 +358,11 @@ export interface FoundTap {
   /** ISO */
   tappedAt: string;
   payload: string;
+  /**
+   * Listed, never continued: someone wrote to the person after the tap
+   * ("replied"), or the tap may have been another campaign's ("unclear").
+   */
+  listOnly?: "replied" | "unclear";
 }
 
 /** A lost tap whose flow goes on: its postback job is queued. */
@@ -274,10 +376,19 @@ export interface ContinuedTap {
   runAt: string;
 }
 
+/** Why a lost tap is listed instead of continued (ListedTap). */
+export type ListedReason = "window" | "campaign" | "replied" | "unclear";
+
+/** Every reason, for reading one back. */
+const LISTED_REASONS: readonly ListedReason[] = ["window", "campaign", "replied", "unclear"];
+
 /**
  * A lost tap that is not continued, as the all-clear and Diagnostics list
  * it: Instagram's 24 hours from the tap leave less than an hour ("window"),
- * or the campaign no longer answers taps (paused or gone, "campaign").
+ * the campaign no longer answers taps (paused or gone, "campaign"), someone
+ * wrote to the person after the tap, maybe the link by hand ("replied"), or
+ * a button of another of the person's campaigns says the same, and the tap
+ * may have been for that one ("unclear").
  */
 export interface ListedTap {
   /** The person's handle, without "@", when known. */
@@ -286,7 +397,7 @@ export interface ListedTap {
   campaign: string;
   /** When they tapped (ISO). */
   tappedAt: string;
-  reason: "window" | "campaign";
+  reason: ListedReason;
 }
 
 /** How far a search got; written when a run stops early. */
@@ -388,7 +499,7 @@ function readListed(item: Record<string, unknown>): ListedTap | null {
     username: textOrNull(item.username),
     campaign: item.campaign,
     tappedAt: item.tappedAt,
-    reason: item.reason === "campaign" ? "campaign" : "window",
+    reason: LISTED_REASONS.find((reason) => reason === item.reason) ?? "window",
   };
 }
 
@@ -430,6 +541,9 @@ function readFound(item: Record<string, unknown>): FoundTap | null {
     messageId: item.messageId,
     tappedAt: item.tappedAt,
     payload: item.payload,
+    ...(item.listOnly === "replied" || item.listOnly === "unclear"
+      ? { listOnly: item.listOnly }
+      : {}),
   };
 }
 
@@ -502,6 +616,56 @@ export function readLostTapResult(value: unknown): LostTapResult | null {
     answered: count(value.answered),
     notChecked,
     reads: count(value.reads),
+    gaveUp,
+    complete: notChecked === 0 && !gaveUp,
+  };
+}
+
+function earliest(a: string | null, b: string | null): string | null {
+  if (!a || !b) return a ?? b;
+  return Date.parse(a) <= Date.parse(b) ? a : b;
+}
+
+function latest(a: string | null, b: string | null): string | null {
+  if (!a || !b) return a ?? b;
+  return Date.parse(a) >= Date.parse(b) ? a : b;
+}
+
+/**
+ * Two finished searches as one, for the all-clear that reports both: the
+ * search after an earlier silence whose all-clear never went out (a new
+ * silence was open by then) and the one after the silence it is reported
+ * with (lib/instagram/messaging-silence-state.ts). Counts add up, the lists
+ * join (each tap once), and it finished with the later one.
+ */
+export function mergeLostTapResults(earlier: LostTapResult, later: LostTapResult): LostTapResult {
+  const listed = [...earlier.listed];
+  for (const entry of later.listed) {
+    if (
+      !listed.some(
+        (item) =>
+          item.username === entry.username &&
+          item.campaign === entry.campaign &&
+          item.tappedAt === entry.tappedAt
+      )
+    ) {
+      listed.push(entry);
+    }
+  }
+  const notChecked = earlier.notChecked + later.notChecked;
+  const gaveUp = earlier.gaveUp || later.gaveUp;
+  return {
+    v: 1,
+    finishedAt: latest(earlier.finishedAt, later.finishedAt) ?? later.finishedAt,
+    people: earlier.people + later.people,
+    continued: earlier.continued + later.continued,
+    firstJobAt: earliest(earlier.firstJobAt, later.firstJobAt),
+    lastJobAt: latest(earlier.lastJobAt, later.lastJobAt),
+    listed,
+    noTap: earlier.noTap + later.noTap,
+    answered: earlier.answered + later.answered,
+    notChecked,
+    reads: earlier.reads + later.reads,
     gaveUp,
     complete: notChecked === 0 && !gaveUp,
   };

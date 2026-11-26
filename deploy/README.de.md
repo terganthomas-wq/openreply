@@ -375,7 +375,9 @@ der E-Mail steht dort schon als `NEXTAUTH_URL`. Auf einem schon laufenden
 Server erst `worker.env` neu erzeugen (`node deploy/make-env.mjs <ordner>`)
 und hochladen (`bash deploy/oracle/upload-env.sh <server-ip>
 <ordner>/worker.env`). Fehlen die Einstellungen, schreibt der Worker einmal
-pro Start eine Warnung in die *Diagnose* und schickt keine E-Mail; der
+pro Start eine Warnung in die *Diagnose* („Hinweis-E-Mails zu
+Instagram-Störungen können nicht rausgehen“, das gilt für die unterbrochene
+Verbindung und für fehlende Button-Tipps) und schickt keine E-Mail; der
 Hinweis im Dashboard kommt trotzdem. Ohne eigene Domain in Resend
 (Absender `onboarding@resend.dev`) kommt die E-Mail, wie die Login-Mails,
 nur an der Adresse deines Resend-Kontos an. Läuft die Anmeldung über einen
@@ -401,11 +403,20 @@ Datenbank:
   eigenen), eine Lesebestätigung oder eine Reaktion, auch als „Standby“,
   wenn gerade eine andere App die Unterhaltungen bekommt. Kommentare zählen
   nicht.
-- „Still“ ist eine Prüfung, wenn mindestens 3 verschiedene Leute vor 12 bis
-  18 Stunden ihre erste DM bekommen haben und seit der ersten davon nichts
-  mehr angekommen ist. Erst zwei stille Prüfungen hintereinander, mindestens
-  einen Durchlauf auseinander, gelten als Störung. „Seit“ nennt die Zeit, zu
-  der zuletzt etwas aus den DMs ankam.
+- „Still“ ist eine Prüfung, wenn seit der ersten von genug ersten DMs, die
+  alle mindestens 12 Stunden alt sind, nichts mehr angekommen ist. Genug
+  heißt: mindestens 3 verschiedene Leute, die ihre erste DM vor 12 bis 18
+  Stunden bekommen haben, also kurz nacheinander. Oder mindestens 5
+  verschiedene Leute seit dem, was zuletzt ankam, egal wie weit auseinander:
+  An ruhigen Tagen gehen nur ein paar erste DMs am Tag raus, und ohne diese
+  zweite Regel würde eine Störung dann erst nach Tagen oder nie auffallen.
+- Erst zwei stille Prüfungen hintereinander, mindestens einen Durchlauf
+  auseinander, gelten als Störung. Die zweite schaut auf dieselben ersten
+  DMs wie die erste und darauf, ob seitdem etwas angekommen ist. Vergessen
+  wird die erste nur, wenn wirklich etwas ankam (oder die Verbindung
+  zwischendurch unterbrochen war), nicht weil ihre DMs inzwischen zu alt
+  sind. Nach 24 Stunden ohne zweite Prüfung fängt sie von vorn an. „Seit“
+  nennt die Zeit, zu der zuletzt etwas aus den DMs ankam.
 - Es zählen nur erste DMs: nicht der Link nach einem Tipp, keine Antworten
   auf DM-Keywords, keine DMs, bei denen unklar ist, ob sie ankamen, und nur
   DMs nach dem Ende der letzten Unterbrechung der Verbindung.
@@ -423,18 +434,27 @@ hätte es nie angeschlagen, auch nicht in ruhigen Nächten. Am knappsten war
 die Nacht vom 24. auf den 25.11.: Fünf Leute bekamen zwischen 13:06 und
 23:17 Uhr ihre erste DM, und 24 Stunden lang kam nichts zurück, bis um 08:16
 Uhr eine Lesebestätigung eintraf. Eine stille Prüfung hätte es frühestens 93
-Minuten danach gegeben. Ein falscher Alarm ist schlimmer als ein paar
-Stunden Verzögerung; deshalb sind die Grenzen eher vorsichtig.
+Minuten danach gegeben, nach der Regel mit den 5 Leuten erst drei Stunden
+danach. Zusätzliche Fehlalarme gab es mit ihr keine, auch nicht, wenn alles
+von einer oder zwei Personen gefehlt hätte oder alles bis zu zwei Stunden
+später gekommen wäre. Eine Störung an den ruhigeren Tagen davor (ab dem
+22.11. um 01:00 Uhr) hätte das Tool am 24.11. zwischen 04:31 und 05:00 Uhr
+gemeldet statt erst am 25.11. zwischen 10:20 und 10:49 Uhr. Je weniger erste
+DMs rausgehen, desto länger dauert es: Wer nichts zurückschickt, kann auch
+einfach noch nicht reingeschaut haben. Ein falscher Alarm ist schlimmer als
+ein paar Stunden Verzögerung; deshalb sind die Grenzen eher vorsichtig.
 
 Ändern lassen sie sich in `worker.env`, nötig ist das nicht:
 `MESSAGING_SILENCE_MIN_PEOPLE` (wie viele Leute, Standard 3, erlaubt 2 bis
 10), `MESSAGING_SILENCE_MIN_AGE_HOURS` (wie alt ihre erste DM mindestens
-ist, Standard 12, erlaubt 4 bis 36) und `MESSAGING_SILENCE_WINDOW_HOURS`
+ist, Standard 12, erlaubt 4 bis 36), `MESSAGING_SILENCE_WINDOW_HOURS`
 (wie alt höchstens, Standard 6 mehr als das Mindestalter, also 18; erlaubt
-1 bis 48 mehr). Werte außerhalb setzt der Worker auf die nächste Grenze,
-Unsinniges auf den Standard, und schreibt das einmal pro Start in die
-*Diagnose*. Weniger Leute oder kürzere Zeiten melden früher, aber auch öfter
-falsch.
+1 bis 48 mehr) und `MESSAGING_SILENCE_SPREAD_MIN_PEOPLE` (wie viele Leute,
+wenn ihre DMs weit auseinander liegen, Standard 2 mehr als die Leute, also
+5; erlaubt 1 bis 20 mehr). Werte außerhalb setzt der Worker auf die nächste
+Grenze, Unsinniges auf den Standard, und schreibt das einmal pro Start in
+die *Diagnose*. Weniger Leute oder kürzere Zeiten melden früher, aber auch
+öfter falsch.
 
 Was dann passiert, genau wie bei der unterbrochenen Verbindung:
 
@@ -479,6 +499,9 @@ gegangen sind, genau einmal pro Störung:
 - Er schaut sich alle an, die in der Störung eine erste DM bekommen haben
   und seitdem weder noch einmal getippt noch den Link bekommen haben. Wer
   nach der Störung selbst noch einmal getippt hat, hat seine Antwort schon.
+  Ebenso alle, die ihre erste DM in den 24 Stunden vor der Störung bekommen
+  haben: Wer erst in der Störung getippt hat, hat genauso nichts bekommen.
+  Die zählen aber nur mit, wenn er bei ihnen so einen Tipp findet.
   Höchstens 50 Leute, die mit der neuesten ersten DM zuerst; alle weiteren
   zählen als „nicht nachgesehen“. Kampagnen, die du inzwischen pausiert
   hast, lässt er aus, außer du hast der Person die DM von Hand geschickt.
@@ -489,14 +512,27 @@ gegangen sind, genau einmal pro Störung:
   viele auf einmal werden.
 - Ein verlorener Tipp ist eine Nachricht der Person, deren Text genau die
   Beschriftung eines Buttons der Kampagne ist (der ersten DM oder der Bitte,
-  dir zu folgen) und die nach ihrer ersten DM kam. So zeigt Instagram einen
-  Tipp in der Unterhaltung an.
-- Für jeden solchen Tipp macht OpenReply weiter, als wäre er gleich
+  dir zu folgen) und die nach ihrer ersten DM und in der Störung kam. So
+  zeigt Instagram einen Tipp in der Unterhaltung an.
+- Viele Kampagnen haben denselben Button-Text („Ja, schick ihn mir“). Hat
+  jemand die erste DM von zwei solchen Kampagnen bekommen, gehört jeder Tipp
+  zu einer davon, der neueste zur zuletzt geschickten DM. Gibt es weniger
+  Tipps als solche Kampagnen, macht OpenReply bei der anderen nicht weiter,
+  sondern nennt sie dir: Ob der Tipp ihr galt, lässt sich nicht erkennen.
+- Hat nach dem Tipp jemand von deinem Konto in die Unterhaltung geschrieben,
+  zum Beispiel du von Hand mit dem Link, macht OpenReply nicht weiter,
+  sondern nennt dir die Person. Was OpenReply selbst geschickt hat, zählt
+  nicht als so eine Nachricht, soweit es das in der Datenbank festhält: erste
+  DMs anderer Kampagnen, Links, Antworten auf DM-Keywords und die Nachrichten
+  eines Angebots. Eine Bitte, dir zu folgen, oder ein Dankeschön nach dem
+  Link hält es nicht fest; die zählen deshalb wie eine Nachricht von dir.
+- Für jeden anderen Tipp macht OpenReply weiter, als wäre er gleich
   angekommen: Folge-Check, Link und was danach kommt wie gewohnt, mit dem
   Tipp als Beginn von Instagrams 24 Stunden. Die ältesten Tipps zuerst, dann
-  etwa einer alle 2,5 Minuten. Den Link bekommt dabei niemand doppelt: Hat
-  die Person inzwischen noch einmal getippt oder den Link schon bekommen,
-  schickt OpenReply nichts.
+  etwa einer alle 2,5 Minuten, auch wenn zwischendurch eine Meta-Pause
+  kommt. Den Link bekommt dabei niemand doppelt: Hat die Person inzwischen
+  noch einmal getippt, eine Antwort auf ein DM-Keyword oder den Link schon
+  bekommen, schickt OpenReply nichts.
 - Instagram erlaubt eine Antwort nur bis 24 Stunden nach dem Tipp. Bleibt
   davon keine Stunde mehr, schickt OpenReply nichts, sondern nennt dir die
   Person. Ebenso, wenn du die Kampagne inzwischen pausiert hast.
@@ -507,12 +543,21 @@ gegangen sind, genau einmal pro Störung:
 Ist die Suche fertig, bekommen alle Inhaber und Admins die Entwarnung
 „Instagram gibt wieder Button-Tipps an OpenReply weiter“: wie lange die
 Störung dauerte, bei wie vielen verlorenen Tipps es jetzt weitergeht, bei
-wem es zu spät war (Name, Kampagne, Uhrzeit des Tipps; schreib diesen Leuten
-am besten selbst in Instagram), wie viele die erste DM bekommen, aber nicht
-getippt haben, und bei wem OpenReply nicht nachsehen konnte. Die *Diagnose*
-zeigt dasselbe sieben Tage lang; solange die Suche läuft, steht dort
-„OpenReply sucht gerade nach Button-Tipps, die in dieser Zeit verloren
-gegangen sind …“.
+wem OpenReply nicht mehr weitermachen konnte (Name, Kampagne, Uhrzeit des
+Tipps und warum; schau dir diese Unterhaltungen am besten selbst an und
+schick den Leuten, worum sie gebeten haben, falls sie es noch nicht haben),
+wie viele die erste DM bekommen, aber nicht getippt haben, und bei wem
+OpenReply nicht nachsehen konnte. Die *Diagnose* zeigt dasselbe sieben Tage
+lang; solange die Suche läuft, steht dort „OpenReply sucht gerade nach
+Button-Tipps, die in dieser Zeit verloren gegangen sind …“.
+
+Folgen zwei Störungen kurz aufeinander, nennt die Entwarnung beide mit
+ihren eigenen Zeiten („Schon davor kam einmal nichts an: …“). Endet die
+zweite, bevor die Suche nach der ersten lief, sucht OpenReply für beide auf
+einmal. War die Suche nach der ersten fertig, als die zweite schon lief,
+kommt ihre Entwarnung nicht (sie würde sagen, dass wieder alles ankommt):
+Was sie gefunden hat, vor allem die Leute, denen du selbst schreiben
+solltest, steht dann in der Entwarnung nach der zweiten.
 
 ## Zugangsdaten
 

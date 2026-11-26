@@ -14,7 +14,10 @@
  * all-clear (at most once per 24 hours), and every e-mail claimed on the
  * account row before it is sent, with an Idempotency-Key per person that is
  * the same for every try. An all-clear that could not go out within 24 hours,
- * or once a silence or a lost connection is open again, is dropped.
+ * or once a silence or a lost connection is open again, is dropped; one
+ * dropped for a silence that is open again is told with that silence's
+ * all-clear, with its window and what its search found
+ * (lib/instagram/messaging-silence-state.ts, earlierToReport).
  */
 
 import { prisma } from "@/lib/db/client";
@@ -268,6 +271,10 @@ export async function sendMessagingSilenceAllClear(
         username: account.username,
         since: new Date(result.since),
         endedAt: new Date(result.endedAt),
+        earlier: (result.earlier ?? []).map((silence) => ({
+          since: new Date(silence.since),
+          endedAt: new Date(silence.endedAt),
+        })),
         taps: result.taps ?? null,
       }),
     idempotencyKey: (to) =>

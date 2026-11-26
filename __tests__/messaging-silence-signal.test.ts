@@ -1,8 +1,9 @@
 /**
  * The messaging silence signal (A2) on its own: which webhook payloads count
  * as an inbound messaging event (echoes and comment changes do not, standby
- * does), the thresholds and their bounds, the judgment of one check, and the
- * two strikes.
+ * does), the thresholds and their bounds, the judgment of one check (the
+ * window and the spread rule), and the two strikes, the second judged on the
+ * first one's evidence.
  *
  * Pure functions: no database, no clock, no network.
  */
@@ -15,11 +16,14 @@ import {
   parseReadEvents,
 } from "../lib/meta/webhook";
 import {
+  INBOUND_LOOKBACK_MS,
   judgeMessagingSilence,
   MESSAGING_SILENCE_DEFAULTS,
   messagingSilenceThresholds,
   nextSilenceStep,
+  SILENCE_STRIKE_MAX_AGE_MS,
   silenceDmBounds,
+  silenceJudgedAt,
   type OpeningDm,
 } from "../lib/instagram/messaging-silence-signal";
 
@@ -171,15 +175,16 @@ describe("what counts as an inbound messaging event", () => {
 });
 
 describe("the thresholds", () => {
-  it("are 3 people, 12 hours and an 18-hour window by default", () => {
+  it("are 3 people, 12 hours and an 18-hour window, or 5 people however far apart, by default", () => {
     expect(messagingSilenceThresholds({})).toEqual({
-      thresholds: { minPeople: 3, minAgeMs: 12 * HOUR, windowMs: 18 * HOUR },
+      thresholds: { minPeople: 3, minAgeMs: 12 * HOUR, windowMs: 18 * HOUR, spreadMinPeople: 5 },
       notes: [],
     });
     expect(MESSAGING_SILENCE_DEFAULTS).toEqual({
       minPeople: 3,
       minAgeHours: 12,
       windowBeyondAgeHours: 6,
+      spreadBeyondPeople: 2,
     });
   });
 
@@ -189,17 +194,21 @@ describe("the thresholds", () => {
         MESSAGING_SILENCE_MIN_PEOPLE: "4",
         MESSAGING_SILENCE_MIN_AGE_HOURS: "13.5",
         MESSAGING_SILENCE_WINDOW_HOURS: "24",
+        MESSAGING_SILENCE_SPREAD_MIN_PEOPLE: "8",
       })
     ).toEqual({
-      thresholds: { minPeople: 4, minAgeMs: 13.5 * HOUR, windowMs: 24 * HOUR },
+      thresholds: { minPeople: 4, minAgeMs: 13.5 * HOUR, windowMs: 24 * HOUR, spreadMinPeople: 8 },
       notes: [],
     });
   });
 
-  it("keep the six hours of the window when only the age changes", () => {
+  it("keep the six hours of the window when only the age changes, and two people more for the spread when only the people change", () => {
     expect(
       messagingSilenceThresholds({ MESSAGING_SILENCE_MIN_AGE_HOURS: "20" }).thresholds.windowMs
     ).toBe(26 * HOUR);
+    expect(
+      messagingSilenceThresholds({ MESSAGING_SILENCE_MIN_PEOPLE: "4" }).thresholds.spreadMinPeople
+    ).toBe(6);
   });
 
   it("move a value outside its bounds to the nearest one and say so", () => {
@@ -207,20 +216,24 @@ describe("the thresholds", () => {
       MESSAGING_SILENCE_MIN_PEOPLE: "1",
       MESSAGING_SILENCE_MIN_AGE_HOURS: "2",
       MESSAGING_SILENCE_WINDOW_HOURS: "3",
+      MESSAGING_SILENCE_SPREAD_MIN_PEOPLE: "2",
     });
-    expect(thresholds).toEqual({ minPeople: 2, minAgeMs: 4 * HOUR, windowMs: 5 * HOUR });
+    expect(thresholds).toEqual({ minPeople: 2, minAgeMs: 4 * HOUR, windowMs: 5 * HOUR, spreadMinPeople: 3 });
     expect(notes).toEqual([
       "MESSAGING_SILENCE_MIN_PEOPLE=1 is outside 2 to 10: using 2",
       "MESSAGING_SILENCE_MIN_AGE_HOURS=2 is outside 4 to 36: using 4",
       "MESSAGING_SILENCE_WINDOW_HOURS=3 is outside 5 to 52: using 5",
+      // Always more people than the window's.
+      "MESSAGING_SILENCE_SPREAD_MIN_PEOPLE=2 is outside 3 to 22: using 3",
     ]);
     expect(
       messagingSilenceThresholds({
         MESSAGING_SILENCE_MIN_PEOPLE: "50",
         MESSAGING_SILENCE_MIN_AGE_HOURS: "100",
         MESSAGING_SILENCE_WINDOW_HOURS: "1000",
+        MESSAGING_SILENCE_SPREAD_MIN_PEOPLE: "1000",
       }).thresholds
-    ).toEqual({ minPeople: 10, minAgeMs: 36 * HOUR, windowMs: 84 * HOUR });
+    ).toEqual({ minPeople: 10, minAgeMs: 36 * HOUR, windowMs: 84 * HOUR, spreadMinPeople: 30 });
   });
 
   it("fall back to the default for anything that is not a number", () => {
@@ -228,11 +241,13 @@ describe("the thresholds", () => {
       MESSAGING_SILENCE_MIN_PEOPLE: "drei",
       MESSAGING_SILENCE_MIN_AGE_HOURS: "12h",
       MESSAGING_SILENCE_WINDOW_HOURS: " ",
+      MESSAGING_SILENCE_SPREAD_MIN_PEOPLE: "5.5",
     });
-    expect(thresholds).toEqual({ minPeople: 3, minAgeMs: 12 * HOUR, windowMs: 18 * HOUR });
+    expect(thresholds).toEqual({ minPeople: 3, minAgeMs: 12 * HOUR, windowMs: 18 * HOUR, spreadMinPeople: 5 });
     expect(notes).toEqual([
       "MESSAGING_SILENCE_MIN_PEOPLE=drei is not a whole number: using 3",
       "MESSAGING_SILENCE_MIN_AGE_HOURS=12h is not a number: using 12",
+      "MESSAGING_SILENCE_SPREAD_MIN_PEOPLE=5.5 is not a whole number: using 5",
     ]);
     expect(messagingSilenceThresholds({ MESSAGING_SILENCE_MIN_PEOPLE: "3.5" }).notes).toEqual([
       "MESSAGING_SILENCE_MIN_PEOPLE=3.5 is not a whole number: using 3",
@@ -256,7 +271,7 @@ describe("one check's judgment", () => {
       dms,
       lastInboundAt,
       bounds: silenceDmBounds(Date.parse(now), thresholds, notBefore),
-      minPeople: thresholds.minPeople,
+      thresholds,
     });
   }
 
@@ -264,6 +279,7 @@ describe("one check's judgment", () => {
     expect(judge("2026-11-26T08:51:35Z")).toEqual({ silent: false, people: 2 });
     expect(judge("2026-11-26T08:51:36Z")).toEqual({
       silent: true,
+      rule: "window",
       people: 3,
       firstDmAt: at("2026-11-25T20:49:23Z"),
     });
@@ -297,12 +313,49 @@ describe("one check's judgment", () => {
   it("needs no inbound event at all to be silent", () => {
     expect(judge("2026-11-26T09:00:00Z", DMS, null).silent).toBe(true);
   });
+
+  // One opening DM to a new person every 190 minutes, as on a quiet day: never
+  // three of them within the six hours of the window.
+  const SPREAD: OpeningDm[] = Array.from({ length: 6 }, (_, n) => ({
+    recipientId: `s${n}`,
+    sentAt: new Date(Date.parse("2026-11-24T08:00:00Z") + n * 190 * MINUTE),
+  }));
+  const FIFTH_DM = Date.parse("2026-11-24T08:00:00Z") + 4 * 190 * MINUTE;
+  const before = at("2026-11-24T07:00:00Z");
+
+  it("is silent by the spread rule once five people's opening DMs are 12 hours old, however far apart", () => {
+    const now = (ms: number) => new Date(ms).toISOString();
+    expect(judge(now(FIFTH_DM + 12 * HOUR - 1_000), SPREAD, before)).toEqual({ silent: false, people: 1 });
+    expect(judge(now(FIFTH_DM + 12 * HOUR), SPREAD, before)).toEqual({
+      silent: true,
+      rule: "spread",
+      people: 5,
+      firstDmAt: SPREAD[0].sentAt,
+    });
+    // Anything that arrived after the first of them leaves too few.
+    expect(judge(now(FIFTH_DM + 12 * HOUR), SPREAD, at("2026-11-24T08:30:00Z")).silent).toBe(false);
+    // And none before the end of the last lost connection counts.
+    expect(judge(now(FIFTH_DM + 12 * HOUR), SPREAD, before, at("2026-11-24T08:30:00Z")).silent).toBe(false);
+  });
+
+  it("reaches back as far as the inbound events are read, and no further", () => {
+    const bounds = silenceDmBounds(Date.parse("2026-11-26T09:00:00Z"), thresholds);
+    expect(bounds).toEqual({
+      after: at("2026-11-25T15:00:00Z"),
+      spreadAfter: new Date(Date.parse("2026-11-26T09:00:00Z") - INBOUND_LOOKBACK_MS),
+      until: at("2026-11-25T21:00:00Z"),
+    });
+    // Judged at an earlier first check: its window and age, today's look-back.
+    expect(
+      silenceDmBounds(Date.parse("2026-11-26T08:30:00Z"), thresholds, null, Date.parse("2026-11-26T09:00:00Z"))
+    ).toEqual({ ...bounds, after: at("2026-11-25T14:30:00Z"), until: at("2026-11-25T20:30:00Z") });
+  });
 });
 
 describe("the two strikes", () => {
   const GAP = 27 * MINUTE;
   const NOW = Date.parse("2026-11-26T09:30:00Z");
-  const silent = { silent: true as const, people: 3, firstDmAt: new Date(NOW - 13 * HOUR) };
+  const silent = { silent: true as const, rule: "window" as const, people: 3, firstDmAt: new Date(NOW - 13 * HOUR) };
   const quiet = { silent: false as const, people: 1 };
   const none = { messagingSilenceCheckAt: null, messagingSilentSince: null };
 
@@ -330,5 +383,51 @@ describe("the two strikes", () => {
     const open = { messagingSilenceCheckAt: new Date(NOW - 2 * HOUR), messagingSilentSince: new Date(NOW - 20 * HOUR) };
     expect(nextSilenceStep(open, quiet, NOW, GAP)).toEqual({ kind: "still-silent" });
     expect(nextSilenceStep(open, silent, NOW, GAP)).toEqual({ kind: "still-silent" });
+  });
+
+  it("judge the second check at the first one's time, so DMs growing too old meanwhile undo nothing", () => {
+    const { thresholds } = messagingSilenceThresholds({});
+    const first = new Date("2026-11-26T09:00:00Z");
+    // Three people's DMs that count together only from 08:51:36 to 09:30.
+    const dms: OpeningDm[] = [
+      { recipientId: "p1", sentAt: new Date("2026-11-25T15:30:00Z") },
+      { recipientId: "p2", sentAt: new Date("2026-11-25T18:00:00Z") },
+      { recipientId: "p3", sentAt: new Date("2026-11-25T20:51:36Z") },
+    ];
+    const judgeAt = (strike: Date | null, now: number, lastInboundAt: Date | null = null) => {
+      const judged = silenceJudgedAt(strike, now, null);
+      const judgment = judgeMessagingSilence({
+        dms,
+        lastInboundAt,
+        bounds: silenceDmBounds(judged.at, thresholds, null, now),
+        thresholds,
+      });
+      return nextSilenceStep({ messagingSilenceCheckAt: strike, messagingSilentSince: null }, judgment, now, GAP, judged.strike);
+    };
+    expect(judgeAt(null, first.getTime())).toEqual({ kind: "strike" });
+    // Judged at its own time, the second check would forget the first.
+    const second = Date.parse("2026-11-26T09:30:00Z");
+    expect(judgeAt(null, second)).toEqual({ kind: "none" });
+    // On the first one's evidence it opens the incident, also hours later.
+    expect(silenceJudgedAt(first, second, null)).toEqual({ at: first.getTime(), strike: first });
+    expect(judgeAt(first, second)).toEqual({ kind: "open" });
+    expect(judgeAt(first, Date.parse("2026-11-26T15:00:00Z"))).toEqual({ kind: "open" });
+    // Only an event that arrived since undoes it.
+    expect(judgeAt(first, second, new Date("2026-11-26T09:10:00Z"))).toEqual({ kind: "clear-strike" });
+  });
+
+  it("start over when the first check no longer counts: from before the last lost connection ended, or a day old", () => {
+    const first = new Date(NOW - 30 * MINUTE);
+    expect(silenceJudgedAt(first, NOW, new Date(NOW - 40 * MINUTE))).toEqual({ at: first.getTime(), strike: first });
+    expect(silenceJudgedAt(first, NOW, new Date(NOW - 10 * MINUTE))).toEqual({ at: NOW, strike: null });
+    expect(silenceJudgedAt(first, first.getTime() + SILENCE_STRIKE_MAX_AGE_MS, null).strike).toEqual(first);
+    expect(silenceJudgedAt(first, first.getTime() + SILENCE_STRIKE_MAX_AGE_MS + 1, null)).toEqual({
+      at: first.getTime() + SILENCE_STRIKE_MAX_AGE_MS + 1,
+      strike: null,
+    });
+    // A first check that no longer counts is replaced by a silent one, or forgotten.
+    const stored = { messagingSilenceCheckAt: new Date(NOW - 2 * SILENCE_STRIKE_MAX_AGE_MS), messagingSilentSince: null };
+    expect(nextSilenceStep(stored, silent, NOW, GAP, null)).toEqual({ kind: "strike" });
+    expect(nextSilenceStep(stored, quiet, NOW, GAP, null)).toEqual({ kind: "clear-strike" });
   });
 });

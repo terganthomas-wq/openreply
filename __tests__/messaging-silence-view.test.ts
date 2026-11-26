@@ -99,6 +99,7 @@ describe("an account row", () => {
         username: "recent",
         since: SILENCE.since,
         endedAt: result.endedAt,
+        earlier: [],
         searching: false,
         taps: null,
       },

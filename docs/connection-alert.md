@@ -80,8 +80,10 @@ UTC). Plain text and simple HTML, no tracking, no secrets.
 The worker sends it through Resend's HTTP API (`RESEND_API_KEY`,
 `EMAIL_FROM`), or through SMTP when `EMAIL_SERVER` is set, as the sign-in
 e-mails do. Without those settings it records one WARNING per start in
-Diagnostics and sends nothing; the alert then goes out with the first check
-after the settings were added and the worker restarted.
+Diagnostics ("Warning e-mails about Instagram problems cannot go out", for
+whichever e-mail about Instagram meets it first: this one or one about
+missing button taps, below) and sends nothing; the alert then goes out with
+the first check after the settings were added and the worker restarted.
 
 Each e-mail is claimed on the account row before it is sent, so two checks at
 once send it once. When Resend does not answer (a timeout, 429, 5xx) the claim
@@ -239,14 +241,29 @@ app, the worker reads:
   one place, `inboundMessagingAccountIds` in `lib/meta/webhook.ts`, which the
   webhook route uses too.
 
-A check is silent when at least 3 different people got an opening DM that
-went out at least 12 and at most 18 hours ago, after the end of the
-account's last A1 incident, and no inbound messaging event arrived since the
-first of these DMs. Two silent checks in a row, at least one sweep interval
-apart (A1's gap, a tenth early at most five minutes), open an incident; its
-start (`messagingSilentSince`) is the last inbound messaging event before the
-silence, or the first unanswered opening DM when none arrived in the last 7
-days.
+A check is silent when no inbound messaging event arrived since the first of
+enough opening DMs, each at least 12 hours old and sent after the end of the
+account's last A1 incident. Enough is either rule:
+
+- the window: 3 different people whose DMs went out at most 18 hours ago,
+  close together;
+- the spread: 5 different people since the last inbound event, however far
+  apart. Outside bursts the production account sends about six opening DMs a
+  day, which rarely puts three people into one window: without this rule a
+  silence on such traffic would be noticed only after days, or never.
+
+Two silent checks in a row, at least one sweep interval apart (A1's gap, a
+tenth early at most five minutes), open an incident. The second is judged on
+the first one's evidence: the opening DMs as they counted at the first check,
+with every inbound event that arrived up to now. Only an event that arrived
+(at the webhook route or found by the check) forgets the first check, and so
+does a lost connection that ended after it; DMs that grow too old to count
+meanwhile do not, or three DMs that count together for half an hour would
+strike and be forgotten again with every sweep. A first check older than 24
+hours (the checks in between could not judge: see below) no longer counts,
+and the check starts over. The incident's start (`messagingSilentSince`) is
+the last inbound messaging event before the silence, or the first unanswered
+opening DM when none arrived in the last 7 days.
 
 No judgment (the check changes nothing) while the account's connection is
 lost (an A1 incident: no webhook arrives at all then) or in doubt (A1's
@@ -280,16 +297,33 @@ The thresholds come from replaying the production timeline of 2026-11-20 to
   have made one from 07:35 on, 18 minutes after it, and with 2 people instead
   of 3 it would have been a false alarm from 06:09 on. 4 people would not
   have fired before the fix: the fourth opening DM of the silence went out at
-  04:51.
+  04:51. All five of that night's people would have made a spread check from
+  10:17 on, three hours after the receipt.
+- The spread rule adds no false alarm: with one person's events taken out of
+  the timeline (one of 21 choices gives a false alarm), two people's (20 of
+  210) or every event up to two hours later (the first false incident at 124
+  minutes), the results are the same with it as without it.
+- A silence on thin traffic: replayed for a silence starting every two hours
+  from 2026-11-20 to 25 (every messaging event after its start dropped), the
+  worst minute of the sweep reported it after more than 36 hours for 29 of
+  the 67 starts while the second check was judged at its own time; judged on
+  the first one's evidence for 20, and with the spread rule for 19 (16 with
+  4 people). A silence from 2026-11-22 00:00 UTC is reported on the 24th
+  between 03:31 and 04:00 instead of on the 25th between 09:20 and 09:49.
+  Reporting within about 12 hours needs three people's DMs close together;
+  on thin days it takes longer (27 hours for the median start of the
+  replay), as no rule can tell a silence from people who simply have not
+  read their DMs yet without false alarms.
 
 A false alarm is worse than a few hours' delay, so the defaults stay
 conservative. They can be set in the worker's environment:
 
 | Variable | Meaning | Default | Allowed |
 | --- | --- | --- | --- |
-| `MESSAGING_SILENCE_MIN_PEOPLE` | Different people with an unanswered opening DM | 3 | 2 to 10, a whole number |
+| `MESSAGING_SILENCE_MIN_PEOPLE` | Different people with an unanswered opening DM, in the window | 3 | 2 to 10, a whole number |
 | `MESSAGING_SILENCE_MIN_AGE_HOURS` | How old each of those DMs is, at least | 12 | 4 to 36 |
 | `MESSAGING_SILENCE_WINDOW_HOURS` | How old they are, at most | the minimum age plus 6 (18) | the minimum age plus 1 to plus 48 |
+| `MESSAGING_SILENCE_SPREAD_MIN_PEOPLE` | Different people with an unanswered opening DM since the last inbound event, however far apart | the people plus 2 (5) | the people plus 1 to plus 20, a whole number |
 
 A value outside its range is moved to the nearest bound, anything that is
 not a number falls back to the default, and the worker records a WARNING
@@ -306,7 +340,7 @@ additive, NULL for existing rows):
 | --- | --- |
 | `messagingSilenceCheckAt` | The first silent check of the current run. |
 | `messagingSilentSince` | Open incident: since when nothing arrived. |
-| `messagingSilenceResult` | The last silence that ended: `since`, `endedAt`, `via` (`webhook` or `check`), and `taps`, what the search for lost taps found, once it has finished. |
+| `messagingSilenceResult` | The last silence that ended: `since`, `endedAt`, `via` (`webhook` or `check`), `earlier` (silences reported with it, see the end), `carried` (what an earlier silence's search found, until this one's has finished) and `taps`, what the search for lost taps found, once it has finished. |
 | `messagingAlertSentAt` | When the last warning e-mail about a silence went out, for any silence of the account. |
 | `messagingAlertRearmedAt` | When such a warning went out inside the 24 hours of the last one, after an all-clear. |
 | `messagingAlertCount` | E-mails for the open silence: 1 after the alert, 2 after the reminder. |
@@ -333,11 +367,23 @@ The end is one conditional update that also keeps the silence as
 `messagingSilenceResult` and owes the search for the taps lost in it:
 `messagingTapSearchFrom` is its start (or the start of an earlier silence
 whose search is still owed, like A1's `connectionCatchUpFrom`) and
-`messagingTapSearchUntil` its end. An all-clear of an earlier silence that is
-still owed is dropped: it would only tell old news now. Whoever ended the
-silence asks the worker for the search at once, as the queue job
-`losttaps_<account>_<from>_<until>`; the worker's sweep asks again for a
-search that is owed but neither running nor queued for later.
+`messagingTapSearchUntil` its end. Whoever ended the silence asks the worker
+for the search at once, as the queue job `losttaps_<account>_<from>_<until>`;
+the worker's sweep asks again for a search that is owed but neither running
+nor queued for later.
+
+Two silences close together are reported together, each with its own time
+(`earlier`), never as one span over the hours in between, when taps arrived:
+
+- One more silence that ends while the search of the one before is still
+  owed is searched with it; the result names both, and the all-clear's
+  numbers are "during those times".
+- A search that finished while the next silence was already open got no
+  all-clear (it would have said that taps arrive again) and left Diagnostics
+  when that silence began. Its window and what it found (above all the
+  people to write to) are carried into the next silence's result, if it
+  ended within the 7 days Diagnostics shows a silence and no all-clear about
+  it went out, and its next search takes them into its own result.
 
 ### The search for lost taps
 
@@ -351,26 +397,52 @@ search that is owed but neither running nor queued for later.
   since their opening DM (`lib/instagram/lost-tap-records.ts`: a
   `reveal:<person>` or `dm:<mid>` row written after it, or a stored webhook
   with their tap on one of the campaign's buttons). Whoever tapped again
-  after the silence was answered the ordinary way. The newest opening DMs
-  first, at most 50 people; the others count as not checked.
+  after the silence was answered the ordinary way. Also, the same way,
+  whoever got an opening DM in the 24 hours before the silence: a tap of
+  theirs in the silence got lost too (people do tap the next day: of the
+  first taps on an opening DM from 2026-11-20 to 25, two came 15 and 25 hours
+  after it; on 2026-11-24 four people got one in the evening and had done
+  nothing yet when the silence began). They count only with such a tap: the
+  all-clear's numbers are about the people of the silence. The newest
+  opening DMs first, at most 50 people; the others of the silence count as
+  not checked.
 - Their conversations: the account's conversation list
   (`/{ig-id}/conversations?platform=instagram&fields=id,updated_time,participants`),
   newest first, 50 per page, each matched by participant id, until everybody
-  is found or a page reaches back before the oldest opening DM still wanted
-  (a conversation with a tap would have moved up); at most 10 pages. Whoever
-  is not found had no conversation that changed after the opening DM: no tap.
+  is found or a page reaches back before the oldest opening DM still wanted,
+  or the silence's start for a DM from before it (a conversation with a lost
+  tap would have moved up); at most 10 pages. Whoever is not found had no
+  conversation that changed after that: no tap.
   A page Meta refuses with code 1 (one entry that cannot be read with its
   participants, docs/conversation-recovery.md) is halved until that entry is
   alone and then stepped over; a person not found after that counts as not
-  checked. A conversation that did not change after the person's opening DM
-  is not read; every other one is read once (its 20 newest messages).
+  checked. A conversation that did not change after that is not read; every
+  other one is read once (its 20 newest messages).
 - A lost tap is a message from the person (no one else's, never the
   account's own) whose text is the title of one of the campaign's buttons (the
   opening DM's, the follow prompt's or the second follow request's, as the
   worker sends them, 20 characters at most) and that is newer than the
-  person's opening DM of that campaign. Of several, the newest. (A tap shows
-  up in the Conversations API as such a message, verified on 2026-11-26.)
-- It is continued with exactly the postback job the tap would have
+  person's opening DM of that campaign and than the silence's start. (A tap
+  shows up in the Conversations API as such a message, verified on
+  2026-11-26.) The resource campaigns all say "Ja, schick ihn mir", so one
+  text may be a tap on several campaigns' buttons: the taps go to distinct
+  campaigns, the newest first, each to the campaign with the latest opening
+  DM before it that has none yet (two taps after two such DMs are one for
+  each; of several on one campaign, the newest counts). A campaign a tap may
+  have been for but that got none is listed as unclear, never continued.
+- A tap after which someone else wrote to the person is listed, never
+  continued: the owner may have answered by hand, in Instagram or in
+  OpenReply's inbox, maybe with the link (the alert invites that). Someone
+  else is any message not from the person, newer than the tap, that none of
+  OpenReply's own DMs to them explains, as the database records them
+  (`ownSendsTo`): every DmLog row of the person (another campaign's opening
+  DM, say) and their offers (the offer messages, the confirmations and the
+  card, the reminder, the message after a sign-up), each message within two
+  minutes of a record and no record for more messages than it sent. What is
+  not recorded (a follow prompt, the note before a follow re-check, the
+  follow-up after a link) counts as someone else's: the tap is listed rather
+  than answered once more.
+- Every other lost tap is continued with exactly the postback job the tap would have
   produced: `payload` rebuilt (`followcheck:<campaign>:open` or
   `reveal:<campaign>:open`, `followcheck:<campaign>` and
   `followcheck:<campaign>:retry` for the follow prompts), `mid` the message's
@@ -384,11 +456,21 @@ search that is owed but neither running nor queued for later.
 - Exactly once: the job takes the tap's own claim, keyed on its `mid`, so
   the same tap delivered late by its webhook gets one link. Before it does
   anything, it stands back if, since the tap, the campaign's link went out to
-  the person, may have or waits for a pause, the campaign answered a DM
-  keyword of theirs, or another tap of theirs on the campaign's buttons
-  arrived: then that answer stands, and nobody gets the link twice. Its
-  copies for an R1 pause and its follow re-checks go on with the same tap.
-  The window, the follow-up and a late offer count from the tap.
+  the person or may have, the campaign answered a DM keyword of theirs, or
+  another tap of theirs on the campaign's buttons arrived: then that answer
+  stands, and nobody gets the link twice. A link that waits for an R1 pause
+  (`PENDING`) is no reason: it may be the job's own first attempt, whose copy
+  never reached the queue, and nothing would answer the tap then; another
+  tap's waiting link came with a stored webhook, and its copy stands back on
+  the link this job sends. Its copies for an R1 pause and its follow
+  re-checks go on with the same tap, and keep their pace: a copy runs in the
+  lost taps' next free slot after the pause (the slot after the pause's end
+  only when the paced one would come too late for the tap's window), so the
+  taps planned 2.5 minutes apart do not all run in the minute after it.
+  Should a copy not reach the queue, the link's row is set back to `FAILED`
+  before the job fails, so its retry starts over and nothing stands back on
+  a wait that nothing ends. The window, the follow-up and a late offer count
+  from the tap.
 - Meta's limits, as A1's catch-up: nothing is read while the account is
   paused; a pause, a request limit on a read, Meta reporting 60 % of a limit,
   three conversation reads in a row refused for the account, or a worker
@@ -403,7 +485,8 @@ search that is owed but neither running nor queued for later.
   `messagingTapSearchFrom` back to null with the result. A second run stands
   back and looks again when the lease would run out; a run that died is taken
   over after 10 minutes, and a tap found again is the same job. One more
-  silence that ends while the search is owed is searched with it.
+  silence that ends while the search is owed is searched with it (see the
+  end, above).
 
 On the production silence of 2026-11-25/26 (the calibration timeline,
 `__tests__/lost-tap-search.test.ts`): five people got an opening DM in it,
@@ -412,7 +495,10 @@ the link a second later and is left alone. The other four are found with one
 page of the list, and only the conversations that changed after the opening
 DM are read: five reads at most. Every tap of that silence came after 20:49,
 so each still had more than ten hours of its 24 when the silence ended, and
-each would have been continued.
+each would have been continued. The four people who got an opening DM in the
+evening before (18:08 to 22:17 UTC) and had not reacted when the silence
+began are looked at too; a conversation of theirs that did not change after
+13:15 costs no read.
 
 ### The e-mails and the dashboard
 
@@ -432,12 +518,17 @@ default for Instagram under "Conversation routing" in the Business Suite) and
 the fix with the link to `{NEXTAUTH_URL}/settings`.
 
 The all-clear ("Instagram passes button taps on to OpenReply again") goes
-out when the search for lost taps has finished: how long the silence lasted,
-how many lost taps go on now, the people it was too late for or whose
-campaign is paused (name, campaign and time of the tap; the owner is asked to
-write to them in Instagram), how many got the opening DM without tapping,
-and how many could not be looked at. It is dropped when it could not go out
-within 24 hours, or once a silence or a lost connection is open again.
+out when the search for lost taps has finished: how long the silence lasted
+(and an earlier one reported with it, by its own time), how many lost taps
+go on now, the people it could not continue for (name, campaign and time of
+the tap, and why: too late, the campaign paused, someone wrote to them after
+the tap, or the tap may have been another campaign's), in a list that says
+by itself who these people are, with the advice to look at the conversation
+and send them what they asked for (for one person in the singular), how
+many got the opening DM without tapping, and how many could not be looked
+at. It is dropped when it could not go out within 24 hours, or once a
+silence or a lost connection is open again; one dropped for a new silence
+is told with that silence's all-clear.
 
 - A banner above every dashboard page, "Instagram is not passing on button
   taps", with since when, what it means, the causes and "Reconnect" (members

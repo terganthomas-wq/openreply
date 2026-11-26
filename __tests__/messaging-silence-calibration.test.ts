@@ -22,7 +22,14 @@
  *   and admins get one alert, the first tap after the fix (10:30:57) ends it
  *   at the webhook route and asks for the search for the taps lost in it,
  *   whose end the all-clear waits for (lost-tap-search.test.ts runs that
- *   search on this silence).
+ *   search on this silence);
+ * - a silence on the thin traffic of the days before (every messaging event
+ *   from 2026-11-22 00:00 UTC on dropped) is reported on 2026-11-24 between
+ *   03:31 and 04:00 UTC, by the spread rule: five people got an opening DM
+ *   after the last event, the fifth at 15:00 the day before. Without it, and
+ *   with a second check judged at its own time, which forgot the first one
+ *   twice as its DMs grew too old, the incident opened only on 2026-11-25
+ *   between 09:20 and 09:49 (81.8 hours after the start).
  */
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -151,7 +158,10 @@ interface Replay {
   duringLostConnection: Set<string>;
 }
 
-async function replay(phaseMinutes: number): Promise<Replay> {
+async function replay(
+  phaseMinutes: number,
+  { dropMessagingFrom = Infinity }: { dropMessagingFrom?: number } = {}
+): Promise<Replay> {
   state.redis = new FakeRedis();
   state.db = new FakeConnectionDb();
   state.jobs = [];
@@ -184,10 +194,10 @@ async function replay(phaseMinutes: number): Promise<Replay> {
       dmSentAt: new Date(iso),
     });
   });
-  const arrivals = timeline.inbound.map((event, n) => ({
-    at: Date.parse(event[0]),
-    payload: webhook(event, n),
-  }));
+  const arrivals = timeline.inbound
+    .map((event, n) => ({ at: Date.parse(event[0]), kind: event[1], payload: webhook(event, n) }))
+    // A silence of our own making: no button tap, DM or read receipt after it began.
+    .filter((event) => event.at < dropMessagingFrom || event.kind === "change:comments" || event.kind === "echo");
 
   const mails: Replay["mails"] = [];
   let now = START;
@@ -324,5 +334,24 @@ describe("the defaults on the production timeline of 2026-11-20 to 26", () => {
     expect(iso(Math.max(...strikes))).toBe("2026-11-26T09:21:00.000Z");
     expect(iso(Math.min(...opened))).toBe("2026-11-26T09:22:00.000Z");
     expect(iso(Math.max(...opened))).toBe("2026-11-26T09:51:00.000Z");
+  });
+
+  it("report a silence on the thin traffic of 2026-11-22 to 24 within about two days, by the spread rule", async () => {
+    const from = Date.parse("2026-11-22T00:00:00Z");
+    const opened: number[] = [];
+    for (let phase = 0; phase < 30; phase += 1) {
+      const run = await replay(phase, { dropMessagingFrom: from });
+      expect(run.firstStrike!, `phase ${phase}`).toBeGreaterThan(from);
+      expect(run.opened, `phase ${phase}`).not.toBeNull();
+      // Since the last event before it: a read receipt at 22:23 on the 21st.
+      expect(run.since?.toISOString(), `phase ${phase}`).toBe("2026-11-21T22:23:15.000Z");
+      expect(
+        state.db.events.find((event) => event.payload?.kind === "messaging-silent")?.payload,
+        `phase ${phase}`
+      ).toMatchObject({ rule: "spread", people: 5 });
+      opened.push(run.opened!);
+    }
+    expect(iso(Math.min(...opened))).toBe("2026-11-24T03:31:00.000Z");
+    expect(iso(Math.max(...opened))).toBe("2026-11-24T04:00:00.000Z");
   });
 });

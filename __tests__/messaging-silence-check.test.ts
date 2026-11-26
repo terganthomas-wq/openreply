@@ -359,6 +359,118 @@ describe("no judgment", () => {
   });
 });
 
+describe("a silence on thin traffic", () => {
+  // Sweeps every 30 minutes from `from`, offset by `phase` minutes, until the
+  // incident opens or `until`: when it opened, or null.
+  async function sweep(from: number, until: number, phase: number) {
+    for (let now = from + phase * MINUTE; now <= until; now += INTERVAL) {
+      const { outcomes } = await check(now);
+      expect(outcomes.error, new Date(now).toISOString()).toBeUndefined();
+      if (outcomes.opened) return now;
+    }
+    return null;
+  }
+  function reset(phaseSetup: () => void) {
+    state.db.dmLogs.length = 0;
+    state.db.webhookEvents.length = 0;
+    Object.assign(account(), { messagingSilenceCheckAt: null, messagingSilentSince: null, messagingAlertCount: 0, messagingAlertSentAt: null });
+    phaseSetup();
+  }
+
+  it("is reported when one person after the other gets an opening DM every 165 to 170 minutes and nothing comes back", async () => {
+    const start = Date.parse("2026-11-20T00:00:00Z");
+    for (const spacing of [165, 170]) {
+      for (const phase of [0, 7, 13, 21, 29]) {
+        reset(() => {
+          inbound(new Date(start - HOUR), "read", "p0");
+          for (let n = 0; n * spacing * MINUTE <= 48 * HOUR; n += 1) {
+            openingDm(`p${n + 1}`, new Date(start + n * spacing * MINUTE).toISOString());
+          }
+        });
+        // Three of them count together for half an hour (every 165 minutes)
+        // or 20 minutes (every 170): the first sweep that falls into such a
+        // stretch is the first silent check, and the second, judged on its
+        // DMs, opens the incident. Before, the second forgot the first every
+        // time, and the incident never opened.
+        const opened = await sweep(start, start + 119 * HOUR, phase);
+        expect(opened, `every ${spacing} minutes, phase ${phase}`).not.toBeNull();
+        expect(opened! - start, `every ${spacing} minutes, phase ${phase}`).toBeLessThanOrEqual(
+          spacing === 165 ? 18.5 * HOUR : 24.5 * HOUR
+        );
+        expect(account().messagingSilentSince).toEqual(new Date(start - HOUR));
+      }
+    }
+  });
+
+  it("is reported by the spread rule when no three DMs ever count together", async () => {
+    const start = Date.parse("2026-11-20T00:00:00Z");
+    reset(() => {
+      inbound(new Date(start - HOUR), "read", "p0");
+      // Every 190 minutes: the window never holds three of them.
+      for (let n = 0; n < 6; n += 1) openingDm(`p${n + 1}`, new Date(start + n * 190 * MINUTE).toISOString());
+    });
+    const opened = await sweep(start, start + 72 * HOUR, 0);
+    // The fifth DM (at 12:40) is 12 hours old at 00:40 the next day: the first
+    // silent check at 01:00, the incident at 01:30.
+    expect(new Date(opened!).toISOString()).toBe("2026-11-21T01:30:00.000Z");
+    expect(events("messaging-silent")[0].payload).toMatchObject({ rule: "spread", people: 5 });
+  });
+
+  it("is reported when three people's DMs count together for a quarter of an hour, if a sweep falls into it", async () => {
+    const day = Date.parse("2026-11-23T00:00:00Z");
+    const opened: number[] = [];
+    for (let phase = 0; phase < 30; phase += 1) {
+      reset(() => {
+        inbound(new Date(day + 8 * HOUR), "read", "p0");
+        openingDm("p1", "2026-11-23T09:00:00Z");
+        openingDm("p2", "2026-11-23T12:00:00Z");
+        openingDm("p3", "2026-11-23T14:45:00Z");
+      });
+      const at = await sweep(day + 9 * HOUR, day + 72 * HOUR, phase);
+      // Together only from 02:45 to 03:00 the next morning.
+      if (phase >= 15) {
+        expect(new Date(at!).toISOString(), `phase ${phase}`).toBe(
+          new Date(day + 27 * HOUR + phase * MINUTE).toISOString()
+        );
+        opened.push(phase);
+      } else {
+        expect(at, `phase ${phase}`).toBeNull();
+      }
+    }
+    expect(opened).toHaveLength(15);
+  });
+
+  it("is judged on the first check's evidence after hours without a judgment, until it is a day old", async () => {
+    await check(FIRST_CHECK);
+    expect(account().messagingSilenceCheckAt).toEqual(new Date(FIRST_CHECK));
+    // No active campaign for 20 hours: no judgment, the first check stays.
+    state.db.campaigns[0].isActive = false;
+    expect((await check(FIRST_CHECK + 20 * HOUR)).outcomes).toEqual({ "no-campaign": 1 });
+    state.db.campaigns[0].isActive = true;
+    // The DMs it was made on are 32 hours old by now, and nothing came back.
+    expect((await check(FIRST_CHECK + 20 * HOUR + INTERVAL)).outcomes).toEqual({ opened: 1 });
+    expect(account().messagingSilentSince).toEqual(LAST_INBOUND);
+  });
+
+  it("starts over with a first check older than a day, or one from before the lost connection was back", async () => {
+    await check(FIRST_CHECK);
+    state.db.campaigns[0].isActive = false;
+    await check(FIRST_CHECK + 24 * HOUR);
+    state.db.campaigns[0].isActive = true;
+    // A day and more: forgotten, and this check is a first one again; its
+    // own DMs are too old, so nothing waits.
+    expect((await check(FIRST_CHECK + 24 * HOUR + INTERVAL)).outcomes).toEqual({ quiet: 1 });
+    expect(account().messagingSilenceCheckAt).toBeNull();
+
+    // A lost connection that ended after the first check (A1) voids it too.
+    await check(FIRST_CHECK);
+    expect(account().messagingSilenceCheckAt).toEqual(new Date(FIRST_CHECK));
+    Object.assign(account(), { connectionRecoveredAt: new Date(FIRST_CHECK + 10 * MINUTE) });
+    expect((await check(SECOND_CHECK)).outcomes).toEqual({ quiet: 1 });
+    expect(account()).toMatchObject({ messagingSilenceCheckAt: null, messagingSilentSince: null });
+  });
+});
+
 describe("what counts", () => {
   it("echoes and comment changes are no answer, an event in standby is", async () => {
     inbound(at("2026-11-26T06:00:00Z"), "echo", "p1");
@@ -678,6 +790,10 @@ describe("the e-mails, by A1's rules", () => {
     await check(SECOND_CHECK, { transport: null });
     await check(SECOND_CHECK + INTERVAL, { transport: null });
     expect(events("mail-unconfigured")).toHaveLength(1);
+    // It names what this e-mail is about too, not only a lost connection.
+    expect(events("mail-unconfigured")[0].message).toBe(
+      "No warning e-mail about Instagram (a lost connection or missing button taps) can go out: the worker has no e-mail settings (RESEND_API_KEY and EMAIL_FROM, or EMAIL_SERVER and EMAIL_FROM, in its .env)"
+    );
     expect(account()).toMatchObject({ messagingSilentSince: LAST_INBOUND, messagingAlertCount: 0 });
     await check(SECOND_CHECK + 2 * INTERVAL);
     expect(sent).toHaveLength(2);

@@ -28,7 +28,7 @@ import {
   pauseWaitMessage,
   requeueForPause,
 } from "./account-pause";
-import { recoveryPaceKey, reservePacedSlot } from "./send-pacing";
+import { lostTapPaceKey, recoveryPaceKey, reservePacedSlot } from "./send-pacing";
 import { afterLinkDelivered } from "./after-delivery";
 import {
   claimPostbackDelivery,
@@ -61,6 +61,7 @@ import {
 } from "@/lib/instagram/connection-catch-up";
 import { classifyConnectionError } from "@/lib/instagram/connection-check";
 import { lostTapAnswered } from "@/lib/instagram/lost-tap-records";
+import { LOST_TAP_SPACING_MS } from "@/lib/instagram/lost-tap-state";
 import { runLostTapSearch } from "@/lib/instagram/lost-tap-search";
 import { recentAccountUsagePercent } from "@/lib/meta/usage";
 import { createHash } from "node:crypto";
@@ -485,6 +486,32 @@ function latestTime(
 type ConversationHold = "held" | "window-closed" | "capped";
 
 /**
+ * When a copy of a conversation job that may not run before `earliest` runs
+ * in a pace of its own (a tap the search after a messaging silence
+ * continued: lib/instagram/lost-tap-search.ts): the pace's next free slot
+ * after it (lib/queue/send-pacing.ts), so the copies of taps that were
+ * planned one LOST_TAP_SPACING_MS apart do not all run in the minute after an
+ * R1 pause, the burst that runs into Meta's limit again. The slot only while
+ * Instagram's window from `windowFrom` still allows it: lined up behind the
+ * taps still planned, an older tap may come too late there, and then it runs
+ * at `earliest` after all, as every other copy does. Should Redis not answer,
+ * `earliest` too.
+ */
+async function pacedRunAt(
+  pace: { key: string; spacingMs: number },
+  earliest: number,
+  windowFrom: number | null
+): Promise<number> {
+  try {
+    const slot = await reservePacedSlot(pace.key, { earliest, spacingMs: pace.spacingMs });
+    return withinWindow(windowFrom, slot) ? slot : earliest;
+  } catch (error) {
+    console.error("[DM Worker] Could not take a slot of the lost taps' pace:", formatError(error));
+    return earliest;
+  }
+}
+
+/**
  * Put a conversation job (a button tap, the reply to a DM, a follow-up) back
  * for the end of its account's pause: a copy of it runs then, as
  * `<baseJobId>_pause_<n>` (requeueForPause). Nothing was sent: the pause was
@@ -496,11 +523,15 @@ type ConversationHold = "held" | "window-closed" | "capped";
  * (`windowFrom`). When that window is closed by the time the copy would run,
  * within withinWindow's margin, nothing is queued ("window-closed"), and
  * after MAX_PAUSE_REQUEUES waits neither ("capped"). The caller handles
- * these as it handles a closed window and a refused send.
+ * these as it handles a closed window and a refused send. With `pace`, the
+ * copy runs in that pace's next slot after the pause (pacedRunAt).
  *
  * `beforeQueue` gets what the job shows meanwhile ("Instagram request limit;
  * next try at …") and runs before the copy is queued, so what the caller
- * records can never land after the copy's own outcome.
+ * records can never land after the copy's own outcome. Should the copy then
+ * not reach the queue, `undoWaiting` takes back what `beforeQueue` recorded
+ * (no copy would ever settle it) before the error goes to BullMQ, whose
+ * retry runs the job again.
  */
 async function holdConversation({
   name,
@@ -509,7 +540,9 @@ async function holdConversation({
   instagramAccountId,
   resumeAt,
   windowFrom,
+  pace,
   beforeQueue,
+  undoWaiting,
 }: {
   name: string;
   data: DmQueueJob;
@@ -518,22 +551,68 @@ async function holdConversation({
   instagramAccountId: string;
   resumeAt: number;
   windowFrom: number | null;
+  pace?: { key: string; spacingMs: number };
   beforeQueue?: (reason: string) => Promise<unknown>;
+  undoWaiting?: (reason: string, error: unknown) => Promise<unknown>;
 }): Promise<ConversationHold> {
   const wait = nextPauseWait(baseJobId, data.pauseRequeue, resumeAt);
   if (!withinWindow(windowFrom, wait.runAt)) return "window-closed";
   if (wait.capped) return "capped";
-  const reason = pauseWaitMessage(wait.runAt);
+  const runAt = pace ? await pacedRunAt(pace, wait.runAt, windowFrom) : wait.runAt;
+  const reason = pauseWaitMessage(runAt);
   await beforeQueue?.(reason);
-  await requeueForPause({
-    name,
-    data: { ...data, pauseRequeue: wait.number },
-    jobId: wait.jobId,
-    instagramAccountId,
-    resumeAt,
-  });
+  try {
+    await requeueForPause({
+      name,
+      data: { ...data, pauseRequeue: wait.number },
+      jobId: wait.jobId,
+      instagramAccountId,
+      resumeAt,
+      ...(pace ? { runAt } : {}),
+    });
+  } catch (error) {
+    if (undoWaiting) {
+      await undoWaiting(reason, error).catch((undoError) =>
+        console.error(
+          `[DM Worker] ${baseJobId}: what waits for the pause could not be taken back:`,
+          formatError(undoError)
+        )
+      );
+    }
+    throw error;
+  }
   console.log(`[DM Worker] ${baseJobId}: ${reason} (wait ${wait.number})`);
   return "held";
+}
+
+/**
+ * What a message row shows when its copy for the account's pause could not
+ * be queued: FAILED with the reason, so the read fallback and a lost tap's
+ * job do not stand back on a wait that nothing will end. The job's retry
+ * starts over with the row.
+ */
+function pauseQueueFailedMessage(error: unknown): string {
+  return `Instagram request limit: the try after the account's pause could not be queued (${formatError(error)})`;
+}
+
+/**
+ * Take back the PENDING that markDmLogWaiting wrote for `reason`, unless the
+ * row changed since (another job's outcome stands).
+ */
+async function undoDmLogWaiting(
+  row: { automationId: string; commentId: string },
+  reason: string,
+  error: unknown
+): Promise<void> {
+  await prisma.dmLog.updateMany({
+    where: {
+      automationId: row.automationId,
+      commentId: row.commentId,
+      status: "PENDING",
+      errorMessage: reason,
+    },
+    data: { status: "FAILED", errorMessage: pauseQueueFailedMessage(error) },
+  });
 }
 
 /**
@@ -1652,7 +1731,12 @@ async function sendFollowRecheckAck({
  *
  * A read fallback waits one minute longer than the taps and DM replies held
  * for the same pause. Whichever of those brings this person the link, the
- * fallback then finds it and sends nothing.
+ * fallback then finds it and sends nothing. A tap the search after a
+ * messaging silence continued (lostTap) keeps its pace through the pause:
+ * its copy runs in the lost taps' next free slot after it, while the window
+ * allows (holdConversation, pacedRunAt). Should the copy not reach the
+ * queue, the waiting link is logged FAILED again before the job fails: its
+ * retry starts over, and nothing stands back on a wait that nothing ends.
  *
  * A closed window ends the tap here: a link is logged FAILED, and so is a
  * waiting link behind a follow check or prompt. "capped" ends it too: a
@@ -1700,6 +1784,19 @@ async function holdTapForPause({
       contact?.lastInteractionAt,
       fallback ? null : tapTime(job)
     ),
+    pace:
+      job.data.lostTap && !fallback
+        ? { key: lostTapPaceKey(job.data.instagramAccountId), spacingMs: LOST_TAP_SPACING_MS }
+        : undefined,
+    // Whichever way this copy's wait was recorded on the link's row.
+    undoWaiting: fallback
+      ? undefined
+      : (reason, queueError) =>
+          undoDmLogWaiting(
+            { automationId: automation.id, commentId: dedupeId },
+            reason,
+            queueError
+          ),
     beforeQueue: fallback
       ? undefined
       : step === "link"
@@ -2652,6 +2749,7 @@ async function holdMessageForPause({
     resumeAt,
     windowFrom: latestTime(contact?.lastInteractionAt, messageTime(job)),
     beforeQueue: (reason) => markDmLogWaiting(row, reason),
+    undoWaiting: (reason, queueError) => undoDmLogWaiting(row, reason, queueError),
   });
   if (outcome === "held") return outcome;
 

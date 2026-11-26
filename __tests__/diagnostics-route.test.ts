@@ -432,6 +432,7 @@ describe("Diagnostics and a messaging silence", () => {
         username: "studio",
         since: "2026-11-19T13:15:16.000Z",
         endedAt: "2026-11-20T10:30:57.000Z",
+        earlier: [],
         searching: false,
         taps: null,
       },
@@ -482,8 +483,8 @@ describe("Diagnostics and a messaging silence", () => {
     ]);
     const { endedMessagingSilences } = await diagnostics();
     expect(endedMessagingSilences).toEqual([
-      { accountId: "a1", username: "studio", since: result.since, endedAt: result.endedAt, searching: true, taps: null },
-      { accountId: "a2", username: "other", since: result.since, endedAt: result.endedAt, searching: false, taps },
+      { accountId: "a1", username: "studio", since: result.since, endedAt: result.endedAt, earlier: [], searching: true, taps: null },
+      { accountId: "a2", username: "other", since: result.since, endedAt: result.endedAt, earlier: [], searching: false, taps },
     ]);
     expect(JSON.stringify(endedMessagingSilences)).not.toContain("ig_");
   });
