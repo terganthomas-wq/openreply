@@ -4,9 +4,10 @@
  *
  * `eval` runs the account pause's script (lib/queue/account-pause.ts) the way
  * its Lua does: set or extend, never shorten. It also runs the counter of the
- * manual sends' rate limit (lib/comments/server.ts): INCR, and an expiry on
- * the first. It refuses any other script, so a test notices when new Redis
- * logic needs a stand-in of its own.
+ * manual sends' rate limits (lib/comments/server.ts): INCR, and an expiry on
+ * the first; and the send pace (lib/queue/send-pacing.ts): the next slot, at
+ * least the spacing after the last one. It refuses any other script, so a
+ * test notices when new Redis logic needs a stand-in of its own.
  */
 
 type Entry = { value: string; expiresAt: number | null };
@@ -60,6 +61,18 @@ export class FakeRedis {
   }
 
   async eval(script: string, numKeys: number, ...args: (string | number)[]) {
+    if (numKeys === 1 && script.startsWith("-- openreply paced slot")) {
+      const [key, earliest, spacing, now, keep] = args.map(String);
+      this.commands.push(`EVAL pace ${key} ${earliest} ${spacing}`);
+      const last = this.live(key)?.value;
+      let slot = Number(earliest);
+      if (last !== undefined && Number(last) + Number(spacing) > slot) {
+        slot = Number(last) + Number(spacing);
+      }
+      const ttl = Math.max(1, slot - Number(now) + Number(keep));
+      this.strings.set(key, { value: String(slot), expiresAt: Date.now() + ttl });
+      return String(slot);
+    }
     if (
       numKeys === 1 &&
       script.includes('redis.call("INCR", KEYS[1])') &&

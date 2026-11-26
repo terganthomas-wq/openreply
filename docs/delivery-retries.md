@@ -56,13 +56,36 @@ sends its link once.
 No campaign is paused by this policy. New comments continue through the normal
 flow. No schema migration is required.
 
+The claim is per campaign, Instagram's private reply per comment. So the DM
+claim (`claimCommentPrivateReply`) runs in one transaction with a look at the
+other campaigns' rows of the comment, under a Postgres advisory lock on the
+comment: of two jobs that claim one comment for two campaigns at the same
+moment (two campaigns that match it, a manual send next to a webhook, sweep or
+catch-up job), the second always sees the first one's claim and claims
+nothing. What it does then depends on that claim:
+
+- the other campaign's DM went out or may have (SENT, unconfirmed, or a
+  claim older than ten minutes, `DM_CLAIM_IN_FLIGHT_MS`, whose worker died):
+  SKIPPED_DEDUP, for good;
+- it is on its way (claimed within ten minutes): nothing is decided yet, as
+  that DM may still be refused or wait for a pause. The row waits (PENDING,
+  "Waiting: another campaign (…) is sending …", no attempt used) and a copy
+  of the job, `<job id base>_dedup_<n>`, looks again a minute later (plus up
+  to 30 seconds by its id), through every campaign of the comment in order,
+  at most six times; then SKIPPED_DEDUP.
+
+A job that finds its own campaign's DM claimed by another job leaves the
+public reply to that job: a "check your DMs" posted next to a DM on its way
+could stand under a comment whose DM Instagram then refuses. (A claim older
+than ten minutes gets its public reply from the next job, as a DM that may
+have gone out.)
+
 A DM sent by hand from the Comments page ([manual send](manual-send.md)) is a
-comment job for exactly the chosen campaign and takes the same claim. Because
-the claim is per campaign and Instagram's private reply per comment, a manual
-send also checks the other campaigns' rows before and right after its claim,
-and an automatic job checks for a manual send's claim right after its own: of
-two sends that claim one comment at the same moment, one stands back and gives
-its attempt back.
+comment job for exactly the chosen campaign and takes the same claim. With
+"Reply publicly" switched off, the campaign's public reply is closed in the
+claim's own transaction, so no other job posts it from the moment the claim
+can be seen; a later manual send with it switched on opens that closing
+again.
 
 ## Meta's request limits
 
@@ -101,6 +124,10 @@ a limit instead of reading it as "not following":
 - A pause found before the send: nothing is reserved, claimed or called. The
   DM leg stays PENDING with "Instagram request limit; next try at HH:MM UTC"
   and the copy `comment_<account>_<comment>_pause_<n>` runs after the pause.
+  A job of the catch-up after a lost connection (source RECOVERY) runs its
+  copy in the catch-up's next free slot after the pause, 2.5 minutes after
+  the one before (`lib/queue/send-pacing.ts`), instead of in the minute after
+  it: a catch-up that met a pause must not send its backlog in one burst.
 - A send refused for a limit: the hourly slot and the monthly reservation go
   back as for any refusal, the account pauses, and the DM claim is given back
   with its attempt (`releaseCommentClaim`: `dmDeliveryUnconfirmed` false, the

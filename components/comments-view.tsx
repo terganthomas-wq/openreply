@@ -6,9 +6,10 @@
  * The comments of the newest posts from the last 7 days, newest first, each
  * with where its DM stands, and per comment a campaign and "DM senden" for
  * the comments the keywords missed. The list is read when the page opens (and
- * on "Mehr laden", a reload or another account): never in the background.
- * After a send only the DM log is asked, every few seconds, until the
- * worker's outcome is in. Owners and admins only, like every send.
+ * on "Mehr laden", a reload or another account, and once after an R1 pause
+ * ends): never in the background otherwise. After a send only the DM log is
+ * asked, every few seconds, until the worker's outcome is in. Owners and
+ * admins only, like every send.
  */
 
 import { useEffect, useState } from "react";
@@ -23,8 +24,12 @@ import {
   defaultPublicReply,
   lastAttempt,
   manualSendSettled,
+  pauseReloadDelay,
   relativeTime,
+  SEND_POLL_INTERVAL_MS,
   sendBlock,
+  sendDelayed,
+  sendPollBudget,
   withStatus,
   type CampaignOption,
   type CommentRow,
@@ -37,9 +42,11 @@ import type { I18n } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
 import { formatIncidentTime } from "@/lib/instagram/connection-incident";
 
-// How often, and how long, the page asks for a send's outcome.
-const POLL_INTERVAL_MS = 3_000;
-const MAX_POLLS = 20;
+// How often the page asks for a send's outcome without a time it is due.
+const MAX_POLLS = sendPollBudget(null, null);
+// The reload after a pause is spread over this much, so open pages do not
+// all read Meta in the same second.
+const PAUSE_RELOAD_SPREAD_MS = 20_000;
 
 type Filter = "without-dm" | "all";
 type Failure = "forbidden" | "provider" | "no-account" | "error";
@@ -126,6 +133,8 @@ export function refusalText(
       return t("The sending service is not updated yet. Try again later.");
     case "rate_limited":
       return t("Too many DMs in a short time. Wait a minute.");
+    case "account_limit":
+      return t("Too many DMs sent by hand for this account in the last hour. Try again later.");
     case "instagram_limit":
       return t("Instagram limit reached. Try again in a few minutes.");
     default:
@@ -181,6 +190,8 @@ export interface CommentCardProps {
   sending: boolean;
   /** A refused send or a send without an outcome, in the reader's words. */
   notice: string | null;
+  /** When a queued send goes out, if it waits behind others (ISO). */
+  scheduledAt?: string | null;
   pausedUntil: string | null;
   /** Since when the account's connection is lost (A1); null while it works. */
   connectionLostAt?: string | null;
@@ -199,6 +210,7 @@ export function CommentCard({
   publicReply,
   sending,
   notice,
+  scheduledAt = null,
   pausedUntil,
   connectionLostAt = null,
   now,
@@ -334,6 +346,13 @@ export function CommentCard({
       )}
 
       {reason && <p className="text-xs text-muted">{reason}</p>}
+      {sending && scheduledAt && (
+        <p className="text-xs text-muted">
+          {t("Goes out at about {time}, so Instagram does not get too many DMs at once.", {
+            time: formatClock(scheduledAt, locale),
+          })}
+        </p>
+      )}
       {block?.kind === "connection-lost" && <ReconnectButton />}
       {notice && (
         <p role="status" className="text-xs text-error">
@@ -372,6 +391,8 @@ export default function CommentsView() {
   const [pending, setPending] = useState<Record<string, PendingSend>>({});
   const [starting, setStarting] = useState<Record<string, true>>({});
   const [notices, setNotices] = useState<Record<string, string>>({});
+  // Sends that wait behind others of the account: when they go out.
+  const [scheduled, setScheduled] = useState<Record<string, string>>({});
   const [statuses, setStatuses] = useState<Record<string, CommentStatus>>({});
   // Comments sent from here stay in "Ohne DM" until the next load.
   const [touched, setTouched] = useState<Record<string, true>>({});
@@ -432,9 +453,28 @@ export default function CommentsView() {
     };
   }, [accountId, posts, reloads]);
 
+  // While the account is paused for a Meta limit the server reads nothing
+  // and the list stays empty: once the pause is over, load it once more by
+  // itself (the server asks the pause again before it reads Meta). A pause
+  // that was extended meanwhile comes back with its new end.
+  const pausedUntil = data?.pausedUntil ?? null;
+  const answeredAt = data?.generatedAt ?? null;
+  useEffect(() => {
+    if (!answeredAt) return;
+    const delay = pauseReloadDelay(
+      pausedUntil,
+      answeredAt,
+      Math.random() * PAUSE_RELOAD_SPREAD_MS
+    );
+    if (delay === null) return;
+    const timer = window.setTimeout(() => setReloads((count) => count + 1), delay);
+    return () => window.clearTimeout(timer);
+  }, [pausedUntil, answeredAt]);
+
   // While sends wait for the worker: ask the DM log every few seconds, and
-  // stop for each send once its outcome is in (or after a minute). Only the
-  // sends this poll asked about change: a send started meanwhile stays.
+  // stop for each send once its outcome is in (or a minute after it was
+  // due). Only the sends this poll asked about change: a send started
+  // meanwhile stays.
   const pollAccountId = data?.account.id ?? null;
   useEffect(() => {
     const ids = Object.keys(pending);
@@ -452,8 +492,10 @@ export default function CommentsView() {
           const fresh = payload.data.statuses as Record<string, CommentStatus>;
           const done = (entry: PendingSend, id: string) =>
             manualSendSettled(fresh[id], entry);
+          const used = (entry: PendingSend) =>
+            entry.polls + 1 >= (entry.maxPolls ?? MAX_POLLS);
           const timedOut = ids.filter(
-            (id) => !done(pending[id], id) && pending[id].polls + 1 >= MAX_POLLS
+            (id) => !done(pending[id], id) && used(pending[id])
           );
           setStatuses((previous) => ({ ...previous, ...fresh }));
           setPending((previous) => {
@@ -461,7 +503,7 @@ export default function CommentsView() {
             for (const id of ids) {
               const entry = previous[id];
               if (!entry) continue;
-              if (done(entry, id) || entry.polls + 1 >= MAX_POLLS) delete next[id];
+              if (done(entry, id) || used(entry)) delete next[id];
               else next[id] = { ...entry, polls: entry.polls + 1 };
             }
             return next;
@@ -479,7 +521,7 @@ export default function CommentsView() {
         .finally(() => {
           if (active) setPollTick((tick) => tick + 1);
         });
-    }, POLL_INTERVAL_MS);
+    }, SEND_POLL_INTERVAL_MS);
     return () => {
       active = false;
       window.clearTimeout(timer);
@@ -493,6 +535,7 @@ export default function CommentsView() {
     setReplies({});
     setPending({});
     setNotices({});
+    setScheduled({});
   }
 
   async function send(row: CommentRow, campaignId: string, publicReply: boolean) {
@@ -511,14 +554,23 @@ export default function CommentsView() {
       });
       const payload = await res.json().catch(() => null);
       if (res.status === 202 && payload?.success) {
+        const queuedAt = typeof payload.queuedAt === "string" ? payload.queuedAt : null;
+        const scheduledAt =
+          typeof payload.scheduledAt === "string" ? payload.scheduledAt : null;
         setPending((map) => ({
           ...map,
           [row.id]: {
             automationId: campaignId,
             previousUpdatedAt: payload.previousUpdatedAt ?? null,
             polls: 0,
+            maxPolls: sendPollBudget(queuedAt, scheduledAt),
           },
         }));
+        setScheduled((map) =>
+          scheduledAt && sendDelayed(queuedAt, scheduledAt)
+            ? { ...map, [row.id]: scheduledAt }
+            : without(map, row.id)
+        );
         return;
       }
       if (payload?.status) {
@@ -552,14 +604,32 @@ export default function CommentsView() {
       </div>
     );
   }
+  // The page reads through the account's own Meta connection only: an
+  // account connected through Zernio is not offered.
+  const metaAccounts = accounts.filter(
+    (account) => !account.provider || account.provider === "META"
+  );
   if (failure === "provider" || failure === "no-account") {
+    // The account asked for cannot be read (connected through Zernio, or
+    // gone): the others can still be chosen here.
     return (
-      <div className="panel rounded p-8 text-center">
-        <p className="text-sm text-muted">
-          {failure === "provider"
-            ? t("Sending by hand needs an account connected with your own Meta app.")
-            : t("Connect an Instagram account first.")}
-        </p>
+      <div className="space-y-6">
+        {metaAccounts.length > 0 && (
+          <AccountSelect
+            accounts={metaAccounts}
+            value={accountId ?? ""}
+            onChange={changeAccount}
+            includeAll={false}
+            placeholder={t("Choose an account")}
+          />
+        )}
+        <div className="panel rounded p-8 text-center">
+          <p className="text-sm text-muted">
+            {failure === "provider"
+              ? t("Sending by hand needs an account connected with your own Meta app.")
+              : t("Connect an Instagram account first.")}
+          </p>
+        </div>
       </div>
     );
   }
@@ -591,12 +661,13 @@ export default function CommentsView() {
             </button>
           ))}
         </div>
-        {accounts.length > 1 && (
+        {metaAccounts.length > 1 && (
           <AccountSelect
-            accounts={accounts}
-            value={accountId ?? data?.account.id ?? accounts[0]?.id ?? ""}
+            accounts={metaAccounts}
+            value={accountId ?? data?.account.id ?? metaAccounts[0]?.id ?? ""}
             onChange={changeAccount}
             includeAll={false}
+            placeholder={t("Choose an account")}
           />
         )}
       </div>
@@ -669,6 +740,7 @@ export default function CommentsView() {
                 publicReply={publicReply}
                 sending={Boolean(pending[row.id] || starting[row.id])}
                 notice={notices[row.id] ?? null}
+                scheduledAt={pending[row.id] ? scheduled[row.id] ?? null : null}
                 pausedUntil={data.pausedUntil}
                 connectionLostAt={connectionLostAt}
                 now={now}

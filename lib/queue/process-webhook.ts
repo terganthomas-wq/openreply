@@ -2,6 +2,7 @@ import { prisma } from '@/lib/db/client';
 import { COMMENT_JOB_NAME, getDMQueue, MESSAGE_JOB_NAME, POSTBACK_JOB_NAME } from '@/lib/queue/client';
 import { parseCommentEvents, parseMessageEvents, parsePostbackEvents, parseReadEvents } from '@/lib/meta/webhook';
 import { Prisma, type InstagramProvider } from '@/app/generated/prisma/client';
+import { MANUAL_MATCHED_KEYWORD } from '@/lib/comments/manual';
 
 const OPENING_DM_READ_FALLBACK_DELAY_MS = 5 * 60 * 1000;
 type InstagramPayload = Parameters<typeof parseCommentEvents>[0];
@@ -156,11 +157,25 @@ export async function processInstagramWebhook({ payload: incoming, provider, wor
           commenterId: event.userId,
           status: "SENT",
           automation: {
-            isActive: true,
             openingDmEnabled: true,
             instagramAccount: {
               instagramId: event.instagramAccountId,
             },
+            // A paused campaign only for a reader it was sent to by hand
+            // from the Kommentare page (M1): what follows its DM runs as for
+            // an active one, and the worker finds it the same way.
+            OR: [
+              { isActive: true },
+              {
+                dmLogs: {
+                  some: {
+                    commenterId: event.userId,
+                    matchedKeyword: MANUAL_MATCHED_KEYWORD,
+                    status: "SENT",
+                  },
+                },
+              },
+            ],
           },
         },
         select: {

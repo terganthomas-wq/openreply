@@ -18,10 +18,14 @@
  *   days for a private reply, is not the account's own, matches an active
  *   campaign as the sweep and the worker match (keywords, whole word, the
  *   question filter, a campaign bound to the post before an any-post one:
- *   campaignForComment) and has no DmLog row. As the ordinary comment job
- *   `recover_<ig>_<comment>` (source RECOVERY), oldest first, one every 20
- *   seconds, the first right away: a long outage never bursts into Meta's
- *   limit. Every claim of processComment holds for it as for any comment.
+ *   campaignForComment) and no DmLog row settles it (handledByLog). As the
+ *   ordinary comment job `recover_<ig>_<comment>` (source RECOVERY), oldest
+ *   first, one every CATCH_UP_SPACING_MS (2.5 minutes, 24 an hour), the
+ *   first right away, each in a slot of the account's catch-up pace
+ *   (lib/queue/send-pacing.ts): a long outage never bursts into Meta's limit,
+ *   and copies of these jobs that wait for an R1 pause or for Meta's usage to
+ *   drop line up behind them. Every claim of processComment holds for it as
+ *   for any comment.
  * - A matching comment the owner already answered by hand gets no DM (the
  *   owner may have sent the guide by hand). It is listed in the all-clear
  *   e-mail and in Diagnostics with author, text, time and the post's link.
@@ -43,7 +47,7 @@
  * Then the all-clear e-mail (lib/ops/connection-all-clear.ts).
  */
 
-import { Prisma } from "@/app/generated/prisma/client";
+import { Prisma, type DmStatus } from "@/app/generated/prisma/client";
 import { campaignForComment } from "@/lib/automation/comment-match";
 import { SAFE_ID_PATTERN, withinPrivateReplyWindow, PRIVATE_REPLY_WINDOW_MS } from "@/lib/comments/manual";
 import { prisma } from "@/lib/db/client";
@@ -83,7 +87,12 @@ import type { MailTransport } from "@/lib/ops/mail";
 import { adMediaFor } from "@/lib/polling/comment-reconciler";
 import { checkAccountPause, formatPauseTime, pausedRunAt } from "@/lib/queue/account-pause";
 import { COMMENT_JOB_NAME, getDMQueue, type ProcessCommentJob } from "@/lib/queue/client";
+import {
+  MAX_COMMENT_SEND_ATTEMPTS,
+  privateReplyTaken,
+} from "@/lib/queue/comment-delivery";
 import { formatError, logWorkerEvent } from "@/lib/queue/send-helpers";
+import { recoveryPaceKey, reservePacedSlot } from "@/lib/queue/send-pacing";
 
 /** A run's lease on the account row; another run takes over once it is this old. */
 export const CATCH_UP_LEASE_MS = 10 * 60_000;
@@ -101,8 +110,12 @@ export const CATCH_UP_RETRY_MS = 30 * 60_000;
 const SHUTDOWN_WAIT_MS = 60_000;
 /** After this long since its first run, a catch-up ends with what it has. */
 export const CATCH_UP_GIVE_UP_MS = 24 * 60 * 60_000;
-/** Comment jobs one catch-up queues at most: about five and a half hours of DMs. */
-export const CATCH_UP_MAX_QUEUED = 1_000;
+/**
+ * Comment jobs one catch-up queues at most: about 21 hours of DMs at
+ * CATCH_UP_SPACING_MS, inside the 30 hours the sweep stands back
+ * (CATCH_UP_SWEEP_HOLD_MAX_MS).
+ */
+export const CATCH_UP_MAX_QUEUED = 500;
 // Ids kept for the owner's answered comments, beyond the listed ones.
 const MAX_ANSWERED_IDS = 2_000;
 // Progress is saved after this many posts, so a worker that dies loses little.
@@ -730,8 +743,11 @@ async function takeComments(
   }
   if (candidates.length === 0) return;
 
-  // A DmLog row means a job already handles the comment (sent, failed or on
-  // its way): never the catch-up's to queue again.
+  // Comments a DmLog row settles (handledByLog) are never the catch-up's to
+  // queue again. A row that only waits, or failed with attempts left, does
+  // not settle it: a job that met this incident (it found the connection
+  // lost, or Meta refused the account) left it so, and nothing else would
+  // send it. Queued again, the claims keep it at one DM.
   const logged = new Set(
     (
       await prisma.dmLog.findMany({
@@ -739,9 +755,17 @@ async function takeComments(
           instagramAccountId: account.id,
           commentId: { in: candidates.map((comment) => comment.id) },
         },
-        select: { commentId: true },
+        select: {
+          commentId: true,
+          status: true,
+          attempts: true,
+          dmDeliveryUnconfirmed: true,
+          errorMessage: true,
+        },
       })
-    ).map((row) => row.commentId)
+    )
+      .filter(handledByLog)
+      .map((row) => row.commentId)
   );
 
   const owed: InstagramComment[] = [];
@@ -761,6 +785,27 @@ async function takeComments(
   }
   owed.sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
   for (const comment of owed) await queueComment(run, post, comment);
+}
+
+/**
+ * Whether a comment's DmLog row settles it for the catch-up: its private
+ * reply went out or may have (privateReplyTaken), another campaign answers
+ * it (SKIPPED_DEDUP), the plan limit stopped it (SKIPPED_PLAN_LIMIT), or a
+ * campaign used up its attempts on it. Not a row that waits (PENDING) or
+ * failed with attempts left.
+ */
+export function handledByLog(row: {
+  status: DmStatus;
+  attempts: number;
+  dmDeliveryUnconfirmed: boolean;
+  errorMessage: string | null;
+}): boolean {
+  return (
+    privateReplyTaken(row) ||
+    row.status === "SKIPPED_DEDUP" ||
+    row.status === "SKIPPED_PLAN_LIMIT" ||
+    row.attempts >= MAX_COMMENT_SEND_ATTEMPTS
+  );
 }
 
 function noteAnswered(run: Run, post: CatchUpPost, comment: InstagramComment): void {
@@ -783,7 +828,11 @@ function noteAnswered(run: Run, post: CatchUpPost, comment: InstagramComment): v
   }
 }
 
-/** One comment's job, 20 seconds after the one before. */
+/**
+ * One comment's job, CATCH_UP_SPACING_MS after the one before, in the next
+ * slot of the account's catch-up pace: a copy of an earlier job that waited
+ * for a pause may hold the slot this one would have had.
+ */
 async function queueComment(
   run: Run,
   post: CatchUpPost,
@@ -803,7 +852,16 @@ async function queueComment(
   }
   const now = run.clock();
   const last = progress.lastJobAt ? Date.parse(progress.lastJobAt) : null;
-  const runAt = last === null ? now : Math.max(now, last + CATCH_UP_SPACING_MS);
+  const planned = last === null ? now : Math.max(now, last + CATCH_UP_SPACING_MS);
+  if (!withinPrivateReplyWindow(comment.timestamp, planned + WINDOW_MARGIN_MS)) {
+    progress.skipped.tooOld += 1;
+    return;
+  }
+  const runAt = await reservePacedSlot(recoveryPaceKey(account.instagramId), {
+    earliest: planned,
+    spacingMs: CATCH_UP_SPACING_MS,
+    now,
+  });
   if (!withinPrivateReplyWindow(comment.timestamp, runAt + WINDOW_MARGIN_MS)) {
     progress.skipped.tooOld += 1;
     return;

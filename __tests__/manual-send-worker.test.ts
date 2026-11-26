@@ -18,6 +18,9 @@ const {
   redis,
 } = vi.hoisted(() => ({
   mockPrisma: {
+    // The DM claim's transaction (claimCommentPrivateReply) is the client itself here.
+    $transaction: vi.fn(),
+    $executeRaw: vi.fn(),
     automation: { findMany: vi.fn(), findFirst: vi.fn() },
     dmLog: {
       findUnique: vi.fn(),
@@ -184,6 +187,10 @@ function claimCall() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockPrisma.$transaction
+    .mockReset()
+    .mockImplementation(async (work: (tx: unknown) => unknown) => work(mockPrisma));
+  mockPrisma.$executeRaw.mockReset().mockResolvedValue(1);
   redis.current = new FakeRedis();
   mockQueueAdd.mockReset().mockResolvedValue({});
   mockPrisma.automation.findFirst.mockReset().mockResolvedValue(CAMPAIGN);
@@ -309,54 +316,92 @@ describe("DM worker — a manual send (forceAutomationId)", () => {
     );
   });
 
-  it("stands back before it claims when another campaign's DM is out or on its way", async () => {
-    mockPrisma.dmLog.findMany.mockResolvedValue([
-      {
-        status: "PENDING",
-        dmDeliveryUnconfirmed: true,
-        errorMessage: null,
-        automation: { name: "Link" },
-      },
-    ]);
+  // Another campaign's row of the comment, as findPrivateReplyRival reads it.
+  function rivalRow(overrides: Record<string, unknown> = {}) {
+    return {
+      automationId: "c_link",
+      status: "PENDING",
+      dmDeliveryUnconfirmed: true,
+      errorMessage: null,
+      updatedAt: new Date(),
+      automation: { name: "Link" },
+      ...overrides,
+    };
+  }
+
+  it("stands back before it claims when another campaign's DM went out or may have", async () => {
+    mockPrisma.dmLog.findMany.mockResolvedValue([rivalRow({ status: "FAILED" })]);
     await run(manualJob());
 
     expect(mockSendPrivateReply).not.toHaveBeenCalled();
     expect(claimCall()).toBeUndefined();
-    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith({
-      where: { automationId_commentId: { automationId: "c_guide", commentId: "comment_1" } },
-      data: expect.objectContaining({
-        status: "SKIPPED_DEDUP",
-        matchedKeyword: "(manuell)",
-        errorMessage: expect.stringContaining("Another campaign (Link) is sending, or may have sent"),
-      }),
-    });
-  });
-
-  it("gives its claim back when another campaign claimed the comment meanwhile", async () => {
-    // Nothing before the claim, another campaign's claim right after it.
-    mockPrisma.dmLog.findMany
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([
-        { status: "PENDING", dmDeliveryUnconfirmed: true, errorMessage: null, automation: { name: "Link" } },
-      ]);
-    await run(manualJob());
-
-    expect(mockSendPrivateReply).not.toHaveBeenCalled();
     expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith({
       where: {
         automationId: "c_guide",
         commentId: "comment_1",
         status: { not: "SENT" },
-        dmDeliveryUnconfirmed: true,
-        attempts: { gt: 0 },
+        dmDeliveryUnconfirmed: false,
       },
       data: {
-        dmDeliveryUnconfirmed: false,
-        attempts: { decrement: 1 },
         status: "SKIPPED_DEDUP",
-        errorMessage: expect.stringContaining("Not sent: another campaign (Link)"),
+        matchedKeyword: "(manuell)",
+        errorMessage: expect.stringContaining("Another campaign (Link) is sending, or may have sent"),
       },
     });
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+
+  it("waits and looks again, under its own copy id, while another campaign's DM is on its way", async () => {
+    mockPrisma.dmLog.findMany.mockResolvedValue([rivalRow()]);
+    await run(manualJob());
+
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(claimCall()).toBeUndefined();
+    const [, data, options] = mockQueueAdd.mock.calls[0];
+    expect(options.jobId).toBe("manual_ig_1_comment_1_c_guide_dedup_1");
+    expect(data).toMatchObject({ forceAutomationId: "c_guide", dedupRecheck: 1 });
+  });
+
+  it("claims nothing when another campaign's claim is found under the lock", async () => {
+    // Nothing at the first look, another campaign's claim inside the
+    // claim's transaction.
+    mockPrisma.dmLog.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([rivalRow()]);
+    await run(manualJob());
+
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.$executeRaw).toHaveBeenCalledTimes(1);
+    // The rival is read under the lock, and nothing is claimed after it.
+    expect(claimCall()).toBeUndefined();
+    expect(mockQueueAdd.mock.calls[0][2].jobId).toBe("manual_ig_1_comment_1_c_guide_dedup_1");
+  });
+
+  it("opens a public reply an earlier manual send closed, when the owner asks for it now", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue({ ...CAMPAIGN, publicReplyEnabled: true });
+    // The row as an earlier manual send without the public reply left it.
+    mockPrisma.dmLog.findUnique.mockResolvedValue({
+      status: "FAILED",
+      attempts: 1,
+      dmDeliveryUnconfirmed: false,
+      errorMessage: "MetaApiError 10: refused",
+      updatedAt: new Date(),
+      publicReplySentAt: null,
+      publicReplyDeliveryUnconfirmed: true,
+      publicReplyError: "Not posted: the public reply was switched off for this manual send",
+    });
+    await run(manualJob({ publicReplyOverride: true }));
+
+    expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith({
+      where: {
+        automationId: "c_guide",
+        commentId: "comment_1",
+        publicReplySentAt: null,
+        publicReplyDeliveryUnconfirmed: true,
+        publicReplyError: "Not posted: the public reply was switched off for this manual send",
+      },
+      data: { publicReplyDeliveryUnconfirmed: false, publicReplyError: null },
+    });
+    expect(mockSendCommentReply).toHaveBeenCalledTimes(1);
   });
 
   it("names its pause copy after itself, never after the automatic job", async () => {
@@ -415,25 +460,39 @@ describe("DM worker — an automatic job next to a manual send", () => {
     expect(mockPrisma.automation.findFirst).not.toHaveBeenCalled();
   });
 
-  it("gives its claim back to a manual send on its way, for good", async () => {
-    mockPrisma.dmLog.findFirst.mockImplementation(async (args: { where?: Record<string, unknown> }) =>
-      args.where?.matchedKeyword === "(manuell)"
-        ? { matchedKeyword: "(manuell)", automation: { name: "Guide" } }
-        : null
-    );
+  it("waits for a manual send on its way, and stands back for good once it went out", async () => {
+    const manualRow = {
+      automationId: "c_guide",
+      status: "PENDING",
+      dmDeliveryUnconfirmed: true,
+      errorMessage: null,
+      updatedAt: new Date(),
+      matchedKeyword: "(manuell)",
+      automation: { name: "Guide" },
+    };
+    mockPrisma.dmLog.findMany.mockResolvedValue([manualRow]);
     await run(automatic);
 
     expect(mockSendPrivateReply).not.toHaveBeenCalled();
-    expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith(
+    // Nothing was claimed, so nothing is given back; the comment looks again
+    // under the automatic job's own copy id.
+    expect(claimCall()).toBeUndefined();
+    expect(mockQueueAdd).toHaveBeenCalledTimes(1);
+    expect(mockQueueAdd.mock.calls[0][2].jobId).toBe("comment_ig_1_comment_1_dedup_1");
+
+    // The copy: the manual DM went out meanwhile.
+    mockQueueAdd.mockClear();
+    mockPrisma.dmLog.findMany.mockResolvedValue([{ ...manualRow, status: "SENT", dmDeliveryUnconfirmed: false }]);
+    await run({ ...automatic, id: "comment_ig_1_comment_1_dedup_1", data: { ...automatic.data, dedupRecheck: 1 } });
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.updateMany).toHaveBeenLastCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
           status: "SKIPPED_DEDUP",
-          attempts: { decrement: 1 },
-          errorMessage: expect.stringContaining("sent by hand with another campaign (Guide)"),
+          errorMessage: expect.stringContaining("Another campaign (Guide) already sent"),
         }),
       })
     );
-    // Its copies keep the automatic job's names.
-    expect(mockQueueAdd).not.toHaveBeenCalled();
   });
 });

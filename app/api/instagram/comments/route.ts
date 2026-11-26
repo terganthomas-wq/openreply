@@ -21,7 +21,7 @@ import {
   loadCommentsPage,
   loadCommentStatuses,
 } from "@/lib/comments/server";
-import { getWorkspaceInstagramAccount } from "@/lib/instagram-accounts";
+import { getWorkspaceMetaAccount } from "@/lib/instagram-accounts";
 import {
   canManageWorkspace,
   getCurrentWorkspaceContext,
@@ -54,7 +54,9 @@ export async function GET(request: NextRequest) {
   }
 
   const params = request.nextUrl.searchParams;
-  const account = await getWorkspaceInstagramAccount(
+  // Without an id: the newest account connected through Meta, not a newer
+  // one connected through Zernio, which the page cannot read.
+  const account = await getWorkspaceMetaAccount(
     context.workspaceId,
     params.get("instagramAccountId")
   );

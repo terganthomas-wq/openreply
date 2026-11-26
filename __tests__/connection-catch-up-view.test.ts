@@ -19,6 +19,7 @@ import ru from "../lib/i18n/ru.json";
 import zhTW from "../lib/i18n/zh-TW.json";
 import { I18nProvider } from "../lib/i18n/provider";
 import {
+  catchUpEventText,
   connectionCatchUpReports,
   type CatchUpReport,
 } from "../lib/instagram/catch-up-report";
@@ -208,6 +209,7 @@ describe("the texts", () => {
     "and {count} more",
     "Open comments",
     "Catch-up for @{account} done: {queued} comments get their DM, {answered} you had answered yourself.",
+    "Catch-up for @{account} done: 1 comment gets its DM, {answered} you had answered yourself.",
     "All-clear e-mail for @{account} sent. Recipients: {count}",
   ] as const;
 
@@ -223,6 +225,19 @@ describe("the texts", () => {
       expect(catalog[keys[7]], keys[7]).toContain(catalog["Comments"]);
       expect(catalog[keys[5]], keys[5]).toContain(catalog["Comments"]);
     }
+  });
+
+  it("say one comment in the singular in the timeline", () => {
+    const de = createI18n("de");
+    expect(catchUpEventText(de, { account: "shop", queued: 1, answered: 0 })).toBe(
+      "Nachholen für @shop fertig: 1 Kommentar bekommt seine DM, 0 hattest du selbst beantwortet."
+    );
+    expect(catchUpEventText(de, { account: "shop", queued: 3, answered: 1 })).toBe(
+      "Nachholen für @shop fertig: 3 Kommentare bekommen ihre DM, 1 hattest du selbst beantwortet."
+    );
+    expect(catchUpEventText(createI18n("en"), { account: "shop", queued: 1, answered: 2 })).toBe(
+      "Catch-up for @shop done: 1 comment gets its DM, 2 you had answered yourself."
+    );
   });
 
   it("read as the dashboard in German, informally", () => {

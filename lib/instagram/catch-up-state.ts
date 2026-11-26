@@ -16,8 +16,16 @@
 export const CATCH_UP_MAX_POSTS = 300;
 /** Pages of comments (50 each) it reads, at most, across every post. */
 export const CATCH_UP_MAX_COMMENT_PAGES = 500;
-/** Its comment jobs run this far apart, the first one right away. */
-export const CATCH_UP_SPACING_MS = 20_000;
+/**
+ * Its comment jobs run this far apart, the first one right away: 24 private
+ * replies an hour at most. On 2026-11-21 about 25 private replies and 50
+ * conversation reads in one hour ran into Meta's app limit (code 4), which
+ * then paused every DM of the account, the button taps of people who had
+ * just got their opening DM included. Copies of these jobs that waited for
+ * an R1 pause or for Meta's usage to drop keep the same spacing
+ * (lib/queue/send-pacing.ts).
+ */
+export const CATCH_UP_SPACING_MS = 150_000;
 /** Comments the owner answered by hand that are kept with their text. */
 export const CATCH_UP_MAX_LISTED = 100;
 /** How long Diagnostics shows a finished catch-up: the private-reply window. */
@@ -121,7 +129,7 @@ export interface CatchUpResult {
   finishedAt: string;
   /** Comments created since this time were looked at (ISO). */
   since: string;
-  /** Comments whose DM was queued, one every 20 seconds. */
+  /** Comments whose DM was queued, one every CATCH_UP_SPACING_MS. */
   queued: number;
   firstJobAt: string | null;
   lastJobAt: string | null;
@@ -336,10 +344,12 @@ export interface CatchUpHoldFields {
 /**
  * Whether the comment sweep stands back for the account: while its catch-up
  * is owed or running, and until the last comment job it queued has run. The
- * catch-up reads every post since the incident began and spaces the DMs 20
- * seconds apart; the sweep would queue the same comments again all at once,
- * the burst that runs into Meta's limit. Never longer than
- * CATCH_UP_SWEEP_HOLD_MAX_MS after the incident ended.
+ * catch-up reads every post since the incident began and spaces the DMs
+ * CATCH_UP_SPACING_MS apart; the sweep would queue the same comments again
+ * all at once, the burst that runs into Meta's limit. Never longer than
+ * CATCH_UP_SWEEP_HOLD_MAX_MS after the incident ended. (Copies of the jobs
+ * that waited for a pause may run later still: the sweep also asks the
+ * catch-up's pace in Redis, lib/polling/comment-reconciler.ts.)
  */
 export function catchUpHoldsSweep(
   account: CatchUpHoldFields,

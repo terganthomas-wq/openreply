@@ -1,6 +1,7 @@
 /**
  * The alert e-mail about a lost Instagram connection (A1): when it is due
- * (at most one per 24 hours, one reminder), who gets it (owners and admins
+ * (at most one warning per 24 hours, one reminder, and an alert at once for
+ * a connection lost again after an all-clear), who gets it (owners and admins
  * only), what Resend gets (and what not), the German and the English copy,
  * the SMTP fallback, the claim before the send and what happens when no
  * e-mail is configured or a send fails.
@@ -64,6 +65,8 @@ function account(): AlertAccount {
     connectionLostReason: row.connectionLostReason,
     connectionAlertSentAt: row.connectionAlertSentAt,
     connectionAlertCount: row.connectionAlertCount,
+    connectionAllClearSentAt: row.connectionAllClearSentAt,
+    connectionAlertRearmedAt: row.connectionAlertRearmedAt,
   };
 }
 
@@ -147,6 +150,48 @@ describe("when an e-mail is due", () => {
     expect(connectionAlertDue(earlier, NOW)).toBeNull();
     expect(connectionAlertDue(earlier, NOW - 2 * HOUR + DAY)).toBe("alert");
     expect(connectionAlertDue({ ...open, connectionLostAt: null }, NOW)).toBeNull();
+  });
+
+  it("alerts at once for a connection lost again after the all-clear, once in 24 hours", () => {
+    // 17:30 the alert, 18:00 back and the all-clear, 19:00 lost again.
+    const alertAt = new Date("2026-11-25T17:30:00.000Z");
+    const allClearAt = new Date("2026-11-25T18:00:00.000Z");
+    const again = {
+      connectionLostAt: new Date("2026-11-25T18:30:00.000Z"),
+      connectionAlertSentAt: alertAt,
+      connectionAlertCount: 0,
+      connectionAllClearSentAt: allClearAt,
+      connectionAlertRearmedAt: null,
+    };
+    const at19 = new Date("2026-11-25T19:00:00.000Z").getTime();
+    expect(connectionAlertDue(again, at19)).toBe("alert");
+
+    // Without the all-clear (it never went out), the 24 hours hold: the
+    // owners' last e-mail still says the connection is lost.
+    expect(connectionAlertDue({ ...again, connectionAllClearSentAt: null }, at19)).toBeNull();
+    // An all-clear older than the last warning does not count either.
+    expect(
+      connectionAlertDue(
+        { ...again, connectionAllClearSentAt: new Date(alertAt.getTime() - HOUR) },
+        at19
+      )
+    ).toBeNull();
+
+    // The early alert went out at 19:00; back and all-clear at 19:30; lost
+    // again at 20:00: no second early alert inside 24 hours.
+    const flapping = {
+      ...again,
+      connectionAlertSentAt: new Date(at19),
+      connectionAlertRearmedAt: new Date(at19),
+      connectionAllClearSentAt: new Date(at19 + 30 * 60_000),
+    };
+    expect(connectionAlertDue(flapping, at19 + HOUR)).toBeNull();
+    expect(connectionAlertDue(flapping, at19 + DAY)).toBe("alert");
+
+    // The reminder of an incident stays one, 24 hours after its alert.
+    const alerted = { ...again, connectionAlertSentAt: new Date(at19), connectionAlertCount: 1 };
+    expect(connectionAlertDue(alerted, at19 + HOUR)).toBeNull();
+    expect(connectionAlertDue(alerted, at19 + DAY)).toBe("reminder");
   });
 });
 
@@ -346,7 +391,11 @@ describe("the e-mail through Resend", () => {
     );
     expect(reminder.text).toContain("Das ist die Erinnerung: Die Verbindung ist seit über 24 Stunden unterbrochen.");
     expect(reminder.text).toContain("1. Öffne in OpenReply die Einstellungen.");
-    expect(reminder.text).toContain("Weitere E-Mails zu dieser Unterbrechung kommen nicht");
+    // No more reminders, but the all-clear still comes: the footer says so.
+    expect(reminder.text).toContain(
+      "Weitere Erinnerungen kommen nicht. Sobald die Verbindung wieder steht, bekommst du eine kurze Entwarnung"
+    );
+    expect(reminder.text).not.toContain("Weitere E-Mails");
     expect(reminder.html).not.toContain("<a ");
     for (const part of [reminder.subject, reminder.text, reminder.html]) {
       expect(part).not.toMatch(FORMAL);
@@ -436,6 +485,52 @@ describe("claiming the e-mail", () => {
     expect(state.db.events.map((event) => event.level)).toEqual(["INFO", "WARNING"]);
     expect(state.db.events[0].payload).toMatchObject({ recipients: 1 });
     expect(state.db.events[1].message).toContain("not sent to 1 of 2");
+  });
+
+  it("sends the early alert after an all-clear once, and keeps the next one 24 hours away", async () => {
+    // The alert of an earlier incident an hour ago, then the all-clear.
+    Object.assign(state.db.account(), {
+      connectionAlertSentAt: new Date(NOW - HOUR),
+      connectionAllClearSentAt: new Date(NOW - 30 * 60_000),
+      connectionAlertCount: 0,
+    });
+    expect(await sendConnectionAlert(account())).toBe("sent");
+    expect(state.db.account()).toMatchObject({
+      connectionAlertCount: 1,
+      connectionAlertSentAt: new Date(NOW),
+      connectionAlertRearmedAt: new Date(NOW),
+    });
+    expect(resendCalls[0].body.subject).toBe(
+      "Instagram-Verbindung unterbrochen: OpenReply sendet gerade keine DMs"
+    );
+
+    // Back, all-clear, lost again an hour later: nothing within 24 hours.
+    Object.assign(state.db.account(), {
+      connectionAlertCount: 0,
+      connectionAllClearSentAt: new Date(NOW + 30 * 60_000),
+      connectionLostAt: new Date(NOW + HOUR),
+    });
+    vi.setSystemTime(NOW + 2 * HOUR);
+    expect(await sendConnectionAlert(account())).toBe("not-due");
+    expect(resendCalls).toHaveLength(2);
+  });
+
+  it("gives an early alert back without an answer, the early mark too", async () => {
+    Object.assign(state.db.account(), {
+      connectionAlertSentAt: new Date(NOW - HOUR),
+      connectionAllClearSentAt: new Date(NOW - 30 * 60_000),
+    });
+    resendAnswer = () => Response.json({ message: "Internal server error" }, { status: 500 });
+    expect(await sendConnectionAlert(account())).toBe("failed");
+    expect(state.db.account()).toMatchObject({
+      connectionAlertCount: 0,
+      connectionAlertSentAt: new Date(NOW - HOUR),
+      connectionAlertRearmedAt: null,
+    });
+    // The next check still finds it due.
+    resendAnswer = (call) => Response.json({ id: `email_${call}` });
+    vi.setSystemTime(NOW + 30 * 60_000);
+    expect(await sendConnectionAlert(account())).toBe("sent");
   });
 
   it("takes Resend's answer for a key it already has as sent", async () => {

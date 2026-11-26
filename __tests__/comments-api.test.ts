@@ -40,7 +40,11 @@ vi.mock("@/lib/meta/oauth", () => ({ decryptToken: () => "local-test-token" }));
 
 import { GET } from "../app/api/instagram/comments/route";
 import { POST } from "../app/api/instagram/comments/send/route";
-import { MANUAL_SEND_RATE_LIMIT } from "../lib/comments/manual";
+import {
+  MANUAL_SEND_ACCOUNT_LIMIT,
+  MANUAL_SEND_RATE_LIMIT,
+  MANUAL_SEND_SPACING_MS,
+} from "../lib/comments/manual";
 import { FakeRedis } from "./helpers/fake-redis";
 
 const NOW = new Date("2026-11-25T18:00:00.000Z").getTime();
@@ -143,7 +147,7 @@ function comment(
 }
 
 // What Meta has: posts newest first, their comments newest first.
-let media: { id: string; permalink: string }[];
+let media: { id: string; permalink: string; comments_count?: number }[];
 let comments: Record<string, ReturnType<typeof comment>[]>;
 let commentById: Record<string, unknown>;
 let graphErrors: Record<string, { code: number; subcode?: number }>;
@@ -404,6 +408,60 @@ describe("GET /api/instagram/comments", () => {
     expect(graphCalls).toHaveLength(6);
   });
 
+  it("reads no comments of a post Meta lists without any", async () => {
+    media = [
+      { id: "media_1", permalink: "https://www.instagram.com/reel/one/", comments_count: 4 },
+      // Posted a minute ago, no comment yet.
+      { id: "media_2", permalink: "https://www.instagram.com/p/two/", comments_count: 0 },
+      // An older answer without the count: read as before.
+      { id: "media_3", permalink: "https://www.instagram.com/p/three/" },
+    ];
+    const { data } = await json(await getRequest());
+    expect(graphCalls.map((url) => url.pathname)).toEqual([
+      "/v25.0/ig_owner/media",
+      "/v25.0/media_1/comments",
+      "/v25.0/media_3/comments",
+    ]);
+    expect(data.comments.map((row: { mediaId: string }) => row.mediaId)).not.toContain("media_2");
+  });
+
+  it("opens with the newest account connected through Meta, not a newer one through Zernio", async () => {
+    await getRequest();
+    expect(mockPrisma.instagramAccount.findFirst).toHaveBeenCalledWith({
+      where: { workspaceId: WORKSPACE, provider: "META" },
+      orderBy: { connectedAt: "desc" },
+    });
+    // Without any account through Meta: the newest one, which the page then
+    // explains it cannot read.
+    mockPrisma.instagramAccount.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ ...ACCOUNT, provider: "ZERNIO", zernioAccountId: "z1" });
+    const response = await getRequest();
+    expect(response.status).toBe(400);
+    expect((await json(response)).reason).toBe("provider");
+  });
+
+  it("reads a claim older than a send takes as a DM that may have gone out", async () => {
+    mockPrisma.dmLog.findMany.mockResolvedValue([
+      logRow({
+        commentId: "c1",
+        status: "PENDING",
+        dmDeliveryUnconfirmed: true,
+        // A worker died with its claim 20 minutes ago.
+        updatedAt: new Date(NOW - 20 * MINUTE),
+      }),
+      logRow({
+        commentId: "c2",
+        status: "PENDING",
+        dmDeliveryUnconfirmed: true,
+        updatedAt: new Date(NOW - MINUTE),
+      }),
+    ]);
+    const { data } = await json(await getRequest("?ids=c1,c2"));
+    expect(data.statuses.c1.delivery.state).toBe("unconfirmed");
+    expect(data.statuses.c2.delivery.state).toBe("sending");
+  });
+
   it("reads only the posts it has not read yet when more are loaded", async () => {
     media = Array.from({ length: 20 }, (_, index) => ({
       id: `media_${index + 1}`,
@@ -570,7 +628,14 @@ describe("POST /api/instagram/comments/send", () => {
   it("queues the worker's comment job for exactly this campaign", async () => {
     const response = await send({ publicReply: true });
     expect(response.status).toBe(202);
-    expect(await json(response)).toMatchObject({ success: true, queued: true, previousUpdatedAt: null });
+    expect(await json(response)).toMatchObject({
+      success: true,
+      queued: true,
+      previousUpdatedAt: null,
+      queuedAt: new Date(NOW).toISOString(),
+      // The first send of the account goes out right away.
+      scheduledAt: new Date(NOW).toISOString(),
+    });
 
     expect(mockQueueAdd).toHaveBeenCalledTimes(1);
     const [name, data, options] = mockQueueAdd.mock.calls[0];
@@ -590,6 +655,7 @@ describe("POST /api/instagram/comments/send", () => {
     });
     expect(options).toEqual({
       jobId: "manual_ig_owner_c1_c_post_0",
+      delay: 0,
       removeOnComplete: true,
       removeOnFail: true,
     });
@@ -762,18 +828,74 @@ describe("POST /api/instagram/comments/send", () => {
   });
 
   it(`lets one person queue ${MANUAL_SEND_RATE_LIMIT} sends a minute`, async () => {
-    for (let i = 0; i < MANUAL_SEND_RATE_LIMIT; i++) {
-      expect((await send()).status).toBe(202);
-    }
+    // The person's sends of this minute so far (on other accounts too).
+    await (redis.current as FakeRedis).set(
+      "manual-send:rate:user_1",
+      String(MANUAL_SEND_RATE_LIMIT - 1),
+      "PX",
+      60_000
+    );
+    expect((await send()).status).toBe(202);
     const limited = await send();
     expect(limited.status).toBe(429);
     expect((await json(limited)).reason).toBe("rate_limited");
-    expect(mockQueueAdd).toHaveBeenCalledTimes(MANUAL_SEND_RATE_LIMIT);
+    expect(mockQueueAdd).toHaveBeenCalledTimes(1);
 
     // Someone else is not limited by it, and the minute passes.
     mockContext.mockResolvedValueOnce(context("ADMIN", "user_2"));
     expect((await send()).status).toBe(202);
     vi.setSystemTime(NOW + 61_000);
     expect((await send()).status).toBe(202);
+  });
+
+  it(`sends an account's manual DMs ${MANUAL_SEND_SPACING_MS / 1000} seconds apart, and says when`, async () => {
+    const scheduled: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const response = await send();
+      expect(response.status).toBe(202);
+      scheduled.push((await json(response)).scheduledAt);
+    }
+    // One right away, then one every 20 seconds, whoever clicks.
+    expect(mockQueueAdd.mock.calls.map(([, , options]) => options.delay)).toEqual([
+      0,
+      MANUAL_SEND_SPACING_MS,
+      2 * MANUAL_SEND_SPACING_MS,
+    ]);
+    expect(scheduled).toEqual([
+      new Date(NOW).toISOString(),
+      new Date(NOW + MANUAL_SEND_SPACING_MS).toISOString(),
+      new Date(NOW + 2 * MANUAL_SEND_SPACING_MS).toISOString(),
+    ]);
+
+    // Once the slots have passed, the next goes out right away again.
+    vi.setSystemTime(NOW + 10 * MANUAL_SEND_SPACING_MS);
+    await send();
+    expect(mockQueueAdd.mock.calls.at(-1)?.[2].delay).toBe(0);
+  });
+
+  it(`queues at most ${MANUAL_SEND_ACCOUNT_LIMIT} manual DMs an hour for one account, whoever clicks`, async () => {
+    for (let i = 0; i < MANUAL_SEND_ACCOUNT_LIMIT; i++) {
+      mockContext.mockResolvedValueOnce(context("OWNER", `user_${i % 3}`));
+      expect((await send()).status).toBe(202);
+    }
+    mockContext.mockResolvedValueOnce(context("ADMIN", "user_9"));
+    const limited = await send();
+    expect(limited.status).toBe(429);
+    expect((await json(limited)).reason).toBe("account_limit");
+    expect(mockQueueAdd).toHaveBeenCalledTimes(MANUAL_SEND_ACCOUNT_LIMIT);
+
+    // The hour passes.
+    vi.setSystemTime(NOW + 61 * MINUTE);
+    expect((await send()).status).toBe(202);
+  });
+
+  it("refuses a send that would go out after the 7 days, behind others", async () => {
+    // Three sends wait: the fourth would go out a minute after it is due.
+    for (let i = 0; i < 3; i++) expect((await send()).status).toBe(202);
+    verifiableComment({ timestamp: iso(NOW - 7 * DAY + 30_000) });
+    const late = await send();
+    expect(late.status).toBe(409);
+    expect((await json(late)).reason).toBe("too_old");
+    expect(mockQueueAdd).toHaveBeenCalledTimes(3);
   });
 });

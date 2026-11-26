@@ -1,8 +1,9 @@
 /**
  * The catch-up after a lost Instagram connection (A1): which comments of the
  * meantime get their DM queued (the window, the filters, the sweep's
- * matching), how (one job per comment, recover_<ig>_<comment>, one every 20
- * seconds), what the caps and Meta's limits do, that it runs once per
+ * matching), how (one job per comment, recover_<ig>_<comment>, one every 2.5
+ * minutes, in slots of the account's catch-up pace), what the caps and
+ * Meta's limits do, that it runs once per
  * incident, also across restarts, and that it ends with the all-clear e-mail.
  *
  * Meta and Resend are fetch answered here, never called; Redis (the account
@@ -406,20 +407,52 @@ describe("which comments are caught up", () => {
     expect(commentReads("p_new")).toHaveLength(0);
   });
 
-  it("leaves a comment alone that has a DmLog row, whatever it says", async () => {
+  it("leaves a comment alone whose DmLog row settles it", async () => {
+    const row = (commentId: string, extra: Record<string, unknown>) => ({
+      instagramAccountId: "account_1",
+      automationId: "c_any",
+      commentId,
+      status: "FAILED",
+      ...extra,
+    });
     state.db.dmLogs.push(
-      { instagramAccountId: "account_1", automationId: "c_any", commentId: "c_failed", status: "FAILED" },
-      { instagramAccountId: "account_1", automationId: "c_any", commentId: "c_pending", status: "PENDING" }
+      row("c_sent", { status: "SENT", attempts: 1 }),
+      row("c_unconfirmed", { attempts: 1, dmDeliveryUnconfirmed: true }),
+      row("c_legacy", { attempts: 1, errorMessage: "MetaApiError 1: An unknown error occurred" }),
+      row("c_other_campaign", { status: "SKIPPED_DEDUP" }),
+      row("c_plan_limit", { status: "SKIPPED_PLAN_LIMIT" }),
+      row("c_attempts_used", { attempts: 3 })
     );
     posts = [
       post("p1", [
-        comment("c_failed", "guide", HOUR),
-        comment("c_pending", "guide", HOUR),
+        ...[
+          "c_sent",
+          "c_unconfirmed",
+          "c_legacy",
+          "c_other_campaign",
+          "c_plan_limit",
+          "c_attempts_used",
+        ].map((id) => comment(id, "guide", HOUR)),
         comment("c_new", "guide", HOUR),
       ]),
     ];
     await run();
     expect(commentJobs().map((job) => job.data.commentId)).toEqual(["c_new"]);
+    expect(result()?.queued).toBe(1);
+  });
+
+  it("queues a comment again whose job waited or failed with attempts left, as one that met an incident", async () => {
+    // A catch-up job of the last incident ran into this one: the connection
+    // was lost (the DM waits, no attempt), or Meta refused once.
+    state.db.dmLogs.push(
+      { instagramAccountId: "account_1", automationId: "c_any", commentId: "c_waiting", status: "PENDING" },
+      { instagramAccountId: "account_1", automationId: "c_any", commentId: "c_refused", status: "FAILED", attempts: 1 }
+    );
+    posts = [
+      post("p1", [comment("c_waiting", "guide", HOUR), comment("c_refused", "guide", 2 * HOUR)]),
+    ];
+    await run();
+    expect(commentJobs().map((job) => job.data.commentId)).toEqual(["c_waiting", "c_refused"]);
   });
 
   it("skips comments outside Instagram's 7 days for a private reply, even inside the incident", async () => {
@@ -518,7 +551,7 @@ describe("which comments are caught up", () => {
 });
 
 describe("the jobs", () => {
-  it("are one per comment, the first right away, then one every 20 seconds across posts", async () => {
+  it("are one per comment, the first right away, then one every 2.5 minutes across posts", async () => {
     posts = [
       post("p1", [comment("p1_late", "guide", 3 * HOUR), comment("p1_early", "guide", HOUR)]),
       post("p2", [comment("p2", "guide", 2 * HOUR)]),
@@ -526,13 +559,26 @@ describe("the jobs", () => {
     await run();
     expect(commentJobs().map((job) => [job.opts.jobId, job.opts.delay])).toEqual([
       ["recover_ig_1_p1_early", 0],
-      ["recover_ig_1_p1_late", 20_000],
-      ["recover_ig_1_p2", 40_000],
+      ["recover_ig_1_p1_late", 150_000],
+      ["recover_ig_1_p2", 300_000],
     ]);
     expect(result()).toMatchObject({
       firstJobAt: new Date(NOW).toISOString(),
-      lastJobAt: new Date(NOW + 40_000).toISOString(),
+      lastJobAt: new Date(NOW + 300_000).toISOString(),
     });
+    // The account's catch-up pace holds the last slot, for the copies of
+    // these jobs that wait for a pause.
+    expect(await (state.redis as FakeRedis).get("pace:recovery:ig_1")).toBe(String(NOW + 300_000));
+  });
+
+  it("plans its jobs after the slots that copies of earlier ones already took", async () => {
+    // Two copies of catch-up jobs that waited for a pause took the slots up
+    // to five minutes from now.
+    await (state.redis as FakeRedis).set("pace:recovery:ig_1", String(NOW + 300_000), "PX", HOUR);
+    posts = [post("p1", [comment("c1", "guide", HOUR), comment("c2", "guide", 2 * HOUR)])];
+    await run();
+    expect(commentJobs().map((job) => job.opts.delay)).toEqual([450_000, 600_000]);
+    expect(result()?.lastJobAt).toBe(new Date(NOW + 600_000).toISOString());
   });
 
   it("get the same id when a later catch-up finds the comment again, so the queue keeps one", async () => {
@@ -588,17 +634,21 @@ describe("the caps", () => {
     expect(event.message).toContain("1 posts read in part");
   });
 
-  it("queues at most 1,000 comments and counts the rest", async () => {
+  it("queues at most 500 comments and counts the rest", async () => {
     posts = [
       post(
         "p1",
-        Array.from({ length: 1_050 }, (_, index) => comment(`c${index}`, "guide", 3 * HOUR - index * 1000))
+        Array.from({ length: 550 }, (_, index) => comment(`c${index}`, "guide", 3 * HOUR - index * 1000))
       ),
     ];
     await run();
-    expect(commentJobs()).toHaveLength(1_000);
-    expect(result()).toMatchObject({ queued: 1_000, complete: false });
+    expect(commentJobs()).toHaveLength(500);
+    expect(result()).toMatchObject({ queued: 500, complete: false });
     expect(result()?.skipped.notQueued).toBe(50);
+    // The last one inside the 30 hours the sweep stands back.
+    const last = Date.parse(result()!.lastJobAt!);
+    expect(last - NOW).toBe(499 * 150_000);
+    expect(last).toBeLessThan(RECOVERED.getTime() + 30 * HOUR);
   });
 });
 
@@ -664,7 +714,7 @@ describe("the R1 pause and Meta's limits", () => {
     expect(commentJobs().map((job) => [job.data.commentId, job.opts.delay])).toEqual([
       ["c1", 0],
       ["c2", 0],
-      ["c3", 20_000],
+      ["c3", 150_000],
     ]);
     expect(result()?.queued).toBe(3);
   });
@@ -894,9 +944,9 @@ describe("the worker's sweep", () => {
     ];
     expect(catchUpHoldsSweep(account(), NOW)).toBe(true);
     await run();
-    // Its last job runs 40 seconds from now.
-    expect(catchUpHoldsSweep(account(), NOW + 30_000)).toBe(true);
-    expect(catchUpHoldsSweep(account(), NOW + 41_000)).toBe(false);
+    // Its last job runs five minutes from now.
+    expect(catchUpHoldsSweep(account(), NOW + 290_000)).toBe(true);
+    expect(catchUpHoldsSweep(account(), NOW + 301_000)).toBe(false);
     // Never longer than 30 hours after the incident ended.
     account().connectionCatchUpFrom = LOST_AT;
     expect(catchUpHoldsSweep(account(), RECOVERED.getTime() + 31 * HOUR)).toBe(false);

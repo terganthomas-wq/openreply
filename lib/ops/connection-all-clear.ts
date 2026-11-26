@@ -11,7 +11,9 @@
  *
  * Once per catch-up: the finished catch-up sets connectionAllClearDueAt, and
  * one conditional update of the account row takes it before the e-mail is
- * sent, so two senders at once send it once. A send that got no answer (a
+ * sent, so two senders at once send it once. Once it reached someone,
+ * connectionAllClearSentAt records it: a connection lost again after it gets
+ * its alert at once (lib/ops/connection-alert.ts). A send that got no answer (a
  * timeout, 429, 5xx) gives it back, and the worker's next sweep tries again
  * with the same Idempotency-Key, which Resend keeps for 24 hours; a refusal
  * keeps it taken. Without e-mail settings or recipients nothing is taken, and
@@ -190,6 +192,21 @@ export async function sendConnectionAllClear(
   const delivered = results.length - failures.length;
 
   if (delivered > 0) {
+    // Only an all-clear that went out counts: should the connection drop
+    // again, its alert goes out at once instead of up to 24 hours after the
+    // last warning (lib/ops/connection-alert.ts), as the owners' last e-mail
+    // said it is back. Best effort: without it the 24 hours hold as before.
+    await prisma.instagramAccount
+      .updateMany({
+        where: { id: account.id },
+        data: { connectionAllClearSentAt: new Date(now) },
+      })
+      .catch((error) =>
+        console.error(
+          "[All-clear] Could not record the sent all-clear:",
+          error instanceof Error ? error.message : "unknown error"
+        )
+      );
     await logWorkerEvent({
       workspaceId: account.workspaceId,
       level: "INFO",

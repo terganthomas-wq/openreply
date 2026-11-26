@@ -778,6 +778,40 @@ describe("the sweep and the catch-up after a lost connection", () => {
     log.mockRestore();
   });
 
+  it("stands back until the copies of catch-up jobs that waited for a pause have run", async () => {
+    const recovered = new Date(Date.now() - 10 * 60_000);
+    // The catch-up's own last job ran a minute ago, but copies of its jobs
+    // that met an R1 pause took slots of its pace up to 20 minutes from now.
+    const result = {
+      v: 1,
+      lostAt: new Date(Date.now() - 3_600_000).toISOString(),
+      recoveredAt: recovered.toISOString(),
+      finishedAt: recovered.toISOString(),
+      since: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+      lastJobAt: new Date(Date.now() - 60_000).toISOString(),
+    };
+    mockPrisma.automation.findMany.mockResolvedValue([
+      campaign("copies", { connectionRecoveredAt: recovered, connectionCatchUpFrom: null }),
+      campaign("drained", { connectionRecoveredAt: recovered, connectionCatchUpFrom: null }),
+    ]);
+    mockPrisma.instagramAccount.findUnique.mockResolvedValue({
+      connectionRecoveredAt: recovered,
+      connectionCatchUpFrom: null,
+      connectionCatchUpProgress: null,
+      connectionCatchUpResult: result,
+    });
+    const fake = redis.current as FakeRedis;
+    await fake.set("pace:recovery:owner-copies", String(Date.now() + 20 * 60_000), "PX", 3_600_000);
+    await fake.set("pace:recovery:owner-drained", String(Date.now() - 60_000), "PX", 3_600_000);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await reconcileComments();
+
+    expect(queueAdd.mock.calls.map(([, data]) => data.instagramAccountId)).toEqual(["owner-drained"]);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("@studio_copies is catching up"));
+    log.mockRestore();
+  });
+
   it("sweeps it again 30 hours after the incident ended, whatever the catch-up says", async () => {
     mockPrisma.automation.findMany.mockResolvedValue([
       campaign("stuck", {

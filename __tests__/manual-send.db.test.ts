@@ -4,12 +4,13 @@
  * of a comment's DM holds as for a webhook or a sweep job.
  *
  * What keeps a comment at one private reply lives in where clauses no mock
- * evaluates: the claim on the campaign's DmLog row, and the check of the other
- * campaigns' rows before and after it. So the jobs run here on the real
- * tables, several at once. Instagram, Redis (the account pause), the queue,
- * the usage counter and the hourly limiter are replaced. Skipped without
- * TEST_DATABASE_URL; each run builds its own throwaway schema from
- * prisma/migrations and drops it at the end.
+ * evaluates: the claim on the campaign's DmLog row, taken in one transaction
+ * with the check of the other campaigns' rows, under a lock on the comment.
+ * So the jobs run here on the real tables, several at once: a manual send,
+ * the webhook's, the sweep's and the catch-up's jobs. Instagram, Redis (the
+ * account pause), the queue, the usage counter and the hourly limiter are
+ * replaced. Skipped without TEST_DATABASE_URL; each run builds its own
+ * throwaway schema from prisma/migrations and drops it at the end.
  */
 import { randomBytes } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
@@ -25,10 +26,20 @@ const state = vi.hoisted(() => ({
   redis: null as unknown,
   processor: null as null | ((job: unknown) => Promise<void>),
 }));
-const { mockQueueAdd, mockSendPrivateReply, mockSendCommentReply } = vi.hoisted(() => ({
+const {
+  mockQueueAdd,
+  mockSendPrivateReply,
+  mockSendPrivateReplyWithButton,
+  mockSendCommentReply,
+  mockGetUserFollowStatus,
+  mockSendDirectMessage,
+} = vi.hoisted(() => ({
   mockQueueAdd: vi.fn(),
   mockSendPrivateReply: vi.fn(),
+  mockSendPrivateReplyWithButton: vi.fn(),
   mockSendCommentReply: vi.fn(),
+  mockGetUserFollowStatus: vi.fn(),
+  mockSendDirectMessage: vi.fn(),
 }));
 
 vi.mock("@/lib/db/client", () => ({
@@ -51,14 +62,16 @@ vi.mock("@/lib/queue/client", () => ({
 vi.mock("@/lib/meta/client", () => {
   class MetaApiError extends Error {
     code: number;
+    subcode: number | undefined;
     constructor(
       code: number,
-      _subcode: number | undefined,
+      subcode: number | undefined,
       _fbTraceId: string | undefined,
       message: string
     ) {
       super(message);
       this.code = code;
+      this.subcode = subcode;
       this.name = "MetaApiError";
     }
   }
@@ -76,7 +89,11 @@ vi.mock("@/lib/meta/client", () => {
   }
   return {
     sendPrivateReply: mockSendPrivateReply,
+    sendPrivateReplyWithButton: mockSendPrivateReplyWithButton,
     sendCommentReply: mockSendCommentReply,
+    // The follow gate and the link a tap brings.
+    getUserFollowStatus: mockGetUserFollowStatus,
+    sendDirectMessage: mockSendDirectMessage,
     MetaApiError,
     TokenExpiredError,
     RateLimitError,
@@ -117,6 +134,7 @@ vi.mock("bullmq", () => ({
 }));
 
 import { createDMWorker } from "../lib/queue/dm-worker";
+import { MetaApiError } from "../lib/meta/client";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const schema = `manual_send_${randomBytes(4).toString("hex")}`;
@@ -176,6 +194,52 @@ function sweepJob(commentId: string, commentText: string) {
     commenterId: `person_${commentId}`,
     source: "POLLING",
   });
+}
+
+// What the catch-up after a lost connection queues (connection-catch-up.ts).
+function recoverJob(commentId: string, commentText: string) {
+  return job(`recover_${ACCOUNT}_${commentId}`, {
+    commentId,
+    commentText,
+    commenterId: `person_${commentId}`,
+    source: "RECOVERY",
+  });
+}
+
+/**
+ * The copies a comment job queued to look again while another campaign's DM
+ * was on its way (<job base>_dedup_<n>), run as BullMQ would run them, until
+ * none is left. Returns how many ran.
+ */
+async function runRecheckCopies(run: (value: unknown) => Promise<void>): Promise<number> {
+  let ran = 0;
+  for (let round = 0; round < 10; round++) {
+    const copies = mockQueueAdd.mock.calls.filter(([, , options]) =>
+      String(options?.jobId).includes("_dedup_")
+    );
+    mockQueueAdd.mockClear();
+    if (copies.length === 0) return ran;
+    for (const [name, data, options] of copies) {
+      await run({ name, id: options.jobId, attemptsMade: 0, opts: { attempts: 3 }, timestamp: Date.now(), data });
+      ran += 1;
+    }
+  }
+  throw new Error("the re-check copies never ended");
+}
+
+/** A send that waits until the test lets it go on. */
+function heldSend() {
+  let release!: (value: unknown) => void;
+  let refuse!: (error: unknown) => void;
+  const sent = new Promise((resolve, reject) => {
+    release = resolve;
+    refuse = reject;
+  });
+  return {
+    impl: () => sent,
+    release: () => release({ recipient_id: "p", message_id: "m" }),
+    refuse: (error: unknown) => refuse(error),
+  };
 }
 
 function row(automationId: string, commentId: string) {
@@ -300,7 +364,10 @@ describe.skipIf(!databaseUrl)("manual sends from the Kommentare page on Postgres
     state.redis = new FakeRedis();
     mockQueueAdd.mockReset().mockResolvedValue({});
     mockSendPrivateReply.mockReset().mockImplementation(slowSend);
+    mockSendPrivateReplyWithButton.mockReset().mockImplementation(slowSend);
     mockSendCommentReply.mockReset().mockResolvedValue({ id: "reply" });
+    mockGetUserFollowStatus.mockReset().mockResolvedValue(false);
+    mockSendDirectMessage.mockReset().mockResolvedValue({ recipient_id: "p", message_id: "m" });
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
   });
@@ -390,9 +457,13 @@ describe.skipIf(!databaseUrl)("manual sends from the Kommentare page on Postgres
 
       expect(outcomes.map((o) => o.status)).toEqual(["fulfilled", "fulfilled", "fulfilled"]);
       expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
-      expect(await row("c_guide", commentId)).toMatchObject({ status: "SENT", attempts: 1 });
-      // Its one public reply, by whichever job sent the DM.
-      expect(mockSendCommentReply.mock.calls.length).toBeLessThanOrEqual(1);
+      const sent = await row("c_guide", commentId);
+      expect(sent).toMatchObject({ status: "SENT", attempts: 1 });
+      // Its one public reply, by whichever job sent the DM: none when the
+      // manual send won, whose owner switched it off.
+      expect(mockSendCommentReply.mock.calls.length).toBe(
+        sent?.matchedKeyword === "(manuell)" ? 0 : 1
+      );
     });
 
     it(`sends one DM when the webhook and the sweep answer with another campaign (${order.join(", ")})`, async () => {
@@ -405,37 +476,223 @@ describe.skipIf(!databaseUrl)("manual sends from the Kommentare page on Postgres
         sweep: () => run(sweepJob(commentId, "LINK")),
       };
       const outcomes = await Promise.allSettled(order.map((name) => jobs[name]()));
-
       expect(outcomes.map((o) => o.status)).toEqual(["fulfilled", "fulfilled", "fulfilled"]);
-      expect(mockSendPrivateReply.mock.calls.length).toBeLessThanOrEqual(1);
+      // A campaign that found the other's DM on its way looks again shortly.
+      await runRecheckCopies(run);
+
+      // Exactly one DM: nobody stood back for good while the other was only
+      // on its way.
+      expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
       const rows = await state.db.dmLog.findMany({ where: { commentId } });
-      // At most one row says the DM went out or may have; none is left claimed.
-      expect(rows.filter((r) => r.status === "SENT")).toHaveLength(
-        mockSendPrivateReply.mock.calls.length
-      );
+      expect(rows.filter((r) => r.status === "SENT")).toHaveLength(1);
+      // None is left claimed, and the campaign that stood back used no attempt.
       expect(rows.filter((r) => r.dmDeliveryUnconfirmed)).toHaveLength(0);
-      // A campaign that stood back gave its attempt back.
       for (const r of rows.filter((r) => r.status !== "SENT")) {
         expect(r).toMatchObject({ status: "SKIPPED_DEDUP", attempts: 0 });
+        expect(r.errorMessage).toContain("already sent the one private reply");
       }
     });
   }
 
-  it("stands back while another campaign's DM is on its way", async () => {
+  it("posts no public reply for the manual send while a catch-up job runs next to its DM (public reply off)", async () => {
+    const send = heldSend();
+    mockSendPrivateReply.mockImplementationOnce(send.impl);
+    const manual = run(manualJob("po1", "c_guide", { commentText: "GUIDE" }));
+    await vi.waitFor(() => expect(mockSendPrivateReply).toHaveBeenCalledTimes(1));
+
+    // The catch-up's job for the same comment and campaign, while the
+    // manual DM is on its way: the claim it finds already closed the public
+    // reply, and a claim on its way is not a DM that went out.
+    await run(recoverJob("po1", "GUIDE"));
+    expect(mockSendCommentReply).not.toHaveBeenCalled();
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+
+    send.release();
+    await manual;
+    expect(await row("c_guide", "po1")).toMatchObject({
+      status: "SENT",
+      matchedKeyword: "(manuell)",
+      publicReplySentAt: null,
+      publicReplyDeliveryUnconfirmed: true,
+    });
+    // Later jobs post nothing either.
+    await run(webhookJob("po1", "GUIDE"));
+    expect(mockSendCommentReply).not.toHaveBeenCalled();
+  });
+
+  it("leaves no public reply behind when that manual DM is then refused", async () => {
+    const send = heldSend();
+    mockSendPrivateReply.mockImplementationOnce(send.impl);
+    const manual = run(manualJob("po2", "c_guide", { commentText: "GUIDE" }));
+    await vi.waitFor(() => expect(mockSendPrivateReply).toHaveBeenCalledTimes(1));
+    await run(recoverJob("po2", "GUIDE"));
+
+    send.refuse(new MetaApiError(10, undefined, "trace", "(#10) refused"));
+    await expect(manual).rejects.toThrow("refused");
+    expect(await row("c_guide", "po2")).toMatchObject({
+      status: "FAILED",
+      dmDeliveryUnconfirmed: false,
+      attempts: 1,
+    });
+    // No "Schau in deine DMs" under a comment that got no DM.
+    expect(mockSendCommentReply).not.toHaveBeenCalled();
+
+    // The owner tries again with the public reply on: it goes out now.
+    await run(manualJob("po2", "c_guide", { commentText: "GUIDE", publicReplyOverride: true }));
+    expect(await row("c_guide", "po2")).toMatchObject({
+      status: "SENT",
+      attempts: 2,
+      publicReplySentAt: expect.any(Date),
+    });
+    expect(mockSendCommentReply).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends one private reply when a catch-up job and a sweep job meet a comment two campaigns match", async () => {
+    // Two active campaigns for the same word: one bound to the post, one for
+    // any post (the worker answers with the bound one first).
+    await state.db.automation.createMany({
+      data: [
+        {
+          id: "c_two_bound",
+          workspaceId: "workspace",
+          instagramAccountId: "account",
+          name: "Zwei (Reel)",
+          postId: "media_1",
+          keywords: ["ZWEI"],
+          dmMessage: "Hier ist dein Reel-Guide",
+          publicReplyEnabled: true,
+          publicReplyMessages: ["Reel: schau in deine DMs"],
+          createdAt: new Date(NOW - 500),
+        },
+        {
+          id: "c_two_any",
+          workspaceId: "workspace",
+          instagramAccountId: "account",
+          name: "Zwei (alle)",
+          matchAnyPost: true,
+          keywords: ["ZWEI"],
+          dmMessage: "Hier ist dein Guide (alle)",
+          publicReplyEnabled: true,
+          publicReplyMessages: ["Alle: schau in deine DMs"],
+          createdAt: new Date(NOW - 400),
+        },
+      ],
+    });
+    const send = heldSend();
+    mockSendPrivateReply.mockImplementationOnce(send.impl);
+    const recover = run(recoverJob("two1", "ZWEI"));
+    await vi.waitFor(() => expect(mockSendPrivateReply).toHaveBeenCalledTimes(1));
+
+    // The sweep's job while the catch-up's DM for the bound campaign is on
+    // its way: no second private reply, and no public reply ahead of the DM.
+    await run(sweepJob("two1", "ZWEI"));
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+    expect(mockSendCommentReply).not.toHaveBeenCalled();
+    expect(await row("c_two_any", "two1")).toMatchObject({ status: "PENDING", attempts: 0 });
+
+    send.release();
+    await recover;
+    await runRecheckCopies(run);
+
+    expect(mockSendPrivateReply.mock.calls.map((call) => call[3])).toEqual([
+      "Hier ist dein Reel-Guide",
+    ]);
+    expect(mockSendCommentReply.mock.calls.map((call) => call[2])).toEqual([
+      "Reel: schau in deine DMs",
+    ]);
+    expect(await row("c_two_bound", "two1")).toMatchObject({ status: "SENT", attempts: 1 });
+    expect(await row("c_two_any", "two1")).toMatchObject({
+      status: "SKIPPED_DEDUP",
+      attempts: 0,
+      errorMessage: expect.stringContaining("Another campaign (Zwei (Reel)) already sent"),
+    });
+  });
+
+  it("never lets a manual send and a catch-up job for two campaigns both stand back", async () => {
+    // Both claim at the same moment: one gets the comment, the other waits.
+    const outcomes = await Promise.allSettled([
+      run(manualJob("both1", "c_link", { commentText: "GUIDE" })),
+      run(recoverJob("both1", "GUIDE")),
+    ]);
+    expect(outcomes.map((o) => o.status)).toEqual(["fulfilled", "fulfilled"]);
+    await runRecheckCopies(run);
+
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+    const rows = await state.db.dmLog.findMany({ where: { commentId: "both1" } });
+    expect(rows.filter((r) => r.status === "SENT")).toHaveLength(1);
+    expect(rows.filter((r) => r.status === "SKIPPED_DEDUP")).toHaveLength(1);
+    expect(rows.every((r) => !r.dmDeliveryUnconfirmed)).toBe(true);
+  });
+
+  it("sends with the other campaign once the DM it waited for was refused", async () => {
+    // The catch-up's DM for c_guide is on its way and then refused; the
+    // manual send with c_link waited for it and sends after all.
+    const send = heldSend();
+    mockSendPrivateReply.mockImplementationOnce(send.impl);
+    const recover = run(recoverJob("both2", "GUIDE"));
+    await vi.waitFor(() => expect(mockSendPrivateReply).toHaveBeenCalledTimes(1));
+    await run(manualJob("both2", "c_link", { commentText: "GUIDE" }));
+    expect(await row("c_link", "both2")).toMatchObject({
+      status: "PENDING",
+      attempts: 0,
+      errorMessage: expect.stringContaining("Waiting: another campaign (Guide) is sending"),
+    });
+
+    send.refuse(new MetaApiError(10, undefined, "trace", "(#10) refused"));
+    await expect(recover).rejects.toThrow("refused");
+    await runRecheckCopies(run);
+
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(2);
+    expect(mockSendPrivateReply.mock.calls[1][3]).toBe("Hier ist dein Link");
+    expect(await row("c_link", "both2")).toMatchObject({
+      status: "SENT",
+      attempts: 1,
+      matchedKeyword: "(manuell)",
+    });
+  });
+
+  it("waits while another campaign's DM is on its way, and stands back once it went out", async () => {
     await seedRow("c_link", "m4", { status: "PENDING", dmDeliveryUnconfirmed: true, attempts: 1 });
 
     await run(manualJob("m4", "c_guide"));
 
     expect(mockSendPrivateReply).not.toHaveBeenCalled();
     expect(await row("c_guide", "m4")).toMatchObject({
+      status: "PENDING",
+      attempts: 0,
+      errorMessage: expect.stringContaining("Waiting: another campaign (Link) is sending"),
+    });
+    // That DM went out meanwhile: the copy stands back for good.
+    await state.db.dmLog.update({
+      where: { automationId_commentId: { automationId: "c_link", commentId: "m4" } },
+      data: { status: "SENT", dmDeliveryUnconfirmed: false },
+    });
+    expect(await runRecheckCopies(run)).toBe(1);
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(await row("c_guide", "m4")).toMatchObject({
       status: "SKIPPED_DEDUP",
       attempts: 0,
       matchedKeyword: "(manuell)",
+      errorMessage: expect.stringContaining("Another campaign (Link) already sent"),
+    });
+  });
+
+  it("stands back for good for a claim older than a send takes", async () => {
+    // A worker died with its claim twenty minutes ago: its DM may have gone out.
+    vi.setSystemTime(NOW - 20 * 60_000);
+    await seedRow("c_link", "m4b", { status: "PENDING", dmDeliveryUnconfirmed: true, attempts: 1 });
+    vi.setSystemTime(NOW);
+
+    await run(manualJob("m4b", "c_guide"));
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+    expect(await row("c_guide", "m4b")).toMatchObject({
+      status: "SKIPPED_DEDUP",
       errorMessage: expect.stringContaining("Another campaign (Link) is sending, or may have sent"),
     });
   });
 
-  it("lets an automatic job stand back for a manual send on its way", async () => {
+  it("lets an automatic job wait for a manual send on its way", async () => {
     await seedRow("c_guide", "m5", {
       status: "PENDING",
       dmDeliveryUnconfirmed: true,
@@ -446,16 +703,27 @@ describe.skipIf(!databaseUrl)("manual sends from the Kommentare page on Postgres
     await run(webhookJob("m5", "LINK"));
 
     expect(mockSendPrivateReply).not.toHaveBeenCalled();
-    // The claim it took is given back with its attempt, and the comment is
-    // left to the manual send for good.
+    // Nothing claimed, no attempt used: the comment waits for the manual send.
     expect(await row("c_link", "m5")).toMatchObject({
-      status: "SKIPPED_DEDUP",
+      status: "PENDING",
       attempts: 0,
       dmDeliveryUnconfirmed: false,
-      errorMessage: expect.stringContaining("sent by hand with another campaign (Guide)"),
+      errorMessage: expect.stringContaining("Waiting: another campaign (Guide) is sending"),
     });
     // The manual send's own claim is untouched.
     expect(await row("c_guide", "m5")).toMatchObject({ status: "PENDING", dmDeliveryUnconfirmed: true });
+
+    await state.db.dmLog.update({
+      where: { automationId_commentId: { automationId: "c_guide", commentId: "m5" } },
+      data: { status: "SENT", dmDeliveryUnconfirmed: false },
+    });
+    await runRecheckCopies(run);
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(await row("c_link", "m5")).toMatchObject({
+      status: "SKIPPED_DEDUP",
+      attempts: 0,
+      errorMessage: expect.stringContaining("Another campaign (Guide) already sent"),
+    });
   });
 
   it("never sends next to a DM that went out or may have", async () => {
@@ -509,6 +777,68 @@ describe.skipIf(!databaseUrl)("manual sends from the Kommentare page on Postgres
       source: "MANUAL",
       pauseRequeue: 1,
     });
+  });
+
+  it("lets the tap on a paused follow-gate campaign sent by hand bring the link", async () => {
+    await state.db.automation.create({
+      data: {
+        id: "c_gate",
+        workspaceId: "workspace",
+        instagramAccountId: "account",
+        name: "Gate (pausiert)",
+        isActive: false,
+        matchAnyPost: true,
+        keywords: ["GATE"],
+        requireFollow: true,
+        dmMessage: "Hier ist dein Gate-Link",
+        followPromptMessage: "Folg mir kurz, dann kommt der Link",
+        followPromptButtonLabel: "Ich folge",
+        createdAt: new Date(NOW - 100),
+      },
+    });
+    // Someone who does not follow yet: the private reply is the follow request.
+    await run(manualJob("g1", "c_gate", { commentText: "gate bitte" }));
+    expect(mockSendPrivateReplyWithButton).toHaveBeenCalledWith(
+      AUTH,
+      ACCOUNT,
+      "g1",
+      "Folg mir kurz, dann kommt der Link",
+      "Ich folge",
+      "followcheck:c_gate"
+    );
+    expect(await row("c_gate", "g1")).toMatchObject({ status: "SENT", matchedKeyword: "(manuell)" });
+
+    // They follow and tap: the paused campaign answers the tap.
+    mockGetUserFollowStatus.mockResolvedValue(true);
+    const tap = (userId: string, mid: string) =>
+      run({
+        name: "process-postback",
+        id: `postback_${mid}`,
+        attemptsMade: 0,
+        opts: { attempts: 3 },
+        timestamp: Date.now(),
+        data: {
+          instagramAccountId: ACCOUNT,
+          accountConnectionId: "account",
+          userId,
+          payload: "followcheck:c_gate",
+          mid,
+        },
+      });
+    await tap("person_g1", "mid_g1");
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    expect(mockSendDirectMessage).toHaveBeenCalledWith(
+      AUTH,
+      ACCOUNT,
+      "person_g1",
+      "Hier ist dein Gate-Link"
+    );
+    expect(await row("c_gate", "reveal:person_g1")).toMatchObject({ status: "SENT" });
+
+    // Someone the paused campaign was never sent to by hand gets nothing.
+    await tap("person_stranger", "mid_stranger");
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    expect(await row("c_gate", "reveal:person_stranger")).toBeNull();
   });
 
   it("sends nothing for a campaign that was deleted meanwhile, and says so", async () => {

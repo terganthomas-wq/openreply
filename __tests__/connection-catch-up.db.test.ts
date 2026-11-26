@@ -136,8 +136,8 @@ describe.skipIf(!databaseUrl)("the catch-up on Postgres", () => {
       .map((entry) => entry.name)
       .sort((a, b) => a.localeCompare(b));
     expect(dirs).toContain(MIGRATION);
-    // The new migration is the newest one.
-    expect(dirs.at(-1)).toBe(MIGRATION);
+    // Every other migration first (a later one only adds columns of its own),
+    // so the account is written as the release before this one wrote it.
     for (const name of dirs.filter((name) => name !== MIGRATION)) {
       await sql.query(readFileSync(path.join(root, name, "migration.sql"), "utf8"));
     }
@@ -196,7 +196,10 @@ describe.skipIf(!databaseUrl)("the catch-up on Postgres", () => {
         commenterId: "person_2",
         commentText: "guide",
         commentId: "c_logged",
-        status: "FAILED",
+        // Its DM went out: the row settles the comment. (One that only
+        // waits, or failed with attempts left, is queued again.)
+        status: "SENT",
+        attempts: 1,
       },
     });
   }, 60_000);
@@ -282,7 +285,7 @@ describe.skipIf(!databaseUrl)("the catch-up on Postgres", () => {
     const outcomes = await Promise.all([catchUp(), catchUp()]);
     expect(outcomes.sort()).toEqual(["busy", "done"]);
 
-    // c_logged has a DmLog row: another job handles it.
+    // c_logged has a DmLog row that settles it: another job sent its DM.
     expect(commentJobs().map((job) => job.opts.jobId)).toEqual(["recover_ig_db_c1", "recover_ig_db_c2"]);
     expect(metaCalls.filter((url) => url.pathname.endsWith("/comments"))).toHaveLength(2);
     expect(resendTo.sort()).toEqual(["admin@example.test", "owner@example.test"]);

@@ -151,6 +151,27 @@ export function latestMetaUsage(): LatestMetaUsage | null {
   return latest;
 }
 
+/**
+ * Meta reports its usage over the last hour: a report older than this says
+ * little about the hour now.
+ */
+export const META_USAGE_FRESH_MS = 5 * 60_000;
+
+/**
+ * The highest share of a limit (percent) that the last report of this process
+ * gives for the account (accountUsagePercent), or null when there is none
+ * from the last META_USAGE_FRESH_MS. The catch-up's DMs wait while it is high
+ * (lib/queue/dm-worker.ts).
+ */
+export function recentAccountUsagePercent(
+  instagramId: string,
+  now: number = Date.now(),
+  maxAgeMs: number = META_USAGE_FRESH_MS
+): number | null {
+  if (!latest || now - latest.at > maxAgeMs) return null;
+  return accountUsagePercent(latest.usage, instagramId);
+}
+
 /** Tests: forget the last report. */
 export function resetLatestMetaUsage(): void {
   latest = null;

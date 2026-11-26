@@ -41,3 +41,23 @@ export async function getWorkspaceInstagramAccount(
   });
 }
 
+/**
+ * The account a page that works through Meta only (the Kommentare page)
+ * opens with: the one asked for, or else the workspace's newest account
+ * connected through Meta, and the newest of any kind when there is none (the
+ * page then says why it cannot work with it).
+ */
+export async function getWorkspaceMetaAccount(
+  workspaceId: string,
+  instagramAccountId?: string | null
+) {
+  if (instagramAccountId && instagramAccountId !== "all") {
+    return getWorkspaceInstagramAccount(workspaceId, instagramAccountId);
+  }
+  return (
+    (await prisma.instagramAccount.findFirst({
+      where: { workspaceId, provider: "META" },
+      orderBy: { connectedAt: "desc" },
+    })) ?? getWorkspaceInstagramAccount(workspaceId)
+  );
+}

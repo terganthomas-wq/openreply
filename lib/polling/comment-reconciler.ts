@@ -33,9 +33,10 @@
  *
  * After a lost connection (A1) the account is not swept either while its
  * catch-up runs and until the last comment job it queued has run
- * (catchUpHoldsSweep): the catch-up reads every post since the incident began
- * and spaces the DMs 20 seconds apart, and the sweep would queue the same
- * comments again all at once.
+ * (catchUpHoldsSweep), or a copy of one that waited for a pause or for
+ * Meta's usage (the catch-up's pace, lib/queue/send-pacing.ts): the catch-up
+ * reads every post since the incident began and spaces the DMs 2.5 minutes
+ * apart, and the sweep would queue the same comments again all at once.
  */
 
 import { matchCommentToCampaign } from "@/lib/automation/comment-match";
@@ -52,6 +53,7 @@ import { prisma } from "@/lib/db/client";
 import { SWEEP_LIMIT_EVENT } from "@/lib/ops/event-details";
 import { checkAccountPause, formatPauseTime } from "@/lib/queue/account-pause";
 import { COMMENT_JOB_NAME, getDMQueue } from "@/lib/queue/client";
+import { lastPacedSlot, recoveryPaceKey } from "@/lib/queue/send-pacing";
 import {
   getAllUserMedia,
   getRecentMediaComments,
@@ -211,10 +213,14 @@ export async function reconcileComments(): Promise<void> {
  * Whether the account's catch-up after a lost connection holds the sweep
  * back (catchUpHoldsSweep). The catch-up's JSON (when its last job runs) is
  * read only in the hours after an incident, and once per account and sweep.
- * A failed read holds nothing back: the sweep is the safety net.
+ * Its jobs that waited for an R1 pause or for Meta's usage run as copies in
+ * later slots of the catch-up's pace: the sweep stands back until the last
+ * slot has passed too, or it would queue their comments at once. A failed
+ * read holds nothing back: the sweep is the safety net.
  */
 async function sweepHeldForCatchUp(account: {
   id: string;
+  instagramId: string;
   connectionRecoveredAt?: Date | null;
   connectionCatchUpFrom?: Date | null;
 }): Promise<boolean> {
@@ -235,7 +241,11 @@ async function sweepHeldForCatchUp(account: {
       },
     })
     .catch(() => null);
-  return row ? catchUpHoldsSweep(row, now) : false;
+  if (row && catchUpHoldsSweep(row, now)) return true;
+  const lastSlot = await lastPacedSlot(recoveryPaceKey(account.instagramId)).catch(
+    () => null
+  );
+  return lastSlot !== null && lastSlot > now;
 }
 
 /**

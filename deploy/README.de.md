@@ -190,35 +190,47 @@ ursprünglichen Kommentar).
 - Die DM geht raus wie bei einem Kommentar mit Keyword, mit allem, was die
   Kampagne danach macht: Follow-Gate, Link, Tag, Folgenachricht, Angebote.
   Auch eine pausierte Kampagne lässt sich so senden; die Seite sagt dazu,
-  dass sie pausiert ist.
+  dass sie pausiert ist. Tippt die Person danach auf den Button der DM
+  (etwa „Ich folge“), bekommt sie den Link wie bei einer aktiven Kampagne.
+  Für alle anderen bleibt die Kampagne pausiert.
 - „Öffentlich antworten“ postet die öffentliche Antwort der Kampagne unter
   den Kommentar. Es ist an, außer wenn du dort schon geantwortet hast. Lässt
   du es aus, postet auch später kein automatischer Durchlauf die Antwort zu
-  diesem Kommentar.
+  diesem Kommentar, auch nicht, während die DM noch unterwegs ist oder wenn
+  Instagram sie ablehnt. Erst wenn du die DM noch einmal mit Haken schickst,
+  kommt die Antwort.
 - Nach dem Tippen steht in der Zeile „Wird gesendet …“, nach ein paar
   Sekunden das Ergebnis aus dem DM-Protokoll. Dort steht bei solchen DMs
-  „(manuell)“ als Keyword.
+  „(manuell)“ als Keyword. Schickst du mehrere DMs kurz hintereinander,
+  gehen sie im Abstand von 20 Sekunden raus, damit Instagram keinen Schwall
+  bekommt; die Zeile sagt dann, gegen wann.
 
 Was nicht geht, und warum:
 
 - Instagram erlaubt pro Kommentar genau eine DM (private Antwort). Ging schon
   eine raus, auch mit einer anderen Kampagne, oder vielleicht (unklare
   Antwort von Meta), ist „DM senden“ gesperrt. Schickt der Worker in dem
-  Moment selbst eine DM zu demselben Kommentar, tritt einer von beiden
-  zurück: Doppelt geht nichts raus.
+  Moment selbst eine DM zu demselben Kommentar, wartet einer von beiden auf
+  den anderen: Doppelt geht nichts raus. Lehnt Instagram die andere DM ab,
+  geht die wartende kurz danach raus.
 - Instagram erlaubt die DM nur bis 7 Tage nach dem Kommentar. Ältere
   Kommentare zeigt die Seite nicht.
 - Hat Instagram die DM einer Kampagne zu einem Kommentar dreimal abgelehnt,
   ist mit dieser Kampagne Schluss (wie bei den automatischen Versuchen).
 - Während einer Meta-Pause (siehe *Meta-Limits* oben) liest die Seite nichts
-  und zeigt, bis wann die Pause dauert.
-- Höchstens 30 DMs pro Minute und Person.
+  und zeigt, bis wann die Pause dauert. Danach lädt sie die Kommentare von
+  selbst neu.
+- Höchstens 15 DMs von Hand pro Stunde und Konto, egal, wer klickt, und 30
+  pro Minute und Person. Am 21.11.2026 haben etwa 25 private Antworten und
+  50 Abrufe in einer Stunde das Meta-Limit gerissen, danach ging eine Stunde
+  lang gar nichts mehr raus.
 - Nur für Konten, die über die eigene Meta-App verbunden sind, nicht über
   Zernio.
 
 Was das bei Meta kostet: Ein Aufruf der Seite liest einmal die Beiträge und
-je Beitrag einmal die neuesten 50 Kommentare, bei 15 Beiträgen also 16
-Leseanfragen. Die App hebt die Antworten 60 Sekunden lang auf: Wer die Seite
+je Beitrag einmal die neuesten 50 Kommentare, bei 15 Beiträgen also
+höchstens 16 Leseanfragen; Beiträge ohne einen einzigen Kommentar liest sie
+gar nicht. Die App hebt die Antworten 60 Sekunden lang auf: Wer die Seite
 in dieser Zeit neu lädt oder mehr lädt, fragt Meta nur nach dem, was noch
 fehlt. Im Hintergrund liest die Seite nichts; nach dem Senden fragt sie nur
 das DM-Protokoll ab. „DM senden“ liest den einen Kommentar noch einmal bei
@@ -269,10 +281,13 @@ Was dann passiert:
   das bedeutet, den üblichen Ursachen und den drei Schritten zum
   Neu-Verbinden mit einem Link auf die Einstellungen. Mitglieder bekommen
   sie nicht. Ist die Verbindung 24 Stunden später noch weg, kommt genau eine
-  Erinnerung. Mehr als eine E-Mail in 24 Stunden pro Konto gibt es nicht,
-  auch wenn die Verbindung mehrmals abreißt. Die E-Mail enthält weder
-  Tracking noch Zugangsdaten (in Resend das Öffnungs- und Klick-Tracking
-  der Domain ausgeschaltet lassen).
+  Erinnerung. Höchstens eine Warn-E-Mail in 24 Stunden pro Konto, auch wenn
+  die Verbindung mehrmals abreißt; die Entwarnung „wieder da“ (siehe unten)
+  kommt zusätzlich. Reißt die Verbindung nach einer Entwarnung wieder ab,
+  kommt die Warnung sofort, damit deine letzte E-Mail nicht „wieder da“
+  sagt, während nichts rausgeht; das aber höchstens einmal in 24 Stunden.
+  Die E-Mail enthält weder Tracking noch Zugangsdaten (in Resend das
+  Öffnungs- und Klick-Tracking der Domain ausgeschaltet lassen).
 - Oben auf jeder Seite des Dashboards steht ein roter Hinweis
   „Instagram-Verbindung unterbrochen“ mit dem Grund und „Neu verbinden“.
   In den *Einstellungen* steht beim Konto „Verbindung unterbrochen seit …“
@@ -305,10 +320,19 @@ Kommentare aus der Zwischenzeit nach, genau einmal pro Unterbrechung:
 - Jeder Kommentar, der zu einer aktiven Kampagne passt (Keywords als ganzes
   Wort, Fragen-Filter, Kampagne des Beitrags vor „jeder Beitrag“, wie bei
   der normalen Suche), höchstens 7 Tage alt ist, nicht von dir selbst ist
-  und noch keinen DM-Log-Eintrag hat, bekommt seine DM: eine alle 20
-  Sekunden, damit auch nach einer langen Unterbrechung kein Schwall an Meta
-  geht und das Meta-Limit nicht reißt. Jeder Kommentar bekommt dabei
-  höchstens eine DM, wie immer.
+  und noch keine DM bekommen hat, bekommt seine DM: eine alle 2,5 Minuten,
+  also höchstens 24 pro Stunde, damit auch nach einer langen Unterbrechung
+  kein Schwall an Meta geht. Jeder Kommentar bekommt dabei höchstens eine
+  DM, wie immer.
+- Meldet Meta schon 60 % eines Limits, warten die nachgeholten DMs, bis
+  wieder Luft ist: Neue Kommentare und Leute, die gerade auf einen Button
+  tippen, gehen vor. Trifft eine Meta-Pause das Nachholen, reihen sich die
+  wartenden DMs danach im selben Abstand wieder ein, statt alle auf einmal
+  rauszugehen.
+- Reißt die Verbindung wieder ab, während nachgeholte DMs noch warten, geht
+  keine davon raus, und keine verbraucht einen ihrer drei Versuche. Das
+  Nachholen nach dieser Unterbrechung oder die normale Suche schickt sie
+  später, und auf der Seite *Kommentare* kannst du sie von Hand senden.
 - Kommentare, auf die du in der Zwischenzeit schon selbst geantwortet hast,
   bekommen keine automatische DM (vielleicht hast du den Guide schon von
   Hand geschickt). Diese Kommentare stehen in der E-Mail und in der

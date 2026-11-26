@@ -191,7 +191,7 @@ describe("what it says", () => {
       "Die Unterbrechung dauerte etwa 4 Stunden und 5 Minuten: am 25.11.2026 von 17:45 bis 21:50 Uhr."
     );
     expect(email.text).toContain(
-      "3 Kommentare mit deinen Keywords bekommen ihre DM jetzt nach und nach, etwa eine alle 20 Sekunden."
+      "3 Kommentare mit deinen Keywords bekommen ihre DM jetzt nach und nach, etwa eine alle 2,5 Minuten."
     );
     expect(email.text).toContain(
       "Auf einen Kommentar hast du in der Zwischenzeit selbst geantwortet. OpenReply schickt ihm keine automatische DM, falls du den Guide schon von Hand geschickt hast:"
@@ -216,6 +216,9 @@ describe("what it says", () => {
   });
 
   it("in English with UTC for every other locale", () => {
+    expect(buildAllClearEmail(input({ locale: "en" })).text).toContain(
+      "3 comments with your keywords get their DM now, one after the other, about one every 2.5 minutes."
+    );
     const email = buildAllClearEmail(input({ locale: "en", queued: 1 }));
     expect(email.subject).toBe("Instagram connection is back: OpenReply is sending DMs again");
     expect(email.text).toContain("The connection to your Instagram account @thomas.tergan is back.");
@@ -289,12 +292,16 @@ describe("once per catch-up", () => {
     ]);
     expect(outcomes.sort()).toEqual(["sent", "taken"]);
     expect(resendCalls).toHaveLength(2);
+    // A connection lost again from now on gets its alert at once.
+    expect(state.db.account().connectionAllClearSentAt).toEqual(new Date(NOW));
   });
 
   it("is owed again when Resend does not answer, and the next try uses the same keys", async () => {
     resendAnswer = () => new Response(JSON.stringify({ message: "busy" }), { status: 503 });
     expect(await sendConnectionAllClear("account_1")).toBe("failed");
     expect(state.db.account().connectionAllClearDueAt).toEqual(FINISHED);
+    // Only an all-clear that reached someone counts for the next alert.
+    expect(state.db.account().connectionAllClearSentAt).toBeNull();
     expect(warnings().at(-1)?.message).toContain("the next sweep tries again");
     const keys = resendCalls.map((call) => (call.init.headers as Record<string, string>)["Idempotency-Key"]);
 
@@ -310,6 +317,7 @@ describe("once per catch-up", () => {
     resendAnswer = () => new Response(JSON.stringify({ message: "domain not verified" }), { status: 403 });
     expect(await sendConnectionAllClear("account_1")).toBe("failed");
     expect(state.db.account().connectionAllClearDueAt).toBeNull();
+    expect(state.db.account().connectionAllClearSentAt).toBeNull();
     expect(await sendConnectionAllClear("account_1")).toBe("not-due");
     expect(resendCalls).toHaveLength(2);
   });

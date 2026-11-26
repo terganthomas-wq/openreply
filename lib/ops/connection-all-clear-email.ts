@@ -29,6 +29,24 @@ import {
 
 /** Comments the e-mail lists by name; the rest are counted (Diagnostics has more). */
 export const ALL_CLEAR_MAX_LISTED = 50;
+
+/**
+ * How far apart the caught-up DMs go out, in words: "2,5 Minuten",
+ * "2.5 minutes", or seconds below a minute.
+ */
+export function catchUpSpacingWords(
+  locale: AlertLocale,
+  spacingMs: number = CATCH_UP_SPACING_MS
+): string {
+  if (spacingMs < 60_000) {
+    const seconds = Math.round(spacingMs / 1000);
+    return locale === "de" ? `${seconds} Sekunden` : `${seconds} seconds`;
+  }
+  const minutes = Math.round((spacingMs / 60_000) * 10) / 10;
+  return locale === "de"
+    ? `${minutes.toLocaleString("de-DE")} ${minutes === 1 ? "Minute" : "Minuten"}`
+    : `${minutes.toLocaleString("en-GB")} ${minutes === 1 ? "minute" : "minutes"}`;
+}
 // A comment's text in the e-mail, at most.
 const TEXT_MAX = 200;
 
@@ -95,7 +113,7 @@ const COPY: Record<AlertLocale, Copy> = {
         ? "OpenReply hat die Kommentare aus dieser Zeit durchgesehen: Für keinen davon musste eine DM nachgeholt werden."
         : count === 1
           ? "OpenReply hat die Kommentare aus dieser Zeit durchgesehen: 1 Kommentar mit deinen Keywords bekommt seine DM jetzt."
-          : `OpenReply hat die Kommentare aus dieser Zeit durchgesehen: ${count} Kommentare mit deinen Keywords bekommen ihre DM jetzt nach und nach, etwa eine alle ${CATCH_UP_SPACING_MS / 1000} Sekunden.`,
+          : `OpenReply hat die Kommentare aus dieser Zeit durchgesehen: ${count} Kommentare mit deinen Keywords bekommen ihre DM jetzt nach und nach, etwa eine alle ${catchUpSpacingWords("de")}.`,
     answeredIntro: (count) =>
       count === 1
         ? "Auf einen Kommentar hast du in der Zwischenzeit selbst geantwortet. OpenReply schickt ihm keine automatische DM, falls du den Guide schon von Hand geschickt hast:"
@@ -153,7 +171,7 @@ const COPY: Record<AlertLocale, Copy> = {
         ? "OpenReply went through the comments of that time: none of them needed a DM caught up."
         : count === 1
           ? "OpenReply went through the comments of that time: 1 comment with your keywords gets its DM now."
-          : `OpenReply went through the comments of that time: ${count} comments with your keywords get their DM now, one after the other, about one every ${CATCH_UP_SPACING_MS / 1000} seconds.`,
+          : `OpenReply went through the comments of that time: ${count} comments with your keywords get their DM now, one after the other, about one every ${catchUpSpacingWords("en")}.`,
     answeredIntro: (count) =>
       count === 1
         ? "You answered one comment yourself in the meantime. OpenReply sends it no automatic DM, in case you already sent the guide by hand:"

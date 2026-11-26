@@ -31,12 +31,14 @@ export interface FakeAccount {
   connectionLostReason: string | null;
   connectionAlertSentAt: Date | null;
   connectionAlertCount: number;
+  connectionAlertRearmedAt: Date | null;
   connectionRecoveredAt: Date | null;
   connectionCatchUpFrom: Date | null;
   connectionCatchUpClaimedAt: Date | null;
   connectionCatchUpProgress: unknown;
   connectionCatchUpResult: unknown;
   connectionAllClearDueAt: Date | null;
+  connectionAllClearSentAt: Date | null;
 }
 
 export interface FakeEvent {
@@ -66,6 +68,9 @@ export interface FakeDmLog {
   automationId: string;
   commentId: string;
   status: string;
+  attempts?: number;
+  dmDeliveryUnconfirmed?: boolean;
+  errorMessage?: string | null;
 }
 
 function same(value: unknown, condition: unknown): boolean {
@@ -134,12 +139,14 @@ export function fakeAccount(overrides: Partial<FakeAccount> = {}): FakeAccount {
     connectionLostReason: null,
     connectionAlertSentAt: null,
     connectionAlertCount: 0,
+    connectionAlertRearmedAt: null,
     connectionRecoveredAt: null,
     connectionCatchUpFrom: null,
     connectionCatchUpClaimedAt: null,
     connectionCatchUpProgress: null,
     connectionCatchUpResult: null,
     connectionAllClearDueAt: null,
+    connectionAllClearSentAt: null,
     ...overrides,
   };
 }
@@ -261,10 +268,19 @@ export class FakeConnectionDb {
           .map((campaign) => copy(campaign as unknown as Row)),
     },
     dmLog: {
+      // Every row as the table keeps it: what a row leaves out has its
+      // default (no attempt, nothing unconfirmed, no error).
       findMany: async ({ where }: { where: Record<string, unknown> }) =>
         this.dmLogs
           .filter((log) => matches(log as unknown as Row, where))
-          .map((log) => copy(log as unknown as Row)),
+          .map((log) =>
+            copy({
+              attempts: 0,
+              dmDeliveryUnconfirmed: false,
+              errorMessage: null,
+              ...log,
+            } as unknown as Row)
+          ),
     },
     // adMediaFor (lib/polling/comment-reconciler.ts): the post id is its one value.
     $queryRaw: async (_sql: TemplateStringsArray, postId: string) =>

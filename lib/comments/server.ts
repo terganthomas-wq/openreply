@@ -13,12 +13,17 @@
  * - While the account's sending is paused for a Meta limit
  *   (lib/queue/account-pause.ts) the page reads nothing at all and shows the
  *   pause. A limit on a read itself stops the remaining reads.
+ * - A post Meta lists without a single comment (comments_count 0) is not
+ *   read at all.
  * - A manual send reads the one comment it sends for (and the posts, unless
  *   they are cached) and queues the worker's comment job; the DM itself is
  *   sent by the worker, with every claim of a comment's DM (dm-worker.ts).
+ *   Manual sends of an account go out MANUAL_SEND_SPACING_MS apart (a pace in
+ *   Redis, lib/queue/send-pacing.ts), and at most MANUAL_SEND_ACCOUNT_LIMIT
+ *   an hour, whoever clicks.
  */
 
-import type { DmStatus, Prisma } from "@/app/generated/prisma/client";
+import type { Prisma } from "@/app/generated/prisma/client";
 import { campaignForComment } from "@/lib/automation/comment-match";
 import { isQuestionComment } from "@/lib/automation/question-filter";
 import { prisma } from "@/lib/db/client";
@@ -44,15 +49,20 @@ import {
 } from "@/lib/queue/client";
 import {
   MAX_COMMENT_SEND_ATTEMPTS,
+  privateReplyState,
   privateReplyTaken,
 } from "@/lib/queue/comment-delivery";
+import { manualSendPaceKey, reservePacedSlot } from "@/lib/queue/send-pacing";
 import { runningWorkerLacks } from "@/lib/ops/worker-health";
 import {
   COMMENTS_MAX_POSTS,
   COMMENTS_PER_POST,
   MANUAL_MATCHED_KEYWORD,
+  MANUAL_SEND_ACCOUNT_LIMIT,
+  MANUAL_SEND_ACCOUNT_WINDOW_MS,
   MANUAL_SEND_FEATURE,
   MANUAL_SEND_RATE_LIMIT,
+  MANUAL_SEND_SPACING_MS,
   manualSendJobId,
   withinPrivateReplyWindow,
 } from "./manual";
@@ -87,6 +97,8 @@ export type CommentsAccount = ProviderAccount & {
 interface CachedMedia {
   id: string;
   permalink: string | null;
+  /** As Meta listed it; absent in an entry cached before it was kept. */
+  commentsCount?: number | null;
 }
 
 interface CachedComment {
@@ -159,7 +171,12 @@ async function readMedia(
   if (cached && cached.count >= posts) return cached.media.slice(0, posts);
 
   const media = (await getAllUserMedia(context, posts, account.instagramId)).map(
-    (item) => ({ id: item.id, permalink: item.permalink ?? null })
+    (item): CachedMedia => ({
+      id: item.id,
+      permalink: item.permalink ?? null,
+      commentsCount:
+        typeof item.comments_count === "number" ? item.comments_count : null,
+    })
   );
   await cacheSet(key, { count: posts, media });
   return media;
@@ -215,12 +232,19 @@ async function readRecentComments(
   }
 
   const lists = new Map<string, CachedComment[]>();
+  // A post Meta just listed without a single comment has none to read: no
+  // read for it (a new comment shows once the 60 seconds of the posts' cache
+  // are over, as on any other post).
+  for (const item of media) {
+    if (item.commentsCount === 0) lists.set(item.id, []);
+  }
+  const unread = media.filter((item) => !lists.has(item.id));
   const cached = await Promise.all(
-    media.map((item) =>
+    unread.map((item) =>
       cacheGet<CachedComment[]>(commentsListCacheKey(account.id, item.id))
     )
   );
-  media.forEach((item, index) => {
+  unread.forEach((item, index) => {
     const list = cached[index];
     if (list) lists.set(item.id, list);
   });
@@ -286,24 +310,31 @@ const LOG_SELECT = {
 
 type LogRow = Prisma.DmLogGetPayload<{ select: typeof LOG_SELECT }>;
 
-function deliveryState(row: {
-  status: DmStatus;
-}): CommentDelivery["state"] {
-  if (row.status === "SENT") return "sent";
-  return row.status === "PENDING" ? "sending" : "unconfirmed";
+/**
+ * Where a row that takes the comment's private reply stands: sent, on its
+ * way (a claim a job holds right now), or unconfirmed. A claim older than a
+ * send takes (DM_CLAIM_IN_FLIGHT_MS) belongs to a worker that died with it:
+ * its DM may have gone out, and nothing will settle it, so it reads as
+ * unconfirmed, not as "Wird gesendet …" for ever.
+ */
+function deliveryState(row: LogRow, now: number): CommentDelivery["state"] {
+  return privateReplyState(row, now) ?? "unconfirmed";
 }
 
 /** Where a comment's DM stands, from its DmLog rows (one per campaign). */
-export function commentStatus(rows: LogRow[]): CommentStatus {
+export function commentStatus(
+  rows: LogRow[],
+  now: number = Date.now()
+): CommentStatus {
   // A sent DM before one that may have gone out, before a claim in flight.
   const taken = rows
     .filter(privateReplyTaken)
-    .sort((a, b) => rank(a.status) - rank(b.status));
+    .sort((a, b) => rank(deliveryState(a, now)) - rank(deliveryState(b, now)));
   const delivered = taken[0];
   return {
     delivery: delivered
       ? {
-          state: deliveryState(delivered),
+          state: deliveryState(delivered, now),
           campaignId: delivered.automationId,
           campaignName: delivered.automation?.name ?? "",
           manual: delivered.matchedKeyword === MANUAL_MATCHED_KEYWORD,
@@ -325,8 +356,8 @@ export function commentStatus(rows: LogRow[]): CommentStatus {
   };
 }
 
-function rank(status: DmStatus): number {
-  return status === "SENT" ? 0 : status === "PENDING" ? 2 : 1;
+function rank(state: CommentDelivery["state"]): number {
+  return state === "sent" ? 0 : state === "sending" ? 2 : 1;
 }
 
 async function logsByComment(
@@ -354,14 +385,16 @@ export async function loadCommentStatuses({
   workspaceId,
   accountId,
   commentIds,
+  now = Date.now(),
 }: {
   workspaceId: string;
   accountId: string;
   commentIds: string[];
+  now?: number;
 }): Promise<Record<string, CommentStatus>> {
   const byComment = await logsByComment(workspaceId, accountId, commentIds);
   return Object.fromEntries(
-    commentIds.map((id) => [id, commentStatus(byComment.get(id) ?? [])])
+    commentIds.map((id) => [id, commentStatus(byComment.get(id) ?? [], now)])
   );
 }
 
@@ -484,7 +517,7 @@ export async function loadCommentsPage({
       ownerReplied: comment.ownerReplied,
       question: isQuestionComment(comment.text),
       match: match ? { id: match.campaign.id, name: match.campaign.name } : null,
-      ...commentStatus(logs.get(comment.id) ?? []),
+      ...commentStatus(logs.get(comment.id) ?? [], now),
     };
   });
 
@@ -520,6 +553,25 @@ export async function takeManualSendSlot(userId: string): Promise<boolean> {
   return count <= MANUAL_SEND_RATE_LIMIT;
 }
 
+/**
+ * One manual send for this Instagram account, whoever sends it: at most
+ * MANUAL_SEND_ACCOUNT_LIMIT in MANUAL_SEND_ACCOUNT_WINDOW_MS (counted from
+ * the window's first send). The spacing alone (MANUAL_SEND_SPACING_MS) would
+ * still let 180 private replies an hour through, and Meta counts the hour.
+ * Throws when Redis cannot be asked.
+ */
+export async function takeAccountManualSendSlot(instagramId: string): Promise<boolean> {
+  const count = Number(
+    await getRedisConnection().eval(
+      RATE_SCRIPT,
+      1,
+      `manual-send:account:${instagramId}`,
+      String(MANUAL_SEND_ACCOUNT_WINDOW_MS)
+    )
+  );
+  return count <= MANUAL_SEND_ACCOUNT_LIMIT;
+}
+
 export type ManualSendReason =
   | "campaign_not_found"
   | "not_comment_campaign"
@@ -533,11 +585,19 @@ export type ManualSendReason =
   | "own_comment"
   | "too_old"
   | "foreign_media"
+  | "account_limit"
   | "instagram_limit"
   | "instagram_error";
 
 export type ManualSendResult =
-  | { ok: true; queuedAt: string; previousUpdatedAt: string | null; jobId: string }
+  | {
+      ok: true;
+      queuedAt: string;
+      /** When the worker sends it: its slot of the account's manual pace. */
+      scheduledAt: string;
+      previousUpdatedAt: string | null;
+      jobId: string;
+    }
   | {
       ok: false;
       status: number;
@@ -588,9 +648,14 @@ async function isAccountMedia(
  * - no campaign's DM for this comment went out, may have, or is on its way,
  *   and the chosen campaign has attempts left for it;
  * - Instagram still has the comment, it is not the account's own, it is
- *   within the 7 days, and it is under one of the account's newest posts.
- * Then the worker's comment job is queued for exactly this campaign. The
- * worker checks again before it sends, under the comment's claim.
+ *   within the 7 days, and it is under one of the account's newest posts;
+ * - the account has manual sends left for the hour
+ *   (takeAccountManualSendSlot), and the comment is still within the 7 days
+ *   at its slot.
+ * Then the worker's comment job is queued for exactly this campaign, delayed
+ * to the account's next slot for manual sends (MANUAL_SEND_SPACING_MS after
+ * the one before), so a list clicked through quickly goes out one by one.
+ * The worker checks again before it sends, under the comment's claim.
  */
 export async function sendCommentManually({
   workspaceId,
@@ -675,7 +740,7 @@ export async function sendCommentManually({
       409,
       "already_sent",
       "A DM for this comment already went out; Instagram allows one per comment",
-      { commentStatus: commentStatus(rows) }
+      { commentStatus: commentStatus(rows, now) }
     );
   }
   const own = rows.find((row) => row.automationId === campaign.id);
@@ -730,6 +795,28 @@ export async function sendCommentManually({
     );
   }
 
+  if (!(await takeAccountManualSendSlot(account.instagramId))) {
+    return refuse(
+      429,
+      "account_limit",
+      `At most ${MANUAL_SEND_ACCOUNT_LIMIT} DMs by hand an hour for this account`
+    );
+  }
+  const slot = await reservePacedSlot(manualSendPaceKey(account.instagramId), {
+    earliest: now,
+    spacingMs: MANUAL_SEND_SPACING_MS,
+    now,
+  });
+  // A send that waits behind others must still be inside the 7 days when
+  // it goes out.
+  if (!withinPrivateReplyWindow(comment.timestamp, slot)) {
+    return refuse(
+      409,
+      "too_old",
+      "Instagram allows a DM only within 7 days of the comment"
+    );
+  }
+
   const jobId = manualSendJobId({
     instagramId: account.instagramId,
     commentId,
@@ -753,6 +840,7 @@ export async function sendCommentManually({
   // taken once, so a double click queues one job.
   await getDMQueue().add(COMMENT_JOB_NAME, data, {
     jobId,
+    delay: Math.max(0, slot - now),
     removeOnComplete: true,
     removeOnFail: true,
   });
@@ -761,6 +849,7 @@ export async function sendCommentManually({
     ok: true,
     jobId,
     queuedAt: new Date(now).toISOString(),
+    scheduledAt: new Date(Math.max(now, slot)).toISOString(),
     previousUpdatedAt: own ? own.updatedAt.toISOString() : null,
   };
 }

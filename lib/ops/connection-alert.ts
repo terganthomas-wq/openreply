@@ -5,9 +5,15 @@
  * every owner and admin of the workspace gets an e-mail that says what
  * happened and how to reconnect (lib/ops/connection-alert-email.ts). If the
  * connection is still lost 24 hours later, one reminder follows, and then
- * nothing more for that incident. At most one e-mail per 24 hours per
- * account, across incidents: a connection that keeps dropping does not
- * flood anyone's inbox, and the dashboard shows every incident anyway.
+ * no further warning for that incident; the all-clear after the catch-up
+ * (lib/ops/connection-all-clear.ts) comes on top. At most one warning e-mail
+ * per 24 hours per account, across incidents: a connection that keeps
+ * dropping does not flood anyone's inbox, and the dashboard shows every
+ * incident anyway. With one exception: when the owners were told the
+ * connection is back (the all-clear went out after the last warning), a new
+ * incident gets its alert at once, or their last e-mail would say "wieder
+ * da" while nothing goes out. That happens at most once per 24 hours
+ * (connectionAlertRearmedAt), so alert, all-clear, alert cannot loop.
  *
  * Claimed before it is sent, like a DM: one conditional update of the
  * account row (connectionAlertSentAt, connectionAlertCount) takes the e-mail,
@@ -39,7 +45,10 @@ import {
 } from "@/lib/ops/mail";
 import { logWorkerEvent } from "@/lib/queue/send-helpers";
 
-/** At most one e-mail per account in this time; the reminder comes after it. */
+/**
+ * At most one warning e-mail per account in this time (the alert after an
+ * all-clear aside, which is once in this time); the reminder comes after it.
+ */
 export const CONNECTION_ALERT_INTERVAL_MS = 24 * 60 * 60_000;
 /** E-mails per incident: the alert and one reminder. */
 export const MAX_CONNECTION_ALERTS = 2;
@@ -55,18 +64,45 @@ export interface AlertAccount {
   connectionLostReason: string | null;
   connectionAlertSentAt: Date | null;
   connectionAlertCount: number;
+  /** When the last all-clear e-mail went out (absent: none known). */
+  connectionAllClearSentAt?: Date | null;
+  /** When the last alert went out early, after an all-clear. */
+  connectionAlertRearmedAt?: Date | null;
+}
+
+type DueFields = Pick<
+  AlertAccount,
+  | "connectionLostAt"
+  | "connectionAlertSentAt"
+  | "connectionAlertCount"
+  | "connectionAllClearSentAt"
+  | "connectionAlertRearmedAt"
+>;
+
+/**
+ * Whether a new incident's alert goes out inside the 24 hours of the last
+ * warning: the all-clear came after that warning (the owners believe the
+ * connection works), and no alert went out early in the last 24 hours.
+ */
+export function connectionAlertRearmed(account: DueFields, now: number): boolean {
+  const sentAt = account.connectionAlertSentAt;
+  const allClearAt = account.connectionAllClearSentAt;
+  const rearmedAt = account.connectionAlertRearmedAt;
+  return (
+    account.connectionAlertCount === 0 &&
+    Boolean(sentAt && allClearAt && allClearAt.getTime() > sentAt.getTime()) &&
+    (!rearmedAt || now - rearmedAt.getTime() >= CONNECTION_ALERT_INTERVAL_MS)
+  );
 }
 
 /**
  * Which e-mail is due for the account's open incident, or null: the alert
  * while none went out for it, the reminder once, each only when the last
- * e-mail of the account is at least 24 hours old.
+ * warning e-mail of the account is at least 24 hours old. A new incident
+ * after an all-clear gets its alert at once (connectionAlertRearmed).
  */
 export function connectionAlertDue(
-  account: Pick<
-    AlertAccount,
-    "connectionLostAt" | "connectionAlertSentAt" | "connectionAlertCount"
-  >,
+  account: DueFields,
   now: number
 ): ConnectionAlertKind | null {
   if (!account.connectionLostAt) return null;
@@ -75,7 +111,7 @@ export function connectionAlertDue(
     account.connectionAlertSentAt &&
     now - account.connectionAlertSentAt.getTime() < CONNECTION_ALERT_INTERVAL_MS
   ) {
-    return null;
+    return connectionAlertRearmed(account, now) ? "alert" : null;
   }
   return account.connectionAlertCount === 0 ? "alert" : "reminder";
 }
@@ -220,9 +256,15 @@ export async function sendConnectionAlert(
   }
 
   // The claim: exactly the state this decision was made on, so a second
-  // check (or a reconnect that ended the incident) wins nothing here.
+  // check (or a reconnect that ended the incident) wins nothing here. An
+  // alert inside the 24 hours (after an all-clear) records that it went out
+  // early, which keeps the next early one 24 hours away.
   const previousSentAt = account.connectionAlertSentAt;
   const previousCount = account.connectionAlertCount;
+  const previousRearmedAt = account.connectionAlertRearmedAt ?? null;
+  const rearmed =
+    previousSentAt !== null &&
+    now - previousSentAt.getTime() < CONNECTION_ALERT_INTERVAL_MS;
   const number = previousCount + 1;
   const sentAt = new Date(now);
   const claim = await prisma.instagramAccount.updateMany({
@@ -231,8 +273,13 @@ export async function sendConnectionAlert(
       connectionLostAt: lostAt,
       connectionAlertCount: previousCount,
       connectionAlertSentAt: previousSentAt,
+      ...(rearmed ? { connectionAlertRearmedAt: previousRearmedAt } : {}),
     },
-    data: { connectionAlertSentAt: sentAt, connectionAlertCount: number },
+    data: {
+      connectionAlertSentAt: sentAt,
+      connectionAlertCount: number,
+      ...(rearmed ? { connectionAlertRearmedAt: sentAt } : {}),
+    },
   });
   if (claim.count !== 1) return "taken";
 
@@ -305,6 +352,7 @@ export async function sendConnectionAlert(
       data: {
         connectionAlertSentAt: previousSentAt,
         connectionAlertCount: previousCount,
+        ...(rearmed ? { connectionAlertRearmedAt: previousRearmedAt } : {}),
       },
     });
   }

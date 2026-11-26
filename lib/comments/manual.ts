@@ -33,6 +33,21 @@ export const COMMENTS_PER_POST = 50;
 /** Manual sends a person may queue per minute. */
 export const MANUAL_SEND_RATE_LIMIT = 30;
 
+/**
+ * Manual sends of one Instagram account go out at least this far apart: a
+ * list clicked through quickly is sent one by one, not in a burst.
+ */
+export const MANUAL_SEND_SPACING_MS = 20_000;
+
+/**
+ * Manual sends one Instagram account may queue per MANUAL_SEND_ACCOUNT_WINDOW_MS,
+ * whoever clicks. On 2026-11-21 about 25 private replies (with 50 conversation
+ * reads) in one hour ran into Meta's app limit, which paused every DM of the
+ * account.
+ */
+export const MANUAL_SEND_ACCOUNT_LIMIT = 15;
+export const MANUAL_SEND_ACCOUNT_WINDOW_MS = 60 * 60_000;
+
 /** What a worker that sends manual jobs says in its heartbeat. */
 export const MANUAL_SEND_FEATURE = "manual-send";
 

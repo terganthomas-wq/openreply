@@ -18,12 +18,16 @@ import {
   defaultPublicReply,
   lastAttempt,
   manualSendSettled,
+  pauseReloadDelay,
   relativeTime,
   sendBlock,
+  sendDelayed,
+  sendPollBudget,
   withStatus,
   type CampaignOption,
   type CommentRow,
 } from "../lib/comments/view";
+import AccountSelect from "../components/account-select";
 import { createI18n } from "../lib/i18n";
 import de from "../lib/i18n/de.json";
 import ptBR from "../lib/i18n/pt-BR.json";
@@ -167,6 +171,17 @@ describe("a comment row on the Kommentare page", () => {
   it("shows a send under way and the outcome of an earlier try", () => {
     const sending = render({ row: row(), campaignId: "c_guide", sending: true });
     expect(sending).toContain("Wird gesendet …");
+    expect(sending).not.toContain("Geht gegen");
+    // A send that waits behind others of the account says when it goes out.
+    const later = render({
+      row: row(),
+      campaignId: "c_guide",
+      sending: true,
+      scheduledAt: new Date(NOW + 40_000).toISOString(),
+    });
+    expect(later).toMatch(
+      /Geht gegen \d\d:\d\d raus, damit Instagram nicht zu viele DMs auf einmal bekommt\./
+    );
 
     const failed = render({
       row: row({
@@ -326,6 +341,7 @@ describe("the rules behind a row", () => {
       "own_comment",
       "too_old",
       "foreign_media",
+      "account_limit",
       "instagram_limit",
     ];
     const generic = refusalText("instagram_error", undefined, i18n);
@@ -337,6 +353,9 @@ describe("the rules behind a row", () => {
     expect(refusalText("rate_limited", undefined, i18n)).toBe(
       "Zu viele DMs in kurzer Zeit. Warte eine Minute."
     );
+    expect(refusalText("account_limit", undefined, i18n)).toBe(
+      "Für dieses Konto gingen in der letzten Stunde schon viele DMs von Hand raus. Versuch es später noch mal."
+    );
     expect(refusalText("paused", new Date(NOW + MINUTE).toISOString(), i18n)).toMatch(
       /^Senden pausiert bis \d\d:\d\d: Instagram-Limit erreicht\.$/
     );
@@ -347,6 +366,52 @@ describe("the rules behind a row", () => {
     expect(blockText({ kind: "connection-lost" }, i18n)).toBe(
       "Die Verbindung zu Instagram ist unterbrochen. Verbinde zuerst neu."
     );
+  });
+
+  it("asks for a send's outcome until a minute after it is due", () => {
+    const queuedAt = new Date(NOW).toISOString();
+    // Right away: a minute of polls, every 3 seconds.
+    expect(sendPollBudget(queuedAt, queuedAt)).toBe(20);
+    expect(sendPollBudget(null, null)).toBe(20);
+    // Behind two others: 40 seconds more.
+    expect(sendPollBudget(queuedAt, new Date(NOW + 40_000).toISOString())).toBe(34);
+    expect(sendDelayed(queuedAt, new Date(NOW + 2_000).toISOString())).toBe(false);
+    expect(sendDelayed(queuedAt, new Date(NOW + 20_000).toISOString())).toBe(true);
+  });
+
+  it("loads the comments again by itself a few seconds after the pause", () => {
+    const answeredAt = new Date(NOW).toISOString();
+    expect(pauseReloadDelay(null, answeredAt)).toBeNull();
+    expect(pauseReloadDelay(new Date(NOW + 10 * MINUTE).toISOString(), answeredAt)).toBe(
+      10 * MINUTE + 5_000
+    );
+    expect(pauseReloadDelay(new Date(NOW + MINUTE).toISOString(), answeredAt, 7_000)).toBe(
+      MINUTE + 12_000
+    );
+    // A pause that is over by the answer's time: soon.
+    expect(pauseReloadDelay(new Date(NOW - MINUTE).toISOString(), answeredAt)).toBe(5_000);
+  });
+
+  it("offers every account in the selector, also when the chosen one cannot be read", () => {
+    const html = renderToStaticMarkup(
+      // eslint-disable-next-line react/no-children-prop
+      createElement(I18nProvider, {
+        locale: "de",
+        children: createElement(AccountSelect, {
+          accounts: [
+            { id: "a1", username: "studio", instagramId: "1" },
+            { id: "a2", username: "shop", instagramId: "2" },
+          ],
+          value: "zernio_account",
+          onChange: () => {},
+          includeAll: false,
+          placeholder: "Konto wählen",
+        }),
+      })
+    );
+    // The first option is the placeholder, so choosing @studio changes the value.
+    expect(html.indexOf("Konto wählen")).toBeLessThan(html.indexOf("@studio"));
+    expect(html).toContain("@shop");
   });
 
   it("names the job after the comment, the campaign and its attempts, without a colon", () => {
@@ -393,6 +458,10 @@ describe("the page's texts", () => {
     "The connection to Instagram is lost. Reconnect first.",
     "The connection to Instagram has been lost since {time}. Reconnect, then you can send DMs here again.",
     "Reconnect",
+    "Too many DMs sent by hand for this account in the last hour. Try again later.",
+    "Goes out at about {time}, so Instagram does not get too many DMs at once.",
+    "Choose an account",
+    "Catch-up for @{account} done: 1 comment gets its DM, {answered} you had answered yourself.",
   ] as const;
 
   it("exist in every language", () => {

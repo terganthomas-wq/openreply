@@ -174,6 +174,8 @@ const ACCOUNT_SELECT = {
   connectionLostReason: true,
   connectionAlertSentAt: true,
   connectionAlertCount: true,
+  connectionAllClearSentAt: true,
+  connectionAlertRearmedAt: true,
 } satisfies Prisma.InstagramAccountSelect;
 
 export type CheckedAccount = Prisma.InstagramAccountGetPayload<{

@@ -257,6 +257,10 @@ export function metaLimitOf(error: unknown): RateLimitError | null {
  * pausedRunAt under its own deterministic id: the same job held back twice
  * for one pause stays one job. Returns when it runs (epoch ms).
  *
+ * `runAt` replaces pausedRunAt for a job that has its own later slot after
+ * the pause: a copy of a catch-up job lines up behind the catch-up's other
+ * jobs (lib/queue/send-pacing.ts) instead of running in the minute after it.
+ *
  * The copy is removed once it completes, as offer jobs are. The queue keeps
  * the last 1,000 completed jobs and drops an add whose id it still holds, so
  * a retained copy would swallow the same id in a later pause.
@@ -267,6 +271,7 @@ export async function requeueForPause({
   jobId,
   instagramAccountId,
   resumeAt,
+  runAt: plannedRunAt,
   now = Date.now(),
 }: {
   name: string;
@@ -275,9 +280,14 @@ export async function requeueForPause({
   jobId: string;
   instagramAccountId: string;
   resumeAt: number;
+  /** When the copy runs instead of pausedRunAt (never before the resume time). */
+  runAt?: number;
   now?: number;
 }): Promise<number> {
-  const runAt = pausedRunAt(resumeAt, jobId);
+  const runAt =
+    plannedRunAt === undefined
+      ? pausedRunAt(resumeAt, jobId)
+      : Math.max(resumeAt, plannedRunAt);
   await getDMQueue().add(name, data, {
     jobId,
     delay: Math.max(0, runAt - now),

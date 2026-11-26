@@ -182,8 +182,14 @@ model InstagramAccount {
   /// Why, short and never a token: "<token|permission|missing> (Meta <code>/<subcode>)".
   connectionLostReason    String?
   /// When the last alert e-mail went out, for any incident of the account: at
-  /// most one e-mail per 24 hours. Kept when the incident ends.
+  /// most one warning e-mail per 24 hours (but see connectionAlertRearmedAt).
+  /// Kept when the incident ends.
   connectionAlertSentAt   DateTime?
+  /// When an alert went out inside those 24 hours because the owners had been
+  /// told the connection was back (connectionAllClearSentAt) after the last
+  /// warning: a new incident gets its alert at once, but this happens at
+  /// most once per 24 hours, so a flapping connection cannot loop.
+  connectionAlertRearmedAt DateTime?
   /// E-mails sent for the open incident: 1 after the alert, 2 after the one
   /// reminder. Back to 0 when an incident starts or ends.
   connectionAlertCount    Int       @default(0)
@@ -212,6 +218,10 @@ model InstagramAccount {
   /// The all-clear e-mail of the last catch-up is still to go out: the time
   /// that catch-up finished. Null once it went out or was given up.
   connectionAllClearDueAt    DateTime?
+  /// When the last all-clear e-mail reached at least one owner or admin. A
+  /// connection lost again after it gets its alert without waiting for the
+  /// 24 hours of the last warning (lib/ops/connection-alert.ts).
+  connectionAllClearSentAt   DateTime?
 
   workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   automations Automation[]

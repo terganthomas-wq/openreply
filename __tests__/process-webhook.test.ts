@@ -157,6 +157,27 @@ describe("read receipts", () => {
     );
   });
 
+  it("looks at a paused campaign only for a reader it was sent to by hand", async () => {
+    await processInstagramWebhook({ payload: readReceipt, provider: "META" });
+    expect(mockPrisma.dmLog.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          automation: expect.objectContaining({
+            openingDmEnabled: true,
+            OR: [
+              { isActive: true },
+              {
+                dmLogs: {
+                  some: { commenterId: READER, matchedKeyword: "(manuell)", status: "SENT" },
+                },
+              },
+            ],
+          }),
+        }),
+      })
+    );
+  });
+
   it("skips only the campaign whose link was already delivered", async () => {
     mockPrisma.dmLog.findMany.mockResolvedValue([
       { commentId: "comment_1", automation: { id: "campaign_1" } },

@@ -104,7 +104,7 @@ const COPY: Record<AlertLocale, Copy> = {
       alert:
         "Diese E-Mail hat deine OpenReply-Installation automatisch geschickt. Ist die Verbindung in 24 Stunden noch unterbrochen, bekommst du einmal eine Erinnerung.",
       reminder:
-        "Diese E-Mail hat deine OpenReply-Installation automatisch geschickt. Weitere E-Mails zu dieser Unterbrechung kommen nicht; wie es steht, siehst du jederzeit im Dashboard.",
+        "Diese E-Mail hat deine OpenReply-Installation automatisch geschickt. Weitere Erinnerungen kommen nicht. Sobald die Verbindung wieder steht, bekommst du eine kurze Entwarnung; wie es steht, siehst du jederzeit im Dashboard.",
     },
   },
   en: {
@@ -150,7 +150,7 @@ const COPY: Record<AlertLocale, Copy> = {
       alert:
         "This e-mail was sent automatically by your OpenReply installation. If the connection is still lost in 24 hours, you get one reminder.",
       reminder:
-        "This e-mail was sent automatically by your OpenReply installation. No further e-mails about this interruption follow; the dashboard always shows where it stands.",
+        "This e-mail was sent automatically by your OpenReply installation. No further reminders follow. Once the connection is back, you get a short all-clear; the dashboard always shows where it stands.",
     },
   },
 };

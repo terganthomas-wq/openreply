@@ -20,6 +20,10 @@ const {
   mockReleaseWorkspaceDMReservation,
 } = vi.hoisted(() => ({
   mockPrisma: {
+    // The DM claim runs in a transaction under a lock on the comment
+    // (claimCommentPrivateReply): here the transaction is the client itself.
+    $transaction: vi.fn(),
+    $executeRaw: vi.fn(),
     zernioConnection: { findUnique: vi.fn() },
     postbackDelivery: { create: vi.fn(), delete: vi.fn() },
     automation: {
@@ -29,6 +33,8 @@ const {
     dmLog: {
       findUnique: vi.fn(),
       findFirst: vi.fn(),
+      // Other campaigns' rows of a comment (findPrivateReplyRival).
+      findMany: vi.fn(),
       upsert: vi.fn(),
       update: vi.fn(),
       updateMany: vi.fn(),
@@ -288,6 +294,11 @@ beforeEach(() => {
   mockPrisma.postbackDelivery.create.mockReset().mockResolvedValue({});
   mockPrisma.postbackDelivery.delete.mockReset().mockResolvedValue({});
 
+  mockPrisma.$transaction
+    .mockReset()
+    .mockImplementation(async (work: (tx: unknown) => unknown) => work(mockPrisma));
+  mockPrisma.$executeRaw.mockReset().mockResolvedValue(1);
+  mockPrisma.dmLog.findMany.mockReset().mockResolvedValue([]);
   mockPrisma.automation.findMany.mockResolvedValue([mockAutomation]);
   mockPrisma.automation.findFirst.mockResolvedValue(null);
   mockPrisma.dmLog.findUnique.mockResolvedValue(null);
@@ -1084,24 +1095,119 @@ describe("DM Worker — Full Pipeline", () => {
 
 describe("DM Worker — one private reply per comment", () => {
   it("should skip a campaign when another already used the comment's private reply", async () => {
-    mockPrisma.dmLog.findFirst.mockImplementation(
-      async (args: { where?: { status?: string } } = {}) =>
-        args.where?.status === "SENT"
-          ? { automation: { name: "openreply 1" } }
-          : { commenterName: "commenter_user" }
-    );
+    // Another campaign's row of the comment: its DM went out.
+    mockPrisma.dmLog.findMany.mockResolvedValue([
+      {
+        automationId: "auto_other",
+        status: "SENT",
+        dmDeliveryUnconfirmed: false,
+        errorMessage: null,
+        updatedAt: new Date(),
+        automation: { name: "openreply 1" },
+      },
+    ]);
 
     const processor = getProcessor();
     await processor(createMockJob());
 
     expect(mockSendPrivateReply).not.toHaveBeenCalled();
     expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
-    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+    expect(mockPrisma.dmLog.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { commentId: "comment_555", automationId: { not: "auto_789" } },
+      })
+    );
+    // Only a row that is not claimed: another job's claim is never this
+    // job's to overwrite.
+    expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith({
+      where: {
+        automationId: "auto_789",
+        commentId: "comment_555",
+        status: { not: "SENT" },
+        dmDeliveryUnconfirmed: false,
+      },
+      data: expect.objectContaining({
+        status: "SKIPPED_DEDUP",
+        errorMessage: expect.stringContaining("openreply 1"),
+      }),
+    });
+    // Final: no copy looks again.
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+
+  it("looks again in about a minute while another campaign's DM is only on its way", async () => {
+    mockPrisma.dmLog.findMany.mockResolvedValue([
+      {
+        automationId: "auto_other",
+        status: "PENDING",
+        dmDeliveryUnconfirmed: true,
+        errorMessage: null,
+        updatedAt: new Date(),
+        automation: { name: "openreply 1" },
+      },
+    ]);
+
+    await getProcessor()(createMockJob());
+
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
+    // Not final: the row waits, and a copy of the job looks again.
+    expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith({
+      where: {
+        automationId: "auto_789",
+        commentId: "comment_555",
+        status: { not: "SENT" },
+        dmDeliveryUnconfirmed: false,
+      },
+      data: {
+        status: "PENDING",
+        errorMessage: expect.stringMatching(/^Waiting: another campaign \(openreply 1\) is sending/),
+      },
+    });
+    expect(mockQueueAdd).toHaveBeenCalledTimes(1);
+    const [name, data, options] = mockQueueAdd.mock.calls[0];
+    expect(name).toBe("process-comment");
+    expect(data).toMatchObject({ commentId: "comment_555", dedupRecheck: 1 });
+    expect(options).toMatchObject({
+      jobId: "comment_ig_456_comment_555_dedup_1",
+      removeOnComplete: true,
+    });
+    expect(options.delay).toBeGreaterThanOrEqual(60_000);
+    expect(options.delay).toBeLessThan(90_000);
+  });
+
+  it("stands back for good once it looked six times, or for a claim older than a send takes", async () => {
+    const inFlight = {
+      automationId: "auto_other",
+      status: "PENDING",
+      dmDeliveryUnconfirmed: true,
+      errorMessage: null,
+      updatedAt: new Date(),
+      automation: { name: "openreply 1" },
+    };
+    mockPrisma.dmLog.findMany.mockResolvedValue([inFlight]);
+    await getProcessor()({ ...createMockJob(), data: { ...mockJobData, dedupRecheck: 6 } });
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.updateMany).toHaveBeenLastCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
           status: "SKIPPED_DEDUP",
-          errorMessage: expect.stringContaining("openreply 1"),
+          errorMessage: expect.stringContaining("is sending, or may have sent"),
         }),
+      })
+    );
+
+    // A claim of a worker that died 20 minutes ago: its DM may have gone out.
+    mockPrisma.dmLog.updateMany.mockClear();
+    mockPrisma.dmLog.findMany.mockResolvedValue([
+      { ...inFlight, updatedAt: new Date(Date.now() - 20 * 60_000) },
+    ]);
+    await getProcessor()(createMockJob());
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.updateMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "SKIPPED_DEDUP" }),
       })
     );
   });
@@ -1745,8 +1851,13 @@ describe("DM Worker — work after a delivered button tap", () => {
 
 describe("DM Worker — job dispatch", () => {
   function prismaCallCount(): number {
+    type Fn = { mock: { calls: unknown[] } };
     return Object.values(mockPrisma)
-      .flatMap((model) => Object.values(model))
+      .flatMap((model): Fn[] =>
+        typeof model === "function"
+          ? [model as unknown as Fn]
+          : (Object.values(model) as unknown as Fn[])
+      )
       .reduce((total, fn) => total + fn.mock.calls.length, 0);
   }
 
@@ -3146,18 +3257,18 @@ describe("DM Worker — campaigns that match the same comment", () => {
         return {};
       }
     );
-    mockPrisma.dmLog.findFirst.mockImplementation(
-      async (args: {
-        where?: { status?: string; automationId?: { not: string } };
-      } = {}) => {
-        if (args.where?.status !== "SENT") {
-          return { commenterName: "commenter_user" };
-        }
-        const other = [...sent].find(
-          ([id]) => id !== args.where?.automationId?.not
-        );
-        return other ? { automation: { name: other[1] } } : null;
-      }
+    mockPrisma.dmLog.findMany.mockImplementation(
+      async (args: { where?: { automationId?: { not: string } } } = {}) =>
+        [...sent]
+          .filter(([id]) => id !== args.where?.automationId?.not)
+          .map(([id, name]) => ({
+            automationId: id,
+            status: "SENT",
+            dmDeliveryUnconfirmed: false,
+            errorMessage: null,
+            updatedAt: new Date(),
+            automation: { name },
+          }))
     );
   }
 
@@ -3184,12 +3295,12 @@ describe("DM Worker — campaigns that match the same comment", () => {
       },
       data: expect.objectContaining({ status: "SENT" }),
     });
-    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith({
+    expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith({
       where: {
-        automationId_commentId: {
-          automationId: "auto_any",
-          commentId: "comment_555",
-        },
+        automationId: "auto_any",
+        commentId: "comment_555",
+        status: { not: "SENT" },
+        dmDeliveryUnconfirmed: false,
       },
       data: expect.objectContaining({
         status: "SKIPPED_DEDUP",
@@ -3216,14 +3327,12 @@ describe("DM Worker — campaigns that match the same comment", () => {
       })
     );
 
-    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+    expect(mockPrisma.dmLog.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: {
-          automationId_commentId: {
-            automationId: "auto_any",
-            commentId: "comment_555",
-          },
-        },
+        where: expect.objectContaining({
+          automationId: "auto_any",
+          commentId: "comment_555",
+        }),
         data: expect.objectContaining({ status: "SKIPPED_DEDUP" }),
       })
     );

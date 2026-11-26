@@ -41,6 +41,13 @@ export interface ProcessCommentJob {
   // request limit (lib/queue/account-pause.ts), capped at MAX_PAUSE_REQUEUES.
   // Its copies are queued as comment_<account>_<comment>_pause_<n>.
   pauseRequeue?: number;
+  // How often this comment looked again because another campaign's DM for it
+  // was on its way (Instagram allows one private reply per comment): its
+  // copies are <job base>_dedup_<n> (lib/queue/dm-worker.ts).
+  dedupRecheck?: number;
+  // A catch-up job (source RECOVERY): how often it waited because Meta
+  // reported 60 % of a request limit, as recover_<account>_<comment>_wait_<n>.
+  usageWait?: number;
   // Which path enqueued this comment. It is not copied to ProcessedComment or
   // used for reconciliation dedup.
   source?: CommentSource;

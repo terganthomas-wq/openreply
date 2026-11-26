@@ -10,7 +10,7 @@ import KeyExpiryNotice, {
 import StatusBadge from "@/components/status-badge";
 import ConnectionCatchUpReport from "@/components/connection-catch-up";
 import { ReconnectButton } from "@/components/connection-incident";
-import type { CatchUpReport } from "@/lib/instagram/catch-up-report";
+import { catchUpEventText, type CatchUpReport } from "@/lib/instagram/catch-up-report";
 import {
   CONNECTION_LOST_REASON_TEXT,
   formatIncidentTime,
@@ -164,8 +164,8 @@ function eventMessage(
       );
     case "connection-catch-up":
       return detail.account
-        ? t(
-            "Catch-up for @{account} done: {queued} comments get their DM, {answered} you had answered yourself.",
+        ? catchUpEventText(
+            { t },
             { account: detail.account, queued: detail.queued, answered: detail.answered }
           )
         : event.message;

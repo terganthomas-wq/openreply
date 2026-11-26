@@ -7,9 +7,12 @@ import {
 } from "@/lib/instagram/delivery-errors";
 import {
   claimCommentDelivery,
+  claimCommentPrivateReply,
+  dmClaimInFlight,
+  findPrivateReplyRival,
   MAX_COMMENT_SEND_ATTEMPTS,
-  privateReplyTaken,
   releaseCommentClaim,
+  type PrivateReplyRival,
 } from "./comment-delivery";
 import {
   AccountPausedError,
@@ -20,10 +23,12 @@ import {
   nextPauseWait,
   PAUSE_JITTER_MS,
   pauseAccountForLimit,
+  pauseJitterMs,
   pausedRunAt,
   pauseWaitMessage,
   requeueForPause,
 } from "./account-pause";
+import { recoveryPaceKey, reservePacedSlot } from "./send-pacing";
 import { afterLinkDelivered } from "./after-delivery";
 import {
   claimPostbackDelivery,
@@ -47,7 +52,15 @@ import {
 import { ensureContactSafe, type ContactSummary } from "@/lib/contacts/store";
 import { OFFER_PAYLOAD_PREFIX, withinWindow } from "@/lib/offers/schedule";
 import { processOffer, processOfferTap } from "@/lib/offers/worker";
-import { runConnectionCatchUp } from "@/lib/instagram/connection-catch-up";
+import { CATCH_UP_SPACING_MS } from "@/lib/instagram/catch-up-state";
+import {
+  CATCH_UP_BRAKE_WAIT_MS,
+  CATCH_UP_USAGE_BRAKE_PERCENT,
+  recoverJobId,
+  runConnectionCatchUp,
+} from "@/lib/instagram/connection-catch-up";
+import { classifyConnectionError } from "@/lib/instagram/connection-check";
+import { recentAccountUsagePercent } from "@/lib/meta/usage";
 import { createHash } from "node:crypto";
 import { UnrecoverableError, Worker, type Job } from "bullmq";
 import {
@@ -291,13 +304,43 @@ function tapTime(job: Job<ProcessPostbackJob>): number {
 }
 
 /**
+ * When a copy of a comment job runs that may not run before `earliest`: then,
+ * or, for a job of the catch-up after a lost connection (source RECOVERY),
+ * the catch-up's next free slot after it (lib/queue/send-pacing.ts). The
+ * catch-up planned its jobs one CATCH_UP_SPACING_MS apart; copies that all
+ * ran in the minute after an R1 pause would be the burst that runs into
+ * Meta's limit again. Other jobs keep `earliest`: they must not wait behind
+ * hours of catch-up. Should Redis not answer, `earliest` too.
+ */
+async function copyRunAt(
+  data: ProcessCommentJob,
+  earliest: number
+): Promise<number> {
+  if (data.source !== "RECOVERY") return earliest;
+  try {
+    return await reservePacedSlot(recoveryPaceKey(data.instagramAccountId), {
+      earliest,
+      spacingMs: CATCH_UP_SPACING_MS,
+    });
+  } catch (error) {
+    console.error(
+      "[DM Worker] Could not take a slot of the catch-up's pace:",
+      formatError(error)
+    );
+    return earliest;
+  }
+}
+
+/**
  * Put a comment back for the end of its account's pause instead of calling
  * Meta (lib/queue/account-pause.ts): its DM leg waits as PENDING with the
  * time of the next try, and a delayed copy of the job runs then, as
  * comment_<account>_<comment>_pause_<n>. The copy goes through every
  * campaign of the comment again, the one bound to the post first. A manual
  * send's copy is manual_<account>_<comment>_<campaign>_pause_<n> and sends
- * the chosen campaign again (commentJobBase).
+ * the chosen campaign again (commentJobBase). A catch-up job's copy runs in
+ * the catch-up's next free slot after the pause (copyRunAt), not in the
+ * minute after it.
  *
  * With `releaseClaim`, this job claimed the DM leg for a send that Meta
  * refused with a request limit. The claim is given back before the copy is
@@ -323,9 +366,8 @@ async function holdCommentForPause({
   if (held > MAX_PAUSE_REQUEUES) return "capped";
 
   const jobId = `${commentJobBase(job.data)}_pause_${held}`;
-  const reason = `Instagram request limit; next try at ${formatPauseTime(
-    pausedRunAt(resumeAt, jobId)
-  )}`;
+  const runAt = await copyRunAt(job.data, pausedRunAt(resumeAt, jobId));
+  const reason = pauseWaitMessage(runAt);
   console.log(`[DM Worker] Comment ${commentId}: ${reason} (wait ${held})`);
   if (releaseClaim) {
     await releaseCommentClaim(automationId, commentId, reason);
@@ -346,6 +388,7 @@ async function holdCommentForPause({
     jobId,
     instagramAccountId,
     resumeAt,
+    runAt,
   });
   return "held";
 }
@@ -573,59 +616,185 @@ async function loadManualCampaign(data: ProcessCommentJob) {
   return [];
 }
 
+// Why a manual send's public reply is closed: the owner switched "Öffentlich
+// antworten" off. Written with the DM claim (claimCommentPrivateReply), and
+// opened again only by a later manual send with it switched on.
+const MANUAL_PUBLIC_REPLY_OFF =
+  "Not posted: the public reply was switched off for this manual send";
+
+// What a comment's DmLog row shows while its account's connection is lost
+// (A1): nothing is sent or posted, and no attempt is counted.
+const CONNECTION_LOST_MESSAGE =
+  "Not sent: the Instagram connection is lost; nothing goes out until the account is reconnected";
+
+/** How long a comment job waits for another campaign's DM on its way before it looks again. */
+const RIVAL_RECHECK_MS = 60_000;
+/** The looks are spread over this much more, by the copy's id. */
+const RIVAL_RECHECK_SPREAD_MS = 30_000;
 /**
- * Another campaign's row that says this comment's private reply is used: it
- * went out, may have, or another job holds the claim for it right now
- * (privateReplyTaken). A manual send asks before it claims the comment and
- * again right after, so that it never sends next to a DM that may be on its
- * way.
+ * Looks at most (about 6 to 9 minutes). A claim that is still on its way then
+ * counts as a DM that may have gone out, as it does once it is older than a
+ * send takes (DM_CLAIM_IN_FLIGHT_MS).
  */
-async function privateReplyTakenBy(
-  commentId: string,
-  automationId: string
-): Promise<{ name: string; sent: boolean } | null> {
-  const rows = await prisma.dmLog.findMany({
-    where: { commentId, automationId: { not: automationId } },
-    select: {
-      status: true,
-      dmDeliveryUnconfirmed: true,
-      errorMessage: true,
-      automation: { select: { name: true } },
-    },
-  });
-  const taken = rows.find(privateReplyTaken);
-  return taken
-    ? { name: taken.automation?.name ?? "unknown", sent: taken.status === "SENT" }
-    : null;
+const MAX_RIVAL_RECHECKS = 6;
+/** How often a catch-up job waits for Meta's usage to drop; then it is sent. */
+const MAX_RECOVERY_USAGE_WAITS = 4;
+
+function dedupMessage(rival: PrivateReplyRival): string {
+  return rival.state === "sent"
+    ? `Another campaign (${rival.name}) already sent the one private reply Instagram allows for this comment`
+    : `Another campaign (${rival.name}) is sending, or may have sent, the one private reply Instagram allows for this comment`;
 }
 
 /**
- * A manual send of another campaign that took this comment's private reply,
- * or holds its claim right now. The comment's automatic jobs ask this right
- * after their own claim. A manual send claims and then looks for every other
- * claim, so of two sends that claim at the same moment, at least one sees the
- * other and stands back: the comment never gets two private replies.
- *
- * Read by its label: a manual send writes "(manuell)" with its claim (and on
- * the row it creates). A claim on such a row stands for the comment's
- * private reply whichever job took it, so standing back is right either way.
- * The label is compared again on the answer: only such a row counts.
+ * Another campaign's DM is on its way for this comment (its claim is in
+ * flight), and Instagram allows one private reply per comment. Nothing is
+ * decided yet: that DM may still be refused, or wait for a pause, and give
+ * its claim back. So this campaign's row waits (PENDING, with the reason),
+ * and a delayed copy of the job looks again in about a minute, as
+ * <job base>_dedup_<n> (commentJobBase), through every campaign of the
+ * comment in order. "capped" after MAX_RIVAL_RECHECKS looks.
  */
-async function manualSendHolding(
-  commentId: string,
-  automationId: string
-): Promise<string | null> {
-  const row = await prisma.dmLog.findFirst({
+async function waitForRival(
+  job: Job<ProcessCommentJob>,
+  automationId: string,
+  rival: PrivateReplyRival
+): Promise<"held" | "capped"> {
+  const { commentId } = job.data;
+  const next = (job.data.dedupRecheck ?? 0) + 1;
+  if (next > MAX_RIVAL_RECHECKS) return "capped";
+  const jobId = `${commentJobBase(job.data)}_dedup_${next}`;
+  const now = Date.now();
+  const runAt =
+    now + RIVAL_RECHECK_MS + (pauseJitterMs(jobId) % RIVAL_RECHECK_SPREAD_MS);
+  const reason = `Waiting: another campaign (${rival.name}) is sending the one private reply Instagram allows for this comment; next look at ${formatPauseTime(runAt)}`;
+  await prisma.dmLog.updateMany({
     where: {
+      automationId,
       commentId,
-      automationId: { not: automationId },
-      matchedKeyword: MANUAL_MATCHED_KEYWORD,
-      OR: [{ status: "SENT" }, { dmDeliveryUnconfirmed: true }],
+      status: { not: "SENT" },
+      dmDeliveryUnconfirmed: false,
     },
-    select: { matchedKeyword: true, automation: { select: { name: true } } },
+    data: { status: "PENDING", errorMessage: reason },
   });
-  return row?.matchedKeyword === MANUAL_MATCHED_KEYWORD
-    ? row.automation?.name ?? "unknown"
+  await getDMQueue().add(
+    COMMENT_JOB_NAME,
+    { ...job.data, dedupRecheck: next },
+    {
+      jobId,
+      delay: Math.max(0, runAt - now),
+      removeOnComplete: true,
+      removeOnFail: true,
+    }
+  );
+  console.log(`[DM Worker] Comment ${commentId}: ${reason}`);
+  return "held";
+}
+
+/**
+ * Another campaign's row takes this comment's one private reply: this
+ * campaign stands back. For good (SKIPPED_DEDUP, which the sweep and the
+ * catch-up count as handled) when that DM went out or may have; while it is
+ * only on its way, the comment waits and looks again (waitForRival): "wait",
+ * and the caller ends the job, as no campaign of the comment can send now.
+ * Only a row that is not claimed changes: its own claim is never this job's
+ * to overwrite.
+ */
+async function standBackForRival(
+  job: Job<ProcessCommentJob>,
+  automationId: string,
+  matchedKeyword: string | null,
+  rival: PrivateReplyRival
+): Promise<"wait" | "skipped"> {
+  if (
+    rival.state === "sending" &&
+    (await waitForRival(job, automationId, rival)) === "held"
+  ) {
+    return "wait";
+  }
+  await prisma.dmLog.updateMany({
+    where: {
+      automationId,
+      commentId: job.data.commentId,
+      status: { not: "SENT" },
+      dmDeliveryUnconfirmed: false,
+    },
+    data: {
+      status: "SKIPPED_DEDUP",
+      matchedKeyword,
+      errorMessage: dedupMessage(rival),
+    },
+  });
+  return "skipped";
+}
+
+/**
+ * A catch-up job (source RECOVERY) while Meta reports the app or the account
+ * at CATCH_UP_USAGE_BRAKE_PERCENT of a request limit (a report of the last
+ * few minutes): its DM waits for the catch-up's next slot at least
+ * CATCH_UP_BRAKE_WAIT_MS later, as recover_<account>_<comment>_wait_<n>, so
+ * the catch-up does not use up what the account's taps and new comments
+ * need. Nothing is claimed or reserved, so no attempt is used. "capped"
+ * after MAX_RECOVERY_USAGE_WAITS waits: the DM is sent then, and an R1 pause
+ * holds it should Meta refuse.
+ */
+async function holdRecoveryForUsage(
+  job: Job<ProcessCommentJob>,
+  automationId: string,
+  percent: number
+): Promise<"held" | "capped"> {
+  const { instagramAccountId, commentId } = job.data;
+  const next = (job.data.usageWait ?? 0) + 1;
+  if (next > MAX_RECOVERY_USAGE_WAITS) return "capped";
+  const now = Date.now();
+  const runAt = await copyRunAt(job.data, now + CATCH_UP_BRAKE_WAIT_MS);
+  const reason = `Meta reports ${Math.round(percent)} % of a request limit; the catch-up's DM waits until ${formatPauseTime(runAt)}`;
+  await prisma.dmLog.updateMany({
+    where: {
+      automationId,
+      commentId,
+      status: { not: "SENT" },
+      dmDeliveryUnconfirmed: false,
+    },
+    data: { status: "PENDING", errorMessage: reason },
+  });
+  await getDMQueue().add(
+    COMMENT_JOB_NAME,
+    { ...job.data, usageWait: next },
+    {
+      jobId: `${recoverJobId(instagramAccountId, commentId)}_wait_${next}`,
+      delay: Math.max(0, runAt - now),
+      removeOnComplete: true,
+      removeOnFail: true,
+    }
+  );
+  console.log(`[DM Worker] Comment ${commentId}: ${reason}`);
+  return "held";
+}
+
+/**
+ * A send Meta refused for a reason that may be the account's, not this
+ * comment's (A1: a token or permission error, or the account not found),
+ * while the connection check has seen the account refused at least once or
+ * holds an incident open: the reason, or null. Only a confirmed rejection
+ * can be meant here, which proves nothing went out; an answer that may have
+ * been delivered is never given back.
+ */
+async function refusedWithAccount(
+  accountRowId: string,
+  error: unknown
+): Promise<string | null> {
+  if (!isConfirmedSendRejection(error) || isMetaThrottle(error)) return null;
+  const verdict = classifyConnectionError(error);
+  if (verdict.outcome !== "lost") return null;
+  const account = await prisma.instagramAccount
+    .findUnique({
+      where: { id: accountRowId },
+      select: { connectionCheckFailedAt: true, connectionLostAt: true },
+    })
+    .catch(() => null);
+  return account?.connectionCheckFailedAt || account?.connectionLostAt
+    ? verdict.reason
     : null;
 }
 
@@ -724,6 +893,12 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     // The public reply follows the DM, so it is owed only once the DM went out
     // (or may have).
     const dmWentOut = alreadyDmd || Boolean(existingLog?.dmDeliveryUnconfirmed);
+    // Another job's claim on this campaign's DM, on its way right now. That
+    // job posts the public reply once its DM went out: posted here, a "check
+    // your DMs" could stand under a comment whose DM Instagram then refuses.
+    // A claim older than a send takes counts as a DM that may have gone out
+    // (its worker died), and gets its public reply here.
+    const claimOnItsWay = Boolean(existingLog && dmClaimInFlight(existingLog));
 
     // Skip only when there is genuinely nothing left to do. A comment whose DM
     // already went out but whose public reply never posted (e.g. it hit a rate
@@ -741,7 +916,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     }
     if (
       !needsDm &&
-      (!dmWentOut || alreadyPublicReplied || existingLog?.publicReplyDeliveryUnconfirmed || !publicReplyOn)
+      (!dmWentOut || claimOnItsWay || alreadyPublicReplied || existingLog?.publicReplyDeliveryUnconfirmed || !publicReplyOn)
     ) {
       continue;
     }
@@ -834,6 +1009,26 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       update: {},
     });
 
+    // A1: the account's connection is lost (an open incident). Meta refuses
+    // every call until it is reconnected, and each refused DM would use up
+    // one of the comment's three attempts. Nothing is called: the DM waits
+    // (PENDING, no attempt), and the catch-up after the incident, the sweep
+    // or "DM senden" sends it later. No other campaign could get through
+    // either.
+    if (automation.instagramAccount.connectionLostAt) {
+      await prisma.dmLog.updateMany({
+        where: {
+          automationId: automation.id,
+          commentId,
+          status: { not: "SENT" },
+          dmDeliveryUnconfirmed: false,
+        },
+        data: { status: "PENDING", errorMessage: CONNECTION_LOST_MESSAGE },
+      });
+      console.log(`[DM Worker] Comment ${commentId}: ${CONNECTION_LOST_MESSAGE}`);
+      return;
+    }
+
     // Public reply leg. It is posted after the DM leg, and only when the DM went
     // out or may have: a "check your DMs" reply under a comment whose DM was
     // refused or skipped would promise a message that never comes. A DM that
@@ -845,6 +1040,8 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         // because they already answered in public). The public leg is closed
         // for good, as a reply that may have gone out closes it, so no later
         // webhook or sweep job posts the campaign's reply under the comment.
+        // The DM claim closed it already (claimCommentPrivateReply); this is
+        // for a manual job that found the DM sent by another one.
         await prisma.dmLog
           .updateMany({
             where: {
@@ -855,7 +1052,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
             },
             data: {
               publicReplyDeliveryUnconfirmed: true,
-              publicReplyError: "Not posted: the public reply was switched off for this manual send",
+              publicReplyError: MANUAL_PUBLIC_REPLY_OFF,
             },
           })
           .catch((error) =>
@@ -872,11 +1069,16 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           : automation.publicReplyMessage
             ? [automation.publicReplyMessage]
             : [];
+      // The owner asked for the public reply on this manual send: a closing
+      // by an earlier manual send was opened again with the DM claim, so
+      // only the claim below can tell whether the reply is still owed.
+      const ownerAsked = manual && job.data.publicReplyOverride === true;
       if (
         !publicReplyOn ||
         replyPool.length === 0 ||
-        existingLog?.publicReplySentAt ||
-        existingLog?.publicReplyDeliveryUnconfirmed ||
+        (!ownerAsked &&
+          (existingLog?.publicReplySentAt ||
+            existingLog?.publicReplyDeliveryUnconfirmed)) ||
         !(await claimCommentDelivery(automation.id, commentId, "public"))
       ) {
         return;
@@ -934,35 +1136,19 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     // and logging a failure the user can do nothing about. Only the campaign
     // that sent the DM posts a public reply: a second "check your DMs" under
     // the same comment, from a campaign that sent nothing, adds noise and
-    // promises a message that never comes. A manual send also stands back
-    // for a DM that may have gone out or is on its way (privateReplyTakenBy).
-    const privateReplyUsedBy = manual
-      ? await privateReplyTakenBy(commentId, automation.id)
-      : await prisma.dmLog
-          .findFirst({
-            where: {
-              commentId,
-              status: "SENT",
-              automationId: { not: automation.id },
-            },
-            select: { automation: { select: { name: true } } },
-          })
-          .then((row) =>
-            row ? { name: row.automation?.name ?? "unknown", sent: true } : null
-          );
-    if (privateReplyUsedBy) {
-      await prisma.dmLog.update({
-        where: {
-          automationId_commentId: { automationId: automation.id, commentId },
-        },
-        data: {
-          status: "SKIPPED_DEDUP",
-          matchedKeyword: matchResult.matchedKeyword,
-          errorMessage: privateReplyUsedBy.sent
-            ? `Another campaign (${privateReplyUsedBy.name}) already sent the one private reply Instagram allows for this comment`
-            : `Another campaign (${privateReplyUsedBy.name}) is sending, or may have sent, the one private reply Instagram allows for this comment`,
-        },
-      });
+    // promises a message that never comes. Every job, automatic or manual,
+    // stands back for another campaign's DM that went out, may have, or is on
+    // its way (then it looks again shortly: standBackForRival). This first
+    // look only saves the reservations and the follow check; the claim below
+    // decides, under a lock on the comment.
+    const rival = await findPrivateReplyRival(commentId, automation.id);
+    if (rival) {
+      if (
+        (await standBackForRival(job, automation.id, matchResult.matchedKeyword, rival)) ===
+        "wait"
+      ) {
+        return;
+      }
       continue;
     }
 
@@ -973,6 +1159,21 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     if (pausedUntil !== null) {
       await waitForAccountPause(job, automation.id, pausedUntil);
       return;
+    }
+
+    // The catch-up after a lost connection sends what piled up while Meta
+    // refused the account. Its DMs wait while Meta reports the app or the
+    // account close to a limit: what is left belongs to new comments and to
+    // the taps of people who just got their opening DM.
+    if (job.data.source === "RECOVERY") {
+      const percent = recentAccountUsagePercent(instagramAccountId);
+      if (
+        percent !== null &&
+        percent >= CATCH_UP_USAGE_BRAKE_PERCENT &&
+        (await holdRecoveryForUsage(job, automation.id, percent)) === "held"
+      ) {
+        return;
+      }
     }
 
     const usage = await reserveWorkspaceDMSend(automation.workspaceId);
@@ -1117,57 +1318,42 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     // the tap on their button.
     const sendsLink = !useOpeningDm && !sendFollowPrompt;
 
-    let claimed;
+    // The claim: this campaign's DM for the comment, and the comment's one
+    // private reply, in one step (claimCommentPrivateReply). It fails when
+    // another campaign's DM went out, may have, or is on its way (then this
+    // campaign stands back as above), or when this campaign's own row cannot
+    // be claimed: its DM went out, another job holds its claim, or its
+    // attempts are used up. The claim labels the row with what this job
+    // matched ("(manuell)" for a manual send, exactly when it claimed), and
+    // a manual send closes the public reply in the same transaction when the
+    // owner switched it off: from then on no other job posts it. Switched
+    // on, a closing by an earlier manual send is opened again.
+    let claim;
     try {
-      claimed = await claimCommentDelivery(
-        automation.id,
-        commentId,
-        "dm",
-        manual ? { matchedKeyword: MANUAL_MATCHED_KEYWORD } : undefined
-      );
+      claim = await claimCommentPrivateReply(automation.id, commentId, {
+        matchedKeyword: matchResult.matchedKeyword,
+        ...(manual && !publicReplyOn && automation.publicReplyEnabled
+          ? { closePublicReply: MANUAL_PUBLIC_REPLY_OFF }
+          : {}),
+        ...(manual && job.data.publicReplyOverride === true
+          ? { reopenPublicReply: MANUAL_PUBLIC_REPLY_OFF }
+          : {}),
+      });
     } catch (error) {
       if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
       await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
       throw error;
     }
-    if (!claimed) {
+    if (!claim.claimed) {
       if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
       await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
-      continue;
-    }
-
-    // The claim is per campaign, the private reply per comment. A manual send
-    // can claim the comment for its campaign while an automatic job claims it
-    // for another. So after its claim, a manual send looks for any other
-    // campaign's claim or DM, and an automatic job for a manual send's: of
-    // two sends that claim at the same moment, at least one sees the other.
-    // That one gives its claim back, with its attempt (nothing was sent), and
-    // leaves the comment to the other campaign.
-    let rival: string | null;
-    try {
-      rival = manual
-        ? ((await privateReplyTakenBy(commentId, automation.id))?.name ?? null)
-        : await manualSendHolding(commentId, automation.id);
-    } catch (error) {
-      // Nothing was sent: the claim goes back, and the job is retried.
-      await releaseCommentClaim(automation.id, commentId, formatError(error)).catch(
-        () => false
-      );
-      if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
-      await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
-      throw error;
-    }
-    if (rival !== null) {
-      if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
-      await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
-      await releaseCommentClaim(
-        automation.id,
-        commentId,
-        manual
-          ? `Not sent: another campaign (${rival}) is sending, or may have sent, the one private reply Instagram allows for this comment`
-          : `Not sent: this comment's DM was sent by hand with another campaign (${rival}); Instagram allows one private reply per comment`,
-        "SKIPPED_DEDUP"
-      );
+      if (
+        claim.rival &&
+        (await standBackForRival(job, automation.id, matchResult.matchedKeyword, claim.rival)) ===
+          "wait"
+      ) {
+        return;
+      }
       continue;
     }
     let delivered = false;
@@ -1315,6 +1501,27 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         });
         if (hold === "held") return;
         errorMessage = `${pauseGaveUpMessage(pause.resumeAt)}. ${errorMessage}`;
+      }
+      // A1: Meta refused the account, not this comment (a token or
+      // permission error, the account not found), while the connection check
+      // has seen it refused already. The incident is about to open, and every
+      // try until the reconnect would use up one of the comment's three
+      // attempts. The claim goes back without counting it (the refusal proves
+      // nothing went out), the DM waits, and the job ends without a retry:
+      // the catch-up after the incident, the sweep or "DM senden" sends it.
+      const accountRefusal = delivered
+        ? null
+        : await refusedWithAccount(automation.instagramAccountId, sendError);
+      if (accountRefusal) {
+        await releaseCommentClaim(
+          automation.id,
+          commentId,
+          `Not sent: Instagram refused the account (${accountRefusal}) while its connection is being checked; this try does not count`
+        );
+        console.log(
+          `[DM Worker] Comment ${commentId}: Instagram refused the account (${accountRefusal}); the DM waits for the connection`
+        );
+        return;
       }
       await prisma.dmLog.update({
         where: { automationId_commentId: { automationId: automation.id, commentId } },
@@ -1565,6 +1772,45 @@ async function holdTapForPause({
 }
 
 /**
+ * The campaign a button tap, a read fallback or a follow-up belongs to: an
+ * active one, or a paused one the owner sent this person by hand from the
+ * Kommentare page (M1: a DmLog row of the campaign for this person marked
+ * "(manuell)" whose DM went out or may have). Sent by hand, a paused campaign
+ * runs everything after its DM as for any comment: its follow gate, the link
+ * behind its opening DM, its follow-up. Without such a row a paused campaign
+ * answers nothing, as before.
+ */
+async function findConversationCampaign<
+  const Include extends Prisma.AutomationInclude,
+>(
+  include: Include,
+  automationId: string,
+  userId: string,
+  data: DmQueueJob
+) {
+  const active = await prisma.automation.findFirst({
+    where: { id: automationId, isActive: true, ...connectionScope(data) },
+    include,
+  });
+  if (active) return active;
+  return prisma.automation.findFirst({
+    where: {
+      id: automationId,
+      isActive: false,
+      ...connectionScope(data),
+      dmLogs: {
+        some: {
+          commenterId: userId,
+          matchedKeyword: MANUAL_MATCHED_KEYWORD,
+          OR: [{ status: "SENT" }, { dmDeliveryUnconfirmed: true }],
+        },
+      },
+    },
+    include,
+  });
+}
+
+/**
  * Deliver the reveal message after a user taps an opening DM's button.
  * The postback payload is `reveal:<automationId>`; the sender is the user's
  * IGSID (same id as their comment author id), which we DM directly.
@@ -1595,9 +1841,8 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
   // this tap would.
   const pauseCopy = !fallback && Boolean(job.data.pauseRequeue);
 
-  const automation = await prisma.automation.findFirst({
-    where: { id: automationId, isActive: true, ...connectionScope(job.data) },
-    include: {
+  const automation = await findConversationCampaign(
+    {
       instagramAccount: true,
       workspace: true,
       trackedLinks: {
@@ -1605,16 +1850,19 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
         orderBy: TRACKED_LINK_ORDER,
       },
     },
-  });
+    automationId,
+    userId,
+    job.data
+  );
 
   if (
     !automation ||
     automation.instagramAccount.instagramId !== instagramAccountId ||
     !hasInstagramCredentials(automation.instagramAccount)
   ) {
-    // The campaign was paused or moved to another account while the tap
-    // waited, or its account lost its token. (A deleted campaign took its
-    // rows with it.)
+    // The campaign was paused (and not sent to this person by hand) or moved
+    // to another account while the tap waited, or its account lost its
+    // token. (A deleted campaign took its rows with it.)
     if (pauseCopy) {
       await settleWaitingReveal(
         automationId,
@@ -2217,10 +2465,12 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
 async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
   const { instagramAccountId, userId, automationId, commenterName } = job.data;
 
-  const automation = await prisma.automation.findFirst({
-    where: { id: automationId, isActive: true, ...connectionScope(job.data) },
-    include: { instagramAccount: true },
-  });
+  const automation = await findConversationCampaign(
+    { instagramAccount: true },
+    automationId,
+    userId,
+    job.data
+  );
 
   if (
     !automation ||

@@ -53,6 +53,13 @@ The catch-up adds four more (migration `20261126120000_connection_catch_up`):
 | `connectionCatchUpResult` | The last finished catch-up: comments queued, comments answered by hand, what was skipped. |
 | `connectionAllClearDueAt` | The all-clear e-mail of the last catch-up is still to go out. |
 
+The alert after an all-clear adds two more (migration `20261126180000_connection_alert_rearm`):
+
+| Column | Meaning |
+| --- | --- |
+| `connectionAllClearSentAt` | When the last all-clear e-mail reached at least one owner or admin. |
+| `connectionAlertRearmedAt` | When an alert went out inside the 24 hours of the last warning, because an all-clear had come after it. |
+
 ## The e-mail
 
 When an incident opens, every owner and admin of the workspace gets an e-mail
@@ -60,9 +67,15 @@ at the address they sign in with (members do not): since when, what it means
 (no DMs for comments, no replies to button taps, no public replies), the usual
 causes, and the three steps to reconnect with a link to
 `{NEXTAUTH_URL}/settings`. If the connection is still lost 24 hours later, one
-reminder follows. At most one e-mail per account in 24 hours, across
-incidents. German when `DEFAULT_LOCALE=de` (times in Europe/Berlin), English
-otherwise (times in UTC). Plain text and simple HTML, no tracking, no secrets.
+reminder follows, and no further reminder. At most one warning e-mail per
+account in 24 hours, across incidents; the all-clear after the catch-up comes
+on top. One exception: when the all-clear went out after the last warning
+(the owners were told the connection is back), a new incident gets its alert
+at once, or their last e-mail would say "back" while nothing goes out. That
+happens at most once per 24 hours (`connectionAlertRearmedAt`), so a flapping
+connection cannot loop alert, all-clear, alert. German when
+`DEFAULT_LOCALE=de` (times in Europe/Berlin), English otherwise (times in
+UTC). Plain text and simple HTML, no tracking, no secrets.
 
 The worker sends it through Resend's HTTP API (`RESEND_API_KEY`,
 `EMAIL_FROM`), or through SMTP when `EMAIL_SERVER` is set, as the sign-in
@@ -123,11 +136,29 @@ all ask for it under that id, so it is queued once while it waits or runs.
   an active campaign the way the sweep and the worker match (keywords as
   whole words unless the campaign allows partial matches, the question
   filter, a campaign bound to the post before an any-post campaign) and has
-  no DmLog row. It is the ordinary comment job `recover_<ig>_<comment>`
-  (`source: "RECOVERY"`), oldest first, the first right away and then one
-  every 20 seconds, so a long outage never bursts into Meta's limit. Every
-  claim of a comment's DM holds for it (one private reply per comment). At
-  most 1,000 per catch-up.
+  no DmLog row that settles it (its DM went out or may have, another
+  campaign answers it, the plan limit stopped it, or three attempts are used;
+  a row that only waits, or failed with attempts left, is queued again). It
+  is the ordinary comment job `recover_<ig>_<comment>` (`source:
+  "RECOVERY"`), oldest first, the first right away and then one every 2.5
+  minutes (`CATCH_UP_SPACING_MS`, 24 an hour: on 2026-11-21 about 25 private
+  replies and 50 conversation reads in one hour ran into Meta's app limit).
+  Each job takes a slot of the account's catch-up pace in Redis
+  (`lib/queue/send-pacing.ts`). Every claim of a comment's DM holds for it
+  (one private reply per comment, across campaigns: the claim and the look
+  at the other campaigns' rows in one transaction, under a lock on the
+  comment). At most 500 per catch-up, about 21 hours of DMs.
+- Its jobs keep that pace when they cannot send yet. One that meets an R1
+  pause runs its copy in the pace's next free slot after the pause, behind
+  the jobs already planned, not in the minute after it. One that finds Meta
+  reporting 60 % of a request limit in the last five minutes waits, without a
+  claim and without using an attempt, for a slot at least 15 minutes later
+  (`recover_<ig>_<comment>_wait_<n>`, at most four times; then it is sent).
+  And none sends while the account's connection is lost again: the DM waits
+  (PENDING, no attempt) for the catch-up of that incident, the sweep or "Send
+  DM". A send Meta refuses for the account (a token or permission error, the
+  account not found) after the check saw it refused once gives its claim
+  back without counting it.
 - A matching comment the account already answered by hand gets no DM: the
   owner may have sent the guide by hand. It is listed in the all-clear
   e-mail and in Diagnostics with the author, the text, the time and a link to
@@ -148,9 +179,10 @@ all ask for it under that id, so it is queued once while it waits or runs.
   check that end the incident at the same moment lead to one catch-up. One
   more incident that ends while a catch-up is owed is caught up with it, from
   the earlier start.
-- While the catch-up runs, and until the last DM it queued has run, the
-  regular comment sweep leaves the account alone (at most 30 hours after the
-  incident ended): it would queue the same comments again, all at once.
+- While the catch-up runs, and until the last DM it queued has run (the last
+  slot of its pace, copies included), the regular comment sweep leaves the
+  account alone (at most 30 hours after the incident ended): it would queue
+  the same comments again, all at once.
 - With every sweep the worker asks again for a catch-up that is owed but
   neither running nor queued for later (its request was lost, or the worker
   restarted), and sends an all-clear e-mail that is still owed.

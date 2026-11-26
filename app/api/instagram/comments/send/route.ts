@@ -8,8 +8,10 @@
  * own; the campaign must be the workspace's and have a DM text; no DM for
  * the comment may have gone out (Instagram allows one per comment). Then the
  * worker's comment job is queued for exactly this campaign, and the answer is
- * 202 { queued: true }: the DM itself goes out from the worker, and the page
- * reads the outcome from the DM log (GET /api/instagram/comments?ids=).
+ * 202 { queued: true, scheduledAt }: the DM itself goes out from the worker,
+ * at scheduledAt (manual sends of an account go out 20 seconds apart, at most
+ * 15 an hour), and the page reads the outcome from the DM log
+ * (GET /api/instagram/comments?ids=).
  *
  * A refusal says why in `reason` (lib/comments/server.ts ManualSendReason),
  * which the page shows in the reader's language.
@@ -106,6 +108,7 @@ export async function POST(request: NextRequest) {
       success: true,
       queued: true,
       queuedAt: result.queuedAt,
+      scheduledAt: result.scheduledAt,
       previousUpdatedAt: result.previousUpdatedAt,
     },
     { status: 202, headers: NO_STORE }

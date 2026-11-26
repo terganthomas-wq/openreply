@@ -8,11 +8,31 @@
  * Client-safe: no database, queue or Meta import.
  */
 
+import type { I18n } from "@/lib/i18n";
 import {
   CATCH_UP_REPORT_MS,
   readCatchUpResult,
   type OwnerAnsweredComment,
 } from "@/lib/instagram/catch-up-state";
+
+/**
+ * The Diagnostics timeline's line for a finished catch-up, in the reader's
+ * language: "1 Kommentar bekommt seine DM" for one, the plural otherwise.
+ */
+export function catchUpEventText(
+  { t }: Pick<I18n, "t">,
+  { account, queued, answered }: { account: string; queued: number; answered: number }
+): string {
+  return queued === 1
+    ? t(
+        "Catch-up for @{account} done: 1 comment gets its DM, {answered} you had answered yourself.",
+        { account, answered }
+      )
+    : t(
+        "Catch-up for @{account} done: {queued} comments get their DM, {answered} you had answered yourself.",
+        { account, queued, answered }
+      );
+}
 
 /** One account's catch-up, as the page gets it. */
 export interface CatchUpReport {

@@ -182,6 +182,60 @@ export interface PendingSend {
   /** The campaign row's updatedAt when the send was queued (null: none). */
   previousUpdatedAt: string | null;
   polls: number;
+  /** How often the page asks at most (sendPollBudget). */
+  maxPolls?: number;
+}
+
+/** How often the page asks the DM log for a send's outcome. */
+export const SEND_POLL_INTERVAL_MS = 3_000;
+/** For how long after a send is due. */
+export const SEND_POLL_AFTER_DUE_MS = 60_000;
+/** A send this much later than its click shows when it goes out. */
+export const SEND_DELAY_NOTE_MS = 5_000;
+
+function delayOf(queuedAt?: string | null, scheduledAt?: string | null): number {
+  if (!queuedAt || !scheduledAt) return 0;
+  const delay = Date.parse(scheduledAt) - Date.parse(queuedAt);
+  return Number.isFinite(delay) && delay > 0 ? delay : 0;
+}
+
+/**
+ * How often the page asks for a send's outcome: until a minute after the
+ * send is due. Manual sends of an account go out 20 seconds apart, so a send
+ * queued behind others is due later than its click (both times are the
+ * server's, so the reader's clock never matters).
+ */
+export function sendPollBudget(
+  queuedAt?: string | null,
+  scheduledAt?: string | null
+): number {
+  return Math.ceil(
+    (delayOf(queuedAt, scheduledAt) + SEND_POLL_AFTER_DUE_MS) / SEND_POLL_INTERVAL_MS
+  );
+}
+
+/** Whether the row says when its send goes out: only when it waits a while. */
+export function sendDelayed(
+  queuedAt?: string | null,
+  scheduledAt?: string | null
+): boolean {
+  return delayOf(queuedAt, scheduledAt) >= SEND_DELAY_NOTE_MS;
+}
+
+/**
+ * When the page loads the comments again by itself after the account's
+ * pause: the pause's end plus a few seconds, counted from the answer's time,
+ * in ms from now. Null without a pause.
+ */
+export function pauseReloadDelay(
+  pausedUntil: string | null,
+  generatedAt: string,
+  spreadMs = 0
+): number | null {
+  if (!pausedUntil) return null;
+  const left = Date.parse(pausedUntil) - Date.parse(generatedAt);
+  if (!Number.isFinite(left)) return null;
+  return Math.max(0, left) + 5_000 + Math.max(0, spreadMs);
 }
 
 /**

@@ -261,6 +261,33 @@ describe("putting a job back for the pause", () => {
     });
   });
 
+  it("queues a copy for its own later slot, never before the pause ends", async () => {
+    const resumeAt = NOW + 20 * MINUTE;
+    const later = await requeueForPause({
+      name: "process-comment",
+      data,
+      jobId: "comment_ig_1_c2_pause_1",
+      instagramAccountId: "ig_1",
+      resumeAt,
+      runAt: resumeAt + 40 * MINUTE,
+    });
+    expect(later).toBe(resumeAt + 40 * MINUTE);
+    expect(queueAdd).toHaveBeenLastCalledWith("process-comment", data, {
+      jobId: "comment_ig_1_c2_pause_1",
+      delay: 60 * MINUTE,
+      removeOnComplete: true,
+    });
+    const early = await requeueForPause({
+      name: "process-comment",
+      data,
+      jobId: "comment_ig_1_c3_pause_1",
+      instagramAccountId: "ig_1",
+      resumeAt,
+      runAt: NOW,
+    });
+    expect(early).toBe(resumeAt);
+  });
+
   it("counts the jobs that wait, until each has run", async () => {
     await requeueForPause({
       name: "process-comment",
