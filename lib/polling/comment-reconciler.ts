@@ -30,9 +30,19 @@
  * (lib/queue/account-pause.ts) is not swept at all while the pause lasts:
  * nothing could be sent for its comments, and the first sweep after the pause
  * finds them.
+ *
+ * After a lost connection (A1) the account is not swept either while its
+ * catch-up runs and until the last comment job it queued has run
+ * (catchUpHoldsSweep): the catch-up reads every post since the incident began
+ * and spaces the DMs 20 seconds apart, and the sweep would queue the same
+ * comments again all at once.
  */
 
 import { matchCommentToCampaign } from "@/lib/automation/comment-match";
+import {
+  catchUpHoldsSweep,
+  CATCH_UP_SWEEP_HOLD_MAX_MS,
+} from "@/lib/instagram/catch-up-state";
 import { MAX_COMMENT_SEND_ATTEMPTS } from "@/lib/queue/comment-delivery";
 import {
   hasLegacyUnconfirmedDelivery,
@@ -131,6 +141,8 @@ export async function reconcileComments(): Promise<void> {
           metaLogin: true,
           workspaceId: true,
           zernioAccountId: true,
+          connectionRecoveredAt: true,
+          connectionCatchUpFrom: true,
         },
       },
     },
@@ -141,9 +153,23 @@ export async function reconcileComments(): Promise<void> {
   const reads: SweepReads = { media: new Map(), comments: new Map() };
   // Each account's pause, read once per sweep.
   const pauses = new Map<string, number | null>();
+  // Accounts whose catch-up after a lost connection holds the sweep back.
+  const catchingUp = new Map<string, boolean>();
 
   for (const automation of automations) {
     const account = automation.instagramAccount;
+    let held = catchingUp.get(account.id);
+    if (held === undefined) {
+      held = await sweepHeldForCatchUp(account);
+      catchingUp.set(account.id, held);
+      if (held) {
+        console.log(
+          `[Sweep] @${account.username} is catching up on the comments of a lost connection; not swept`
+        );
+      }
+    }
+    if (held) continue;
+
     let pausedUntil = pauses.get(account.id);
     if (pausedUntil === undefined) {
       pausedUntil = await checkAccountPause(account.instagramId);
@@ -179,6 +205,37 @@ export async function reconcileComments(): Promise<void> {
       return;
     }
   }
+}
+
+/**
+ * Whether the account's catch-up after a lost connection holds the sweep
+ * back (catchUpHoldsSweep). The catch-up's JSON (when its last job runs) is
+ * read only in the hours after an incident, and once per account and sweep.
+ * A failed read holds nothing back: the sweep is the safety net.
+ */
+async function sweepHeldForCatchUp(account: {
+  id: string;
+  connectionRecoveredAt?: Date | null;
+  connectionCatchUpFrom?: Date | null;
+}): Promise<boolean> {
+  const now = Date.now();
+  const recoveredAt = account.connectionRecoveredAt;
+  if (!recoveredAt || now - recoveredAt.getTime() > CATCH_UP_SWEEP_HOLD_MAX_MS) {
+    return false;
+  }
+  if (account.connectionCatchUpFrom) return catchUpHoldsSweep(account, now);
+  const row = await prisma.instagramAccount
+    .findUnique({
+      where: { id: account.id },
+      select: {
+        connectionRecoveredAt: true,
+        connectionCatchUpFrom: true,
+        connectionCatchUpProgress: true,
+        connectionCatchUpResult: true,
+      },
+    })
+    .catch(() => null);
+  return row ? catchUpHoldsSweep(row, now) : false;
 }
 
 /**

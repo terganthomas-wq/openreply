@@ -118,9 +118,43 @@ export function highestUsagePercent(usage: MetaUsage): number {
   return highest;
 }
 
+/**
+ * The highest share for one Instagram account: the app's own, and the
+ * business use case entries of that account (another account's entries are
+ * its own business).
+ */
+export function accountUsagePercent(
+  usage: MetaUsage,
+  instagramId: string
+): number {
+  return highestUsagePercent({
+    app: usage.app,
+    business: usage.business.filter((entry) => entry.id === instagramId),
+  });
+}
+
 type MetaUsageObserver = (report: MetaUsageReport) => void;
 
 let observer: MetaUsageObserver | null = null;
+
+/** The last report of this process, with when it came (epoch ms). */
+export type LatestMetaUsage = MetaUsageReport & { at: number };
+
+let latest: LatestMetaUsage | null = null;
+
+/**
+ * The usage the last Meta response of this process reported, or null. The
+ * catch-up after a lost connection reads it between its reads and stops
+ * early when the app gets close to a limit (lib/instagram/connection-catch-up.ts).
+ */
+export function latestMetaUsage(): LatestMetaUsage | null {
+  return latest;
+}
+
+/** Tests: forget the last report. */
+export function resetLatestMetaUsage(): void {
+  latest = null;
+}
 
 /**
  * Register the one observer of Meta's usage reports (null removes it). It
@@ -137,10 +171,11 @@ export function noteMetaUsage(
   headers: HeaderSource,
   instagramId: string | null
 ): void {
-  if (!observer) return;
   try {
     const usage = parseMetaUsage(headers);
-    if (usage) observer({ usage, instagramId });
+    if (!usage) return;
+    latest = { usage, instagramId, at: Date.now() };
+    observer?.({ usage, instagramId });
   } catch {
     // Observing usage must never break the call that reported it.
   }

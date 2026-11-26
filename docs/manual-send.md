@@ -84,6 +84,16 @@ Every guarantee of an automatic comment DM holds for a manual one
   pause like any comment job, under its own copy id
   (`manual_<account>_<comment>_<campaign>_pause_<n>`).
 
+## After a lost connection
+
+When the catch-up after a lost connection has run
+([connection alert](connection-alert.md#the-catch-up)), the comments the
+account had already answered by hand got no automatic DM. The all-clear
+e-mail and Diagnostics list them, with a link to this page: send the DM here
+for anyone who should still get it. The page shows them under "Without DM"
+with "You replied", as long as their post is among the newest posts it lists
+(up to 60).
+
 ## Cost in Meta requests
 
 A page view costs one read of the posts and one read of each post's newest 50

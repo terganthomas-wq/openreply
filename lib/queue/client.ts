@@ -21,7 +21,9 @@ export function getRedisConnection(): Redis {
 // ─── DM Queue ───────────────────────────────────────────────────────────────────
 
 // MANUAL: the owner sent it from the Kommentare page (lib/comments/server.ts).
-export type CommentSource = "WEBHOOK" | "POLLING" | "MANUAL";
+// RECOVERY: the catch-up after a lost connection queued it
+// (lib/instagram/connection-catch-up.ts).
+export type CommentSource = "WEBHOOK" | "POLLING" | "MANUAL" | "RECOVERY";
 
 export interface ProcessCommentJob {
   accountConnectionId?: string;
@@ -155,12 +157,28 @@ export interface ProcessOfferJob {
   pauseRequeue?: number;
 }
 
+// The catch-up after a lost Instagram connection (A1,
+// lib/instagram/connection-catch-up.ts) for one account. Queued when an
+// incident ends (by the worker's check or by the reconnect callback), and by
+// the worker's sweep for a catch-up still owed. It sends nothing itself: it
+// reads the comments of the meantime and queues their comment jobs.
+export interface ProcessCatchUpJob {
+  // The InstagramAccount row id.
+  accountConnectionId: string;
+  // The Instagram business id, which recordWorkerFailure reads.
+  instagramAccountId: string;
+  // Not used: the catch-up keeps its own progress on the account row. Here
+  // because code that handles any job reads it.
+  pauseRequeue?: number;
+}
+
 export type DmQueueJob =
   | ProcessCommentJob
   | ProcessPostbackJob
   | ProcessFollowUpJob
   | ProcessMessageJob
-  | ProcessOfferJob;
+  | ProcessOfferJob
+  | ProcessCatchUpJob;
 
 // The worker runs a comment job only under this name (or none at all), so a
 // job name it does not know yet is ignored instead of being read as a comment.
@@ -169,6 +187,9 @@ export const POSTBACK_JOB_NAME = "process-postback";
 export const FOLLOWUP_JOB_NAME = "process-followup";
 export const MESSAGE_JOB_NAME = "process-message";
 export const OFFER_JOB_NAME = "process-offer";
+// A worker from before the catch-up ignores this name (dispatchJob), and the
+// catch-up stays owed in the database until a newer worker runs it.
+export const CATCH_UP_JOB_NAME = "process-catch-up";
 
 let dmQueue: Queue<DmQueueJob> | null = null;
 

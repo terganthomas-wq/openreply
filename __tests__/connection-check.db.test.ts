@@ -31,6 +31,7 @@ vi.mock("@/lib/db/client", () => ({
 vi.mock("@/lib/queue/client", () => ({
   getRedisConnection: () => state.redis,
   getDMQueue: () => ({ add: vi.fn() }),
+  CATCH_UP_JOB_NAME: "process-catch-up",
 }));
 vi.mock("@/lib/meta/oauth", () => ({ decryptToken: () => "local-test-token" }));
 

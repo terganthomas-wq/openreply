@@ -8,7 +8,9 @@ import KeyExpiryNotice, {
   type KeyNeedingAttention,
 } from "@/components/key-expiry-notice";
 import StatusBadge from "@/components/status-badge";
+import ConnectionCatchUpReport from "@/components/connection-catch-up";
 import { ReconnectButton } from "@/components/connection-incident";
+import type { CatchUpReport } from "@/lib/instagram/catch-up-report";
 import {
   CONNECTION_LOST_REASON_TEXT,
   formatIncidentTime,
@@ -76,6 +78,9 @@ interface DiagnosticsData {
     code: string | null;
     alertSentAt: string | null;
   }>;
+  // A1: the catch-up after an incident, while it runs and for 7 days after,
+  // with the comments the owner had answered by hand.
+  connectionCatchUps?: CatchUpReport[];
   // Owners and admins can reconnect an account.
   canReconnect?: boolean;
   // Service keys that expire within 14 days, or expired although something
@@ -157,6 +162,20 @@ function eventMessage(
       return t(
         "Alert e-mails about a lost Instagram connection cannot go out: the sending service has no e-mail settings (RESEND_API_KEY and EMAIL_FROM)."
       );
+    case "connection-catch-up":
+      return detail.account
+        ? t(
+            "Catch-up for @{account} done: {queued} comments get their DM, {answered} you had answered yourself.",
+            { account: detail.account, queued: detail.queued, answered: detail.answered }
+          )
+        : event.message;
+    case "connection-all-clear":
+      return detail.account
+        ? t("All-clear e-mail for @{account} sent. Recipients: {count}", {
+            account: detail.account,
+            count: detail.recipients,
+          })
+        : event.message;
     default:
       return event.message;
   }
@@ -288,6 +307,13 @@ export default function DiagnosticsPage() {
             </p>
           )}
         </section>
+      ) : null}
+
+      {data?.connectionCatchUps?.length ? (
+        <ConnectionCatchUpReport
+          reports={data.connectionCatchUps}
+          canManage={Boolean(data.canReconnect)}
+        />
       ) : null}
 
       {data?.accountPauses.length ? (

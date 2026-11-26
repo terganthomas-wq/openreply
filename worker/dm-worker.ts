@@ -4,6 +4,10 @@ import { recordWorkerHeartbeat } from "@/lib/ops/worker-health";
 import { reconcileComments } from "@/lib/polling/comment-reconciler";
 import { attachPendingNextReels } from "@/lib/automation/attach-next-reel";
 import { checkInstagramConnections } from "@/lib/instagram/connection-check";
+import {
+  resumeConnectionCatchUps,
+  stopConnectionCatchUps,
+} from "@/lib/instagram/connection-catch-up";
 import os from "node:os";
 
 // A WARNING in Diagnostics once a Meta response reports 80 % of a request
@@ -54,6 +58,20 @@ async function poll() {
     console.error("[DM Worker] Connection check failed:", message);
   }
 
+  // A1: a catch-up of missed comments that is owed but neither running nor
+  // queued (its request was lost, or the worker restarted) is asked for
+  // again, and an all-clear e-mail still owed goes out. No Meta call here;
+  // the catch-up itself runs as a queue job (lib/instagram/connection-catch-up.ts).
+  try {
+    const resumed = await resumeConnectionCatchUps();
+    if (resumed.requested > 0 || resumed.mailed > 0) {
+      console.log("[DM Worker] Catch-up after a lost connection:", resumed);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    console.error("[DM Worker] Catch-up look failed:", message);
+  }
+
   try {
     const attached = await attachPendingNextReels();
     if (attached.bound > 0 || attached.failedAccounts > 0) {
@@ -74,6 +92,9 @@ async function shutdown(signal: string) {
   console.log(`[DM Worker] ${signal} received, closing worker`);
   clearInterval(heartbeatTimer);
   clearInterval(pollTimer);
+  // A catch-up that reads stops before its next read and queues the rest for
+  // a minute later, so the shutdown does not wait for its reads.
+  stopConnectionCatchUps();
   await worker.close();
   process.exit(0);
 }

@@ -13,6 +13,7 @@ const { mockPrisma, queueAdd, readComments, readMedia, redis } = vi.hoisted(() =
     automation: { findMany: vi.fn() },
     dmLog: { findMany: vi.fn() },
     operationalEvent: { create: vi.fn() },
+    instagramAccount: { findUnique: vi.fn() },
   },
   queueAdd: vi.fn(),
   readComments: vi.fn(),
@@ -696,5 +697,95 @@ describe("the sweep and Meta's request limits", () => {
     expect(fake.commands.filter((c) => c === "GET meta:pause:owner-a")).toHaveLength(1);
     expect(log).toHaveBeenCalledWith(expect.stringContaining("@studio_a is paused"));
     log.mockRestore();
+  });
+});
+
+// A1: while an account catches up on the comments of a lost connection
+// (lib/instagram/connection-catch-up.ts), and until the last DM it queued has
+// run, the sweep leaves it alone: it would queue the same comments again, all
+// at once.
+describe("the sweep and the catch-up after a lost connection", () => {
+  const campaign = (accountId: string, catchUp: Record<string, unknown>) => ({
+    id: `campaign-${accountId}`,
+    name: `campaign-${accountId}`,
+    workspaceId: "workspace",
+    postId: null,
+    matchAnyPost: true,
+    matchAnyWord: true,
+    keywords: [],
+    wholeWordMatch: true,
+    ignoreQuestionComments: false,
+    publicReplyEnabled: false,
+    instagramAccount: {
+      id: `connection-${accountId}`,
+      instagramId: `owner-${accountId}`,
+      username: `studio_${accountId}`,
+      provider: "META",
+      accessToken: "test",
+      ...catchUp,
+    },
+  });
+
+  beforeEach(() => {
+    queueAdd.mockReset();
+    readMedia.mockReset().mockResolvedValue([{ id: "m1" }]);
+    readComments.mockReset().mockResolvedValue([
+      { id: "c1", text: "LINK", from: { id: "reader" }, timestamp: new Date().toISOString() },
+    ]);
+    mockPrisma.automation.findMany.mockReset();
+    mockPrisma.operationalEvent.create.mockReset().mockResolvedValue({});
+    mockPrisma.$queryRaw.mockResolvedValue([]);
+    mockPrisma.dmLog.findMany.mockResolvedValue([]);
+  });
+
+  it("does not sweep an account whose catch-up is owed or whose last catch-up DM is still to run", async () => {
+    const recovered = new Date(Date.now() - 10 * 60_000);
+    const finished = (lastJobAt: number) => ({
+      v: 1,
+      lostAt: new Date(Date.now() - 3_600_000).toISOString(),
+      recoveredAt: recovered.toISOString(),
+      finishedAt: recovered.toISOString(),
+      since: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+      lastJobAt: new Date(lastJobAt).toISOString(),
+    });
+    mockPrisma.automation.findMany.mockResolvedValue([
+      campaign("owed", { connectionRecoveredAt: recovered, connectionCatchUpFrom: new Date(Date.now() - 3_600_000) }),
+      campaign("waiting", { connectionRecoveredAt: recovered, connectionCatchUpFrom: null }),
+      campaign("done", { connectionRecoveredAt: recovered, connectionCatchUpFrom: null }),
+      campaign("never", { connectionRecoveredAt: null, connectionCatchUpFrom: null }),
+    ]);
+    // The catch-up's JSON is read only for an account whose incident ended
+    // in the last hours, and only when nothing is owed any more.
+    mockPrisma.instagramAccount.findUnique.mockImplementation(async ({ where }) => ({
+      connectionRecoveredAt: recovered,
+      connectionCatchUpFrom: null,
+      connectionCatchUpProgress: null,
+      connectionCatchUpResult:
+        where.id === "connection-waiting" ? finished(Date.now() + 60_000) : finished(Date.now() - 60_000),
+    }));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await reconcileComments();
+
+    expect(readMedia).toHaveBeenCalledTimes(2);
+    expect(queueAdd.mock.calls.map(([, data]) => data.instagramAccountId)).toEqual(["owner-done", "owner-never"]);
+    expect(mockPrisma.instagramAccount.findUnique.mock.calls.map(([args]) => args.where.id).sort()).toEqual([
+      "connection-done",
+      "connection-waiting",
+    ]);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("@studio_owed is catching up"));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("@studio_waiting is catching up"));
+    log.mockRestore();
+  });
+
+  it("sweeps it again 30 hours after the incident ended, whatever the catch-up says", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      campaign("stuck", {
+        connectionRecoveredAt: new Date(Date.now() - 31 * 3_600_000),
+        connectionCatchUpFrom: new Date(Date.now() - 40 * 3_600_000),
+      }),
+    ]);
+    await reconcileComments();
+    expect(queueAdd).toHaveBeenCalledTimes(1);
   });
 });

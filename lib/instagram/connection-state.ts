@@ -5,15 +5,22 @@
  *
  * An incident ends with a check that gets through again, or with a
  * reconnect. Its start is not forgotten then: it moves to
- * connectionCatchUpFrom, where the catch-up of the comments missed in the
- * meantime finds it (onIncidentEnded).
+ * connectionCatchUpFrom, and the catch-up of the comments missed in the
+ * meantime runs in the worker (lib/instagram/connection-catch-up.ts), which
+ * onIncidentEnded asks for through the queue.
  *
- * Database only, no Meta, queue or mail import: the web app's callback uses
- * it too.
+ * Database and queue only, no Meta or mail import: the web app's callback
+ * uses it too.
  */
 
 import { prisma } from "@/lib/db/client";
+import { catchUpJobId } from "@/lib/instagram/catch-up-state";
 import { CONNECTION_BACK_EVENT } from "@/lib/ops/event-details";
+import {
+  CATCH_UP_JOB_NAME,
+  getDMQueue,
+  type ProcessCatchUpJob,
+} from "@/lib/queue/client";
 
 /**
  * How far before an incident's start the catch-up of the missed comments
@@ -30,6 +37,8 @@ function describeError(error: unknown): string {
 export interface EndedIncident {
   accountId: string;
   workspaceId: string;
+  /** The Instagram business id. */
+  instagramId: string;
   username: string;
   /** When the incident began (its connectionLostAt). */
   lostAt: Date;
@@ -39,19 +48,68 @@ export interface EndedIncident {
   via: "check" | "reconnect";
 }
 
+// How long a request for the catch-up waits for Redis. The reconnect must
+// not hang on it; the worker's sweep asks again for a catch-up still owed.
+const QUEUE_TIMEOUT_MS = 5_000;
+
+/**
+ * Ask the worker to run the account's catch-up (A1 requirement 5): the job
+ * `catchup_<account>_<start>` (catchUpJobId), so the check that ends an
+ * incident, the reconnect and the worker's sweep queue it once while it
+ * waits or runs. With `runAt`, a delayed job for that time, under its own id:
+ * a catch-up that stopped early (an R1 pause, a Meta limit) goes on then.
+ * Removed once it ends, so a later request is never swallowed by a finished
+ * one. False when it could not be queued; never throws.
+ */
+export async function queueConnectionCatchUp(
+  account: { id: string; instagramId: string },
+  from: Date,
+  { runAt, now = Date.now() }: { runAt?: number; now?: number } = {}
+): Promise<boolean> {
+  const data: ProcessCatchUpJob = {
+    accountConnectionId: account.id,
+    instagramAccountId: account.instagramId,
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      getDMQueue().add(CATCH_UP_JOB_NAME, data, {
+        jobId: catchUpJobId(account.id, from, runAt),
+        delay: runAt === undefined ? 0 : Math.max(0, runAt - now),
+        removeOnComplete: true,
+        removeOnFail: true,
+      }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("the queue did not answer in time")),
+          QUEUE_TIMEOUT_MS
+        );
+      }),
+    ]);
+    return true;
+  } catch (error) {
+    console.error(
+      "[Connection check] Could not queue the catch-up:",
+      describeError(error)
+    );
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Called once when an incident ends: by the worker when a check gets through
  * again (via "check"), and by the reconnect callback (via "reconnect").
  *
  * The incident's start stays in connectionCatchUpFrom (the earlier one, when
  * a catch-up is still pending), and when it ended in connectionRecoveredAt.
- * Hook for the catch-up of the missed comments (A1 requirement 5) and the
- * all-clear e-mail (6): they start here, scan the comments created since
- * `catchUpFrom` minus CONNECTION_CATCH_UP_MARGIN_MS (in the worker, so a
- * reconnect queues it), and set connectionCatchUpFrom back to null once the
- * catch-up has run. Until they exist the hook only records that the
- * connection is back, and the regular sweep finds the comments of its
- * lookback as before.
+ * This records that the connection is back and asks the worker for the
+ * catch-up of the missed comments and the all-clear e-mail
+ * (lib/instagram/connection-catch-up.ts), which scan from `catchUpFrom` minus
+ * CONNECTION_CATCH_UP_MARGIN_MS and set connectionCatchUpFrom back to null
+ * once they have run. Should the request not reach the queue, the worker's
+ * next sweep asks again. Never throws.
  */
 export async function onIncidentEnded(ended: EndedIncident): Promise<void> {
   const minutes = Math.max(
@@ -81,6 +139,10 @@ export async function onIncidentEnded(ended: EndedIncident): Promise<void> {
       describeError(error)
     );
   }
+  await queueConnectionCatchUp(
+    { id: ended.accountId, instagramId: ended.instagramId },
+    ended.catchUpFrom
+  );
 }
 
 /**
@@ -101,6 +163,7 @@ export async function clearConnectionIncident(
       select: {
         id: true,
         workspaceId: true,
+        instagramId: true,
         username: true,
         connectionLostAt: true,
         connectionCheckFailedAt: true,
@@ -142,6 +205,7 @@ export async function clearConnectionIncident(
       const incident: EndedIncident = {
         accountId,
         workspaceId: current.workspaceId,
+        instagramId: current.instagramId,
         username: current.username,
         lostAt,
         recoveredAt,

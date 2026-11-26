@@ -145,6 +145,7 @@ vi.mock("@/lib/queue/client", () => ({
   FOLLOWUP_JOB_NAME: "process-followup",
   MESSAGE_JOB_NAME: "process-message",
   OFFER_JOB_NAME: "process-offer",
+  CATCH_UP_JOB_NAME: "process-catch-up",
 }));
 
 // The real work after a delivered link, observed: tests can read what a
@@ -164,6 +165,13 @@ vi.mock("../lib/offers/worker", async (importOriginal) => {
     processOfferTap: vi.fn(actual.processOfferTap),
   };
 });
+
+// The catch-up after a lost connection has tests of its own
+// (connection-catch-up.test.ts); here only that the worker hands it its job.
+const { mockRunCatchUp } = vi.hoisted(() => ({ mockRunCatchUp: vi.fn() }));
+vi.mock("@/lib/instagram/connection-catch-up", () => ({
+  runConnectionCatchUp: mockRunCatchUp,
+}));
 
 vi.mock("bullmq", () => {
   function MockWorker(_name: string, processor: unknown) {
@@ -1761,6 +1769,24 @@ describe("DM Worker — job dispatch", () => {
       );
     } finally {
       warn.mockRestore();
+    }
+  });
+
+  it("hands a catch-up job to the catch-up of its account, and runs nothing of a comment", async () => {
+    mockRunCatchUp.mockResolvedValueOnce("done");
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await getProcessor()({
+        ...createMockJob({ accountConnectionId: "ig_account_row_1", instagramAccountId: "ig_123" }),
+        name: "process-catch-up",
+      });
+      expect(mockRunCatchUp).toHaveBeenCalledTimes(1);
+      expect(mockRunCatchUp).toHaveBeenCalledWith("ig_account_row_1");
+      expect(prismaCallCount()).toBe(0);
+      expect(mockQueueAdd).not.toHaveBeenCalled();
+      expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
     }
   });
 

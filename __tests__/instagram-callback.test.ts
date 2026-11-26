@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 
-const { mockPrisma, mockExchange } = vi.hoisted(() => ({
+const { mockPrisma, mockExchange, mockQueueAdd } = vi.hoisted(() => ({
   mockPrisma: {
     workspaceMember: { findFirst: vi.fn() },
     instagramAccount: {
@@ -12,9 +12,15 @@ const { mockPrisma, mockExchange } = vi.hoisted(() => ({
     operationalEvent: { create: vi.fn() },
   },
   mockExchange: vi.fn(),
+  mockQueueAdd: vi.fn(),
 }));
 
 vi.mock("@/lib/db/client", () => ({ prisma: mockPrisma }));
+// The reconnect asks the worker for the catch-up of the missed comments.
+vi.mock("@/lib/queue/client", () => ({
+  getDMQueue: () => ({ add: mockQueueAdd }),
+  CATCH_UP_JOB_NAME: "process-catch-up",
+}));
 vi.mock("@/lib/auth", () => ({
   auth: vi.fn(async () => ({ user: { id: "user" } })),
 }));
@@ -52,6 +58,7 @@ beforeEach(() => {
   mockPrisma.workspaceMember.findFirst.mockResolvedValue({ role: "OWNER" });
   mockPrisma.instagramAccount.findUnique.mockResolvedValue(null);
   mockPrisma.operationalEvent.create.mockResolvedValue({});
+  mockQueueAdd.mockResolvedValue({ id: "job" });
 });
 afterEach(() => vi.unstubAllEnvs());
 
@@ -163,6 +170,7 @@ describe("Instagram OAuth callback", () => {
       mockPrisma.instagramAccount.findUnique.mockResolvedValue({
         id: "row",
         workspaceId: "workspace",
+        instagramId: "ig1",
         username: "one",
         connectionLostAt: lostAt,
         connectionCheckFailedAt: lostAt,
@@ -203,6 +211,47 @@ describe("Instagram OAuth callback", () => {
           }),
         }),
       });
+      // A1 catch-up: the worker gets the job, under the id the check and the
+      // worker's sweep use too, so it runs once.
+      expect(mockQueueAdd).toHaveBeenCalledTimes(1);
+      expect(mockQueueAdd).toHaveBeenCalledWith(
+        "process-catch-up",
+        { accountConnectionId: "row", instagramAccountId: "ig1" },
+        {
+          jobId: `catchup_row_${lostAt.getTime()}`,
+          delay: 0,
+          removeOnComplete: true,
+          removeOnFail: true,
+        }
+      );
+    });
+
+    it("still connects when the catch-up cannot be queued", async () => {
+      mockPrisma.instagramAccount.findUnique.mockResolvedValue({
+        id: "row",
+        workspaceId: "workspace",
+        instagramId: "ig1",
+        username: "one",
+        connectionLostAt: lostAt,
+        connectionCheckFailedAt: lostAt,
+        connectionCatchUpFrom: null,
+      });
+      mockPrisma.instagramAccount.updateMany.mockResolvedValue({ count: 1 });
+      mockQueueAdd.mockRejectedValueOnce(new Error("Connection is closed."));
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      unifiedReconnect();
+
+      const response = await callback();
+
+      expect(response.headers.get("location")).toBe(
+        "https://app.test/dashboard?connected=true"
+      );
+      // The worker's next sweep asks for it again.
+      expect(error).toHaveBeenCalledWith(
+        "[Connection check] Could not queue the catch-up:",
+        "Connection is closed."
+      );
+      error.mockRestore();
     });
 
     it("still connects when the incident cannot be ended", async () => {
@@ -230,6 +279,7 @@ describe("Instagram OAuth callback", () => {
       await callback();
       expect(mockPrisma.instagramAccount.create).toHaveBeenCalledTimes(1);
       expect(mockPrisma.instagramAccount.updateMany).not.toHaveBeenCalled();
+      expect(mockQueueAdd).not.toHaveBeenCalled();
     });
   });
 

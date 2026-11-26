@@ -25,6 +25,10 @@ export const CONNECTION_BACK_EVENT = "connection-back";
 export const CONNECTION_ALERT_EVENT = "connection-alert";
 /** The worker has no e-mail settings, so no alert can go out (lib/ops/mail.ts). */
 export const MAIL_UNCONFIGURED_EVENT = "mail-unconfigured";
+/** The catch-up after an incident finished (lib/instagram/connection-catch-up.ts). */
+export const CONNECTION_CATCH_UP_EVENT = "connection-catch-up";
+/** The all-clear e-mail after an incident went out (lib/ops/connection-all-clear.ts). */
+export const CONNECTION_ALL_CLEAR_EVENT = "connection-all-clear";
 
 export type EventDetail =
   | { kind: typeof META_PAUSE_EVENT; resumeAt: string; account: string | null }
@@ -38,7 +42,14 @@ export type EventDetail =
       recipients: number;
       reminder: boolean;
     }
-  | { kind: typeof MAIL_UNCONFIGURED_EVENT };
+  | { kind: typeof MAIL_UNCONFIGURED_EVENT }
+  | {
+      kind: typeof CONNECTION_CATCH_UP_EVENT;
+      account: string | null;
+      queued: number;
+      answered: number;
+    }
+  | { kind: typeof CONNECTION_ALL_CLEAR_EVENT; account: string | null; recipients: number };
 
 function text(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
@@ -84,7 +95,19 @@ export function eventDetail(payload: unknown): EventDetail | null {
         : null;
     case MAIL_UNCONFIGURED_EVENT:
       return { kind: MAIL_UNCONFIGURED_EVENT };
+    case CONNECTION_CATCH_UP_EVENT:
+      return isCount(p.queued) && isCount(p.answered)
+        ? { kind: CONNECTION_CATCH_UP_EVENT, account, queued: p.queued, answered: p.answered }
+        : null;
+    case CONNECTION_ALL_CLEAR_EVENT:
+      return isCount(p.recipients) && p.recipients > 0
+        ? { kind: CONNECTION_ALL_CLEAR_EVENT, account, recipients: p.recipients }
+        : null;
     default:
       return null;
   }
+}
+
+function isCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }

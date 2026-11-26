@@ -47,17 +47,20 @@ import {
 import { ensureContactSafe, type ContactSummary } from "@/lib/contacts/store";
 import { OFFER_PAYLOAD_PREFIX, withinWindow } from "@/lib/offers/schedule";
 import { processOffer, processOfferTap } from "@/lib/offers/worker";
+import { runConnectionCatchUp } from "@/lib/instagram/connection-catch-up";
 import { createHash } from "node:crypto";
 import { UnrecoverableError, Worker, type Job } from "bullmq";
 import {
   getDMQueue,
   getRedisConnection,
+  CATCH_UP_JOB_NAME,
   COMMENT_JOB_NAME,
   MESSAGE_JOB_NAME,
   POSTBACK_JOB_NAME,
   FOLLOWUP_JOB_NAME,
   OFFER_JOB_NAME,
   type DmQueueJob,
+  type ProcessCatchUpJob,
   type ProcessCommentJob,
   type ProcessMessageJob,
   type ProcessOfferJob,
@@ -2891,6 +2894,15 @@ async function dispatchJob(job: Job<DmQueueJob>): Promise<void> {
   }
   if (job.name === OFFER_JOB_NAME) {
     return processOffer(job as Job<ProcessOfferJob>);
+  }
+  // The catch-up after a lost connection (A1): it reads the comments of the
+  // meantime and queues their comment jobs; it sends nothing itself.
+  if (job.name === CATCH_UP_JOB_NAME) {
+    const outcome = await runConnectionCatchUp(
+      (job as Job<ProcessCatchUpJob>).data.accountConnectionId
+    );
+    console.log(`[DM Worker] Catch-up ${job.id}: ${outcome}`);
+    return;
   }
   // Every other name used to fall through to processComment. A job type this
   // worker does not know yet (one added by a newer release, still delayed in

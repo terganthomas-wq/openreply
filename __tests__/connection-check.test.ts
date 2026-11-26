@@ -15,6 +15,7 @@ const state = vi.hoisted(() => ({
   db: null as unknown as import("./helpers/fake-connection-db").FakeConnectionDb,
   redis: null as unknown,
 }));
+const queueAdd = vi.hoisted(() => vi.fn());
 
 vi.mock("@/lib/db/client", () => ({
   get prisma() {
@@ -23,7 +24,8 @@ vi.mock("@/lib/db/client", () => ({
 }));
 vi.mock("@/lib/queue/client", () => ({
   getRedisConnection: () => state.redis,
-  getDMQueue: () => ({ add: vi.fn() }),
+  getDMQueue: () => ({ add: queueAdd }),
+  CATCH_UP_JOB_NAME: "process-catch-up",
 }));
 vi.mock("@/lib/meta/oauth", () => ({
   decryptToken: (value: string) => {
@@ -107,6 +109,7 @@ beforeEach(() => {
   metaCalls = [];
   resendCalls = [];
   metaAnswer = ok;
+  queueAdd.mockReset().mockResolvedValue({ id: "job" });
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -464,6 +467,14 @@ describe("the end of an incident", () => {
         via: "check",
       },
     });
+    // The catch-up of the missed comments (lib/instagram/connection-catch-up.ts)
+    // runs in the worker as its own job, under the id a reconnect uses too.
+    expect(queueAdd).toHaveBeenCalledTimes(1);
+    expect(queueAdd).toHaveBeenCalledWith(
+      "process-catch-up",
+      { accountConnectionId: "account_1", instagramAccountId: "ig_1" },
+      expect.objectContaining({ jobId: `catchup_account_1_${NOW}`, delay: 0 })
+    );
   });
 
   it("keeps an earlier start whose catch-up has not run yet", async () => {
@@ -473,6 +484,12 @@ describe("the end of an incident", () => {
     metaAnswer = ok;
     await check(NOW + 2 * HOUR);
     expect(state.db.account().connectionCatchUpFrom).toEqual(earlier);
+    // One catch-up for both, from the earlier start.
+    expect(queueAdd).toHaveBeenCalledWith(
+      "process-catch-up",
+      expect.anything(),
+      expect.objectContaining({ jobId: `catchup_account_1_${earlier.getTime()}` })
+    );
   });
 });
 

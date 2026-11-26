@@ -97,6 +97,7 @@ describe("Diagnostics and Meta's request limits", () => {
     expect(mockPrisma.instagramAccount.findMany).toHaveBeenCalledWith({
       where: { workspaceId: "workspace" },
       select: {
+        id: true,
         instagramId: true,
         username: true,
         // A1: the lost-connection incident of each account.
@@ -104,6 +105,9 @@ describe("Diagnostics and Meta's request limits", () => {
         connectionLostReason: true,
         connectionAlertSentAt: true,
         connectionAlertCount: true,
+        // A1: its catch-up, running or finished.
+        connectionCatchUpFrom: true,
+        connectionCatchUpResult: true,
       },
     });
   });
@@ -272,6 +276,77 @@ describe("Diagnostics and a lost Instagram connection", () => {
       lostAt: "2026-11-21T11:45:00.000Z",
     });
     expect(JSON.stringify(operationalEvents)).not.toContain("ig_1");
+  });
+
+  it("shows the catch-up after an incident: running, or finished in the last 7 days with the comments answered by hand", async () => {
+    const answered = {
+      commentId: "c_anna",
+      username: "anna",
+      text: "Guide bitte",
+      timestamp: "2026-11-21T10:02:00.000Z",
+      permalink: "https://www.instagram.com/p/p1/",
+    };
+    const finished = (finishedAt: string) => ({
+      v: 1,
+      lostAt: "2026-11-21T09:45:00.000Z",
+      recoveredAt: "2026-11-21T11:50:00.000Z",
+      finishedAt,
+      since: "2026-11-21T09:00:00.000Z",
+      queued: 2,
+      firstJobAt: null,
+      lastJobAt: null,
+      ownerAnswered: [answered],
+      ownerAnsweredTotal: 1,
+      posts: 30,
+      pages: 30,
+      skipped: {},
+    });
+    mockPrisma.instagramAccount.findMany.mockResolvedValue([
+      {
+        id: "a1",
+        instagramId: "ig_1",
+        username: "studio",
+        connectionLostAt: null,
+        connectionCatchUpFrom: null,
+        connectionCatchUpResult: finished("2026-11-21T12:05:00.000Z"),
+      },
+      {
+        id: "a2",
+        instagramId: "ig_2",
+        username: "running",
+        connectionLostAt: null,
+        connectionCatchUpFrom: new Date("2026-11-21T12:00:00.000Z"),
+        connectionCatchUpResult: null,
+      },
+      {
+        id: "a3",
+        instagramId: "ig_3",
+        username: "old",
+        connectionLostAt: null,
+        connectionCatchUpFrom: null,
+        connectionCatchUpResult: finished("2026-11-10T12:05:00.000Z"),
+      },
+    ]);
+
+    const { connectionCatchUps } = await diagnostics();
+    expect(connectionCatchUps).toEqual([
+      {
+        accountId: "a1",
+        username: "studio",
+        running: false,
+        last: {
+          lostAt: "2026-11-21T09:45:00.000Z",
+          recoveredAt: "2026-11-21T11:50:00.000Z",
+          finishedAt: "2026-11-21T12:05:00.000Z",
+          queued: 2,
+          ownerAnswered: [answered],
+          ownerAnsweredTotal: 1,
+          complete: true,
+        },
+      },
+      { accountId: "a2", username: "running", running: true, last: null },
+    ]);
+    expect(JSON.stringify(connectionCatchUps)).not.toContain("ig_");
   });
 });
 

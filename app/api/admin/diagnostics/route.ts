@@ -8,6 +8,7 @@ import {
   connectionLostCode,
   connectionLostKind,
 } from "@/lib/instagram/connection-incident";
+import { connectionCatchUpReports } from "@/lib/instagram/catch-up-report";
 import { getWorkerAlerts, getWorkerHealth } from "@/lib/ops/worker-health";
 import { canManageWorkspace, getCurrentWorkspaceContext } from "@/lib/workspace-access";
 
@@ -110,12 +111,15 @@ export async function GET() {
     prisma.instagramAccount.findMany({
       where: { workspaceId },
       select: {
+        id: true,
         instagramId: true,
         username: true,
         connectionLostAt: true,
         connectionLostReason: true,
         connectionAlertSentAt: true,
         connectionAlertCount: true,
+        connectionCatchUpFrom: true,
+        connectionCatchUpResult: true,
       },
     }),
     prisma.serviceKey.findMany({
@@ -157,6 +161,10 @@ export async function GET() {
           ? account.connectionAlertSentAt.toISOString()
           : null,
     }));
+  // A1: the catch-up after an incident, while it runs and for 7 days after:
+  // how many comments it queued, and the comments the owner had answered by
+  // hand, which got no automatic DM.
+  const connectionCatchUps = connectionCatchUpReports(accounts, now);
   // The keys by the same rule as the API & MCP page; when they were last
   // used stays on the server.
   const keyWarnings = expiringKeys.flatMap((key) => {
@@ -191,6 +199,7 @@ export async function GET() {
       })),
       accountPauses,
       connectionIncidents,
+      connectionCatchUps,
       keyWarnings,
       // Only owners and admins create and revoke keys (the keys route
       // refuses everyone else), and only they can reconnect an account: a

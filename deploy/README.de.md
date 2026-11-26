@@ -293,11 +293,42 @@ So verbindest du neu (Inhaber oder Admin, etwa zwei Minuten):
 
 Danach ist die Unterbrechung sofort vorbei, Hinweis und Sperre
 verschwinden. Ohne Neu-Verbinden endet sie mit der ersten Prüfung, die
-wieder durchkommt. Kommentare aus der Zwischenzeit findet die regelmäßige
-Suche nach verpassten Kommentaren wieder (Kommentare der letzten 72
-Stunden, siehe oben). Den Beginn der Unterbrechung hebt das Tool auf
-(`connectionCatchUpFrom`), damit die verpassten Kommentare nachgeholt werden
-können.
+wieder durchkommt. In beiden Fällen holt der Worker gleich danach die
+Kommentare aus der Zwischenzeit nach, genau einmal pro Unterbrechung:
+
+- Er liest deine Beiträge (die neuesten 300) und bei jedem Beitrag, zu dem
+  eine aktive Kampagne passt und der Kommentare hat, die Kommentare ab dem
+  Beginn der Unterbrechung minus 45 Minuten (höchstens 500 Seiten mit je 50
+  Kommentaren). Was dabei liegen bleibt (ältere Beiträge, Beiträge über der
+  Grenze, Beiträge, die Meta nicht hergibt), steht in der *Diagnose* und in
+  der E-Mail danach.
+- Jeder Kommentar, der zu einer aktiven Kampagne passt (Keywords als ganzes
+  Wort, Fragen-Filter, Kampagne des Beitrags vor „jeder Beitrag“, wie bei
+  der normalen Suche), höchstens 7 Tage alt ist, nicht von dir selbst ist
+  und noch keinen DM-Log-Eintrag hat, bekommt seine DM: eine alle 20
+  Sekunden, damit auch nach einer langen Unterbrechung kein Schwall an Meta
+  geht und das Meta-Limit nicht reißt. Jeder Kommentar bekommt dabei
+  höchstens eine DM, wie immer.
+- Kommentare, auf die du in der Zwischenzeit schon selbst geantwortet hast,
+  bekommen keine automatische DM (vielleicht hast du den Guide schon von
+  Hand geschickt). Diese Kommentare stehen in der E-Mail und in der
+  *Diagnose* mit Name, Text, Uhrzeit und Link zum Beitrag. Soll jemand davon die DM doch noch
+  bekommen, schick sie auf der Seite *Kommentare* mit „DM senden“.
+- Während einer Meta-Pause liest der Worker nichts und macht nach der Pause
+  dort weiter, wo er aufgehört hat. Dasselbe, wenn Meta ein Limit meldet,
+  der Worker neu startet oder Meta schon 60 % eines Limits meldet. Nach 24
+  Stunden hört er mit dem auf, was er hat.
+- Solange das Nachholen läuft und bis die letzte nachgeholte DM raus ist,
+  lässt die normale Suche nach verpassten Kommentaren dieses Konto aus,
+  damit nichts doppelt angestoßen wird.
+
+Ist alles nachgeholt, bekommen alle Inhaber und Admins die E-Mail
+„Instagram-Verbindung wieder da: OpenReply sendet wieder DMs“: wie lange die
+Verbindung weg war, wie viele Kommentare ihre DM jetzt bekommen, die Liste
+der Kommentare, auf die du selbst geantwortet hast, und der Link zur Seite
+*Kommentare*. Auch die *Diagnose* zeigt das sieben Tage lang. Die E-Mail
+kommt einmal; ist die Verbindung bis dahin schon wieder weg oder ging sie 24
+Stunden lang nicht raus, kommt sie nicht mehr.
 
 Neu verbinden musst du immer, wenn sich bei der Verknüpfung etwas ändert:
 Instagram mit Facebook verknüpft oder davon getrennt, Änderungen im

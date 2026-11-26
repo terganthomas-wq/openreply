@@ -194,6 +194,25 @@ model InstagramAccount {
   /// still pending); the catch-up sets it back to null once it has run.
   connectionCatchUpFrom   DateTime?
 
+  // The catch-up after an incident (A1, lib/instagram/connection-catch-up.ts):
+  // once the connection is back, the worker reads the comments of the
+  // meantime and queues their DMs, one every 20 seconds.
+
+  /// Held by the catch-up that runs right now, renewed while it reads.
+  /// Another run takes over only once it is 10 minutes old (a worker that
+  /// died in the middle).
+  connectionCatchUpClaimedAt DateTime?
+  /// How far a catch-up that stopped early got (an R1 pause, a Meta limit, a
+  /// worker restart), so the next run continues there. Null otherwise.
+  connectionCatchUpProgress  Json?
+  /// The last finished catch-up: the comments it queued, the comments the
+  /// owner had answered by hand (not sent), what it skipped. Diagnostics and
+  /// the all-clear e-mail show it.
+  connectionCatchUpResult    Json?
+  /// The all-clear e-mail of the last catch-up is still to go out: the time
+  /// that catch-up finished. Null once it went out or was given up.
+  connectionAllClearDueAt    DateTime?
+
   workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   automations Automation[]
   dmLogs      DmLog[]

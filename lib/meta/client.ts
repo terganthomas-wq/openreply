@@ -708,6 +708,116 @@ export async function getLatestMediaComments(
   return page.data ?? [];
 }
 
+/**
+ * One page of a list, as the catch-up after a lost connection reads it
+ * (lib/instagram/connection-catch-up.ts): it decides itself whether the next
+ * page is worth a request.
+ */
+export interface GraphPage<T> {
+  data: T[];
+  /**
+   * Meta's link to the next page, or null. It carries the access token: only
+   * ever fetched again, never logged or stored.
+   */
+  next: string | null;
+}
+
+/** How long one page read of the catch-up may take before it is given up. */
+const PAGE_READ_TIMEOUT_MS = 20_000;
+
+// Meta's link to the next page, followed only on the host the first request
+// went to.
+function nextPage(auth: MetaAuth, next: unknown): string | null {
+  if (typeof next !== "string" || next === "") return null;
+  try {
+    const url = new URL(next);
+    return url.origin === new URL(instagramGraphBase(auth)).origin
+      ? url.toString()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One page (50 at most) of a post's comments, newest first, each with who
+ * replied: the first page for `next` null, else the page Meta's link names.
+ * One request; aborted after 20 seconds.
+ */
+export async function getMediaCommentsPage(
+  auth: MetaAuth,
+  mediaId: string,
+  next: string | null = null
+): Promise<GraphPage<InstagramComment>> {
+  let url: string;
+  if (next) {
+    url = next;
+  } else {
+    const first = new URL(`${instagramGraphBase(auth)}/${mediaId}/comments`);
+    first.searchParams.set("fields", "id,text,timestamp,from,replies{from}");
+    first.searchParams.set("order", "reverse_chronological");
+    first.searchParams.set("limit", "50");
+    first.searchParams.set("access_token", tokenOf(auth));
+    url = first.toString();
+  }
+  const page = await handleResponse<{
+    data?: InstagramComment[];
+    paging?: { next?: string };
+  }>(
+    await metaFetch(auth, url, {
+      method: "GET",
+      signal: AbortSignal.timeout(PAGE_READ_TIMEOUT_MS),
+    })
+  );
+  return { data: page.data ?? [], next: nextPage(auth, page.paging?.next) };
+}
+
+/** A post as the catch-up needs it: no caption, no media URLs. */
+export type InstagramMediaSummary = Pick<
+  InstagramMedia,
+  "id" | "permalink" | "timestamp" | "comments_count"
+>;
+
+/**
+ * One page (up to 100) of the account's posts, newest first, with only what
+ * the catch-up needs: id, permalink, time and comment count. One request;
+ * aborted after 20 seconds.
+ */
+export async function getUserMediaPage(
+  auth: MetaAuth,
+  {
+    igUserId,
+    limit = MEDIA_PAGE_SIZE,
+    next = null,
+  }: { igUserId?: string; limit?: number; next?: string | null } = {}
+): Promise<GraphPage<InstagramMediaSummary>> {
+  let url: string;
+  if (next) {
+    url = next;
+  } else {
+    const first = new URL(
+      `${instagramGraphBase(auth)}/${instagramNode(auth, igUserId)}/media`
+    );
+    first.searchParams.set("fields", "id,permalink,timestamp,comments_count");
+    first.searchParams.set(
+      "limit",
+      String(Math.min(Math.max(Math.floor(limit), 1), MEDIA_PAGE_SIZE))
+    );
+    first.searchParams.set("access_token", tokenOf(auth));
+    url = first.toString();
+  }
+  const page = await handleResponse<{
+    data?: InstagramMediaSummary[];
+    paging?: { next?: string };
+  }>(
+    await metaFetch(auth, url, {
+      method: "GET",
+      signal: AbortSignal.timeout(PAGE_READ_TIMEOUT_MS),
+    })
+  );
+  return { data: page.data ?? [], next: nextPage(auth, page.paging?.next) };
+}
+
 /** One comment as a manual send checks it: its author, its time and its post. */
 export interface InstagramCommentDetail {
   id: string;
