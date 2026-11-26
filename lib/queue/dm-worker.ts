@@ -8,6 +8,7 @@ import {
 import {
   claimCommentDelivery,
   MAX_COMMENT_SEND_ATTEMPTS,
+  privateReplyTaken,
   releaseCommentClaim,
 } from "./comment-delivery";
 import {
@@ -35,7 +36,14 @@ import {
 } from "./send-helpers";
 import type { Prisma } from "@/app/generated/prisma/client";
 import type { RateLimitError } from "@/lib/meta/client";
-import { isQuestionComment } from "@/lib/automation/question-filter";
+import {
+  boundCampaignsFirst,
+  matchCommentToCampaign,
+} from "@/lib/automation/comment-match";
+import {
+  MANUAL_MATCHED_KEYWORD,
+  manualSendJobBase,
+} from "@/lib/comments/manual";
 import { ensureContactSafe, type ContactSummary } from "@/lib/contacts/store";
 import { OFFER_PAYLOAD_PREFIX, withinWindow } from "@/lib/offers/schedule";
 import { processOffer, processOfferTap } from "@/lib/offers/worker";
@@ -255,6 +263,24 @@ function connectionScope(data: DmQueueJob) {
   return data.accountConnectionId ? { instagramAccountId: data.accountConnectionId } : {};
 }
 
+/**
+ * What a comment job's copies are named after (the pause's `_pause_<n>`, the
+ * hourly limit's `_retry_<n>`): comment_<account>_<comment>, or for a manual
+ * send manual_<account>_<comment>_<campaign> (manualSendJobBase). A manual
+ * send's copies carry the chosen campaign, so they must never share an id
+ * with the copies of the comment's automatic job, which BullMQ would take
+ * for the same job and drop.
+ */
+function commentJobBase(data: ProcessCommentJob): string {
+  return data.forceAutomationId
+    ? manualSendJobBase({
+        instagramId: data.instagramAccountId,
+        commentId: data.commentId,
+        automationId: data.forceAutomationId,
+      })
+    : `comment_${data.instagramAccountId}_${data.commentId}`;
+}
+
 // When the tap behind a postback job happened (epoch ms). A follow re-check
 // carries the time of the tap it repeats; a tap is its own job's timestamp.
 function tapTime(job: Job<ProcessPostbackJob>): number {
@@ -266,7 +292,9 @@ function tapTime(job: Job<ProcessPostbackJob>): number {
  * Meta (lib/queue/account-pause.ts): its DM leg waits as PENDING with the
  * time of the next try, and a delayed copy of the job runs then, as
  * comment_<account>_<comment>_pause_<n>. The copy goes through every
- * campaign of the comment again, the one bound to the post first.
+ * campaign of the comment again, the one bound to the post first. A manual
+ * send's copy is manual_<account>_<comment>_<campaign>_pause_<n> and sends
+ * the chosen campaign again (commentJobBase).
  *
  * With `releaseClaim`, this job claimed the DM leg for a send that Meta
  * refused with a request limit. The claim is given back before the copy is
@@ -291,7 +319,7 @@ async function holdCommentForPause({
   const held = (job.data.pauseRequeue ?? 0) + 1;
   if (held > MAX_PAUSE_REQUEUES) return "capped";
 
-  const jobId = `comment_${instagramAccountId}_${commentId}_pause_${held}`;
+  const jobId = `${commentJobBase(job.data)}_pause_${held}`;
   const reason = `Instagram request limit; next try at ${formatPauseTime(
     pausedRunAt(resumeAt, jobId)
   )}`;
@@ -487,6 +515,117 @@ async function markDmLogWaiting(
   }
 }
 
+// What a comment job loads with each campaign it may answer with.
+const COMMENT_CAMPAIGN_INCLUDE = {
+  instagramAccount: true,
+  workspace: true,
+  trackedLinks: {
+    select: {
+      slug: true,
+      label: true,
+      destinationUrl: true,
+    },
+    orderBy: TRACKED_LINK_ORDER,
+  },
+} satisfies Prisma.AutomationInclude;
+
+/**
+ * The campaign a manual send names (forceAutomationId), on the comment's own
+ * account, or none. Its keywords, its question filter, its post and whether
+ * it is active do not matter: the owner chose it for this comment (an
+ * inactive campaign may be sent by hand, the page says so). A campaign that
+ * was deleted or moved to another account since sends nothing, recorded in
+ * Diagnostics.
+ */
+async function loadManualCampaign(data: ProcessCommentJob) {
+  const automation = await prisma.automation.findFirst({
+    where: {
+      id: data.forceAutomationId,
+      ...connectionScope(data),
+      instagramAccount: { instagramId: data.instagramAccountId },
+    },
+    include: COMMENT_CAMPAIGN_INCLUDE,
+  });
+  if (automation) return [automation];
+
+  console.warn(
+    `[DM Worker] Manual send for comment ${data.commentId}: campaign ${data.forceAutomationId} not found`
+  );
+  const account = await prisma.instagramAccount
+    .findUnique({
+      where: { instagramId: data.instagramAccountId },
+      select: { workspaceId: true },
+    })
+    .catch(() => null);
+  await logWorkerEvent({
+    workspaceId: account?.workspaceId ?? null,
+    level: "WARNING",
+    message: `Manual send for comment ${data.commentId} not sent: the campaign was deleted or belongs to another account`,
+    payload: {
+      kind: "manual-send",
+      commentId: data.commentId,
+      automationId: data.forceAutomationId ?? null,
+    },
+  });
+  return [];
+}
+
+/**
+ * Another campaign's row that says this comment's private reply is used: it
+ * went out, may have, or another job holds the claim for it right now
+ * (privateReplyTaken). A manual send asks before it claims the comment and
+ * again right after, so that it never sends next to a DM that may be on its
+ * way.
+ */
+async function privateReplyTakenBy(
+  commentId: string,
+  automationId: string
+): Promise<{ name: string; sent: boolean } | null> {
+  const rows = await prisma.dmLog.findMany({
+    where: { commentId, automationId: { not: automationId } },
+    select: {
+      status: true,
+      dmDeliveryUnconfirmed: true,
+      errorMessage: true,
+      automation: { select: { name: true } },
+    },
+  });
+  const taken = rows.find(privateReplyTaken);
+  return taken
+    ? { name: taken.automation?.name ?? "unknown", sent: taken.status === "SENT" }
+    : null;
+}
+
+/**
+ * A manual send of another campaign that took this comment's private reply,
+ * or holds its claim right now. The comment's automatic jobs ask this right
+ * after their own claim. A manual send claims and then looks for every other
+ * claim, so of two sends that claim at the same moment, at least one sees the
+ * other and stands back: the comment never gets two private replies.
+ *
+ * Read by its label: a manual send writes "(manuell)" with its claim (and on
+ * the row it creates). A claim on such a row stands for the comment's
+ * private reply whichever job took it, so standing back is right either way.
+ * The label is compared again on the answer: only such a row counts.
+ */
+async function manualSendHolding(
+  commentId: string,
+  automationId: string
+): Promise<string | null> {
+  const row = await prisma.dmLog.findFirst({
+    where: {
+      commentId,
+      automationId: { not: automationId },
+      matchedKeyword: MANUAL_MATCHED_KEYWORD,
+      OR: [{ status: "SENT" }, { dmDeliveryUnconfirmed: true }],
+    },
+    select: { matchedKeyword: true, automation: { select: { name: true } } },
+  });
+  return row?.matchedKeyword === MANUAL_MATCHED_KEYWORD
+    ? row.automation?.name ?? "unknown"
+    : null;
+}
+
 async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
   const {
     instagramAccountId,
@@ -498,74 +637,65 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     originalMediaId,
   } = job.data;
   const requeueAttempt = job.data.requeueAttempt ?? 0;
+  // A manual send from the Kommentare page (lib/comments/manual.ts): exactly
+  // the campaign it names, with the public reply as the owner chose.
+  // Everything else, from the claims to what follows the DM, is the same.
+  const manual = Boolean(job.data.forceAutomationId);
 
-  const automations = await prisma.automation.findMany({
-    where: {
-      ...connectionScope(job.data),
-      // Match campaigns bound to this specific post, plus any-post campaigns.
-      // A comment left on an ad carries the ad's own media id, while the
-      // campaign is bound to the post the ad was created from, so both ids
-      // have to be considered or the comment is dropped without a trace.
-      OR: [
-        { postId: mediaId },
-        ...(originalMediaId ? [{ postId: originalMediaId }] : []),
-        { matchAnyPost: true },
-      ],
-      isActive: true,
-      instagramAccount: {
-        instagramId: instagramAccountId,
-      },
-    },
-    include: {
-      instagramAccount: true,
-      workspace: true,
-      trackedLinks: {
-        select: {
-          slug: true,
-          label: true,
-          destinationUrl: true,
-        },
-        orderBy: TRACKED_LINK_ORDER,
-      },
-    },
-    orderBy: { createdAt: "asc" },
-  });
-
-  // Campaigns bound to the commented post go before any-post campaigns. Only
-  // the first campaign to send can use the comment's one private reply, and a
-  // campaign set up for this very post is the one meant to answer it. Bound is
-  // read from postId, not matchAnyPost, which an edit can leave set next to a
-  // post. The sort is stable, so the oldest campaign of each group stays first.
-  const boundToThisPost = (postId: string | null) =>
-    Boolean(postId) && (postId === mediaId || postId === originalMediaId);
-  automations.sort(
-    (a, b) =>
-      Number(boundToThisPost(b.postId)) - Number(boundToThisPost(a.postId))
-  );
+  const automations = manual
+    ? await loadManualCampaign(job.data)
+    : // Campaigns bound to the commented post go first
+      // (lib/automation/comment-match.ts): only the first campaign to send
+      // can use the comment's one private reply.
+      boundCampaignsFirst(
+        await prisma.automation.findMany({
+          where: {
+            ...connectionScope(job.data),
+            // Match campaigns bound to this specific post, plus any-post
+            // campaigns. A comment left on an ad carries the ad's own media
+            // id, while the campaign is bound to the post the ad was created
+            // from, so both ids have to be considered or the comment is
+            // dropped without a trace.
+            OR: [
+              { postId: mediaId },
+              ...(originalMediaId ? [{ postId: originalMediaId }] : []),
+              { matchAnyPost: true },
+            ],
+            isActive: true,
+            instagramAccount: {
+              instagramId: instagramAccountId,
+            },
+          },
+          include: COMMENT_CAMPAIGN_INCLUDE,
+          orderBy: { createdAt: "asc" },
+        }),
+        mediaId,
+        originalMediaId
+      );
 
   // Recorded once per job, by the first campaign with work to do for this
   // comment. Undefined until then, null when that write failed.
   let contactId: string | null | undefined;
 
   for (const automation of automations) {
-    // A campaign can leave questions to a human. The raw text is checked: the
-    // keyword matcher turns the question mark into a space.
-    if (automation.ignoreQuestionComments && isQuestionComment(commentText)) {
-      continue;
-    }
-
-    // "Any word" campaigns fire on every comment; otherwise require a keyword hit.
-    const matchResult = automation.matchAnyWord
-      ? { matched: true, matchedKeyword: null }
-      : matchKeywords(
-          commentText,
-          automation.keywords,
-          automation.wholeWordMatch
-        );
+    // A campaign can leave questions to a human, "any word" campaigns fire on
+    // every comment, the others need a keyword. A manual send needs neither:
+    // the owner chose the campaign for this comment.
+    const matchResult = manual
+      ? { matched: true, matchedKeyword: MANUAL_MATCHED_KEYWORD }
+      : matchCommentToCampaign(automation, commentText);
 
     if (!matchResult.matched) {
       continue;
     }
+
+    // Whether this campaign posts its public reply. A manual send says it
+    // itself (off when the owner already answered in public); without that,
+    // the campaign's setting.
+    const publicReplyOn =
+      manual && typeof job.data.publicReplyOverride === "boolean"
+        ? job.data.publicReplyOverride
+        : automation.publicReplyEnabled;
 
     const existingLog = await prisma.dmLog.findUnique({
       where: {
@@ -596,16 +726,19 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     // already went out but whose public reply never posted (e.g. it hit a rate
     // limit) must still come back so the public reply can be retried. A dedupe
     // skip is final: another campaign used the comment's private reply, and
-    // the public reply belongs to that campaign.
+    // the public reply belongs to that campaign. Not for a manual send: the
+    // owner asks again, and the checks below decide anew (another campaign's
+    // DM still rules it out).
     if (
-      existingLog?.status === "SKIPPED_PLAN_LIMIT" ||
-      existingLog?.status === "SKIPPED_DEDUP"
+      !manual &&
+      (existingLog?.status === "SKIPPED_PLAN_LIMIT" ||
+        existingLog?.status === "SKIPPED_DEDUP")
     ) {
       continue;
     }
     if (
       !needsDm &&
-      (!dmWentOut || alreadyPublicReplied || existingLog?.publicReplyDeliveryUnconfirmed || !automation.publicReplyEnabled)
+      (!dmWentOut || alreadyPublicReplied || existingLog?.publicReplyDeliveryUnconfirmed || !publicReplyOn)
     ) {
       continue;
     }
@@ -704,6 +837,32 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     // waits for a retry gets its public reply on the pass that sends it.
     // Idempotent across retries via publicReplySentAt.
     const postPublicReply = async (): Promise<void> => {
+      if (manual && !publicReplyOn && automation.publicReplyEnabled) {
+        // The owner sent this DM by hand without the public reply (usually
+        // because they already answered in public). The public leg is closed
+        // for good, as a reply that may have gone out closes it, so no later
+        // webhook or sweep job posts the campaign's reply under the comment.
+        await prisma.dmLog
+          .updateMany({
+            where: {
+              automationId: automation.id,
+              commentId,
+              publicReplySentAt: null,
+              publicReplyDeliveryUnconfirmed: false,
+            },
+            data: {
+              publicReplyDeliveryUnconfirmed: true,
+              publicReplyError: "Not posted: the public reply was switched off for this manual send",
+            },
+          })
+          .catch((error) =>
+            console.error(
+              "[DM Worker] Could not close the public reply of a manual send:",
+              formatError(error)
+            )
+          );
+        return;
+      }
       const replyPool =
         automation.publicReplyMessages.length > 0
           ? automation.publicReplyMessages
@@ -711,7 +870,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
             ? [automation.publicReplyMessage]
             : [];
       if (
-        !automation.publicReplyEnabled ||
+        !publicReplyOn ||
         replyPool.length === 0 ||
         existingLog?.publicReplySentAt ||
         existingLog?.publicReplyDeliveryUnconfirmed ||
@@ -772,15 +931,22 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     // and logging a failure the user can do nothing about. Only the campaign
     // that sent the DM posts a public reply: a second "check your DMs" under
     // the same comment, from a campaign that sent nothing, adds noise and
-    // promises a message that never comes.
-    const privateReplyUsedBy = await prisma.dmLog.findFirst({
-      where: {
-        commentId,
-        status: "SENT",
-        automationId: { not: automation.id },
-      },
-      select: { automation: { select: { name: true } } },
-    });
+    // promises a message that never comes. A manual send also stands back
+    // for a DM that may have gone out or is on its way (privateReplyTakenBy).
+    const privateReplyUsedBy = manual
+      ? await privateReplyTakenBy(commentId, automation.id)
+      : await prisma.dmLog
+          .findFirst({
+            where: {
+              commentId,
+              status: "SENT",
+              automationId: { not: automation.id },
+            },
+            select: { automation: { select: { name: true } } },
+          })
+          .then((row) =>
+            row ? { name: row.automation?.name ?? "unknown", sent: true } : null
+          );
     if (privateReplyUsedBy) {
       await prisma.dmLog.update({
         where: {
@@ -789,7 +955,9 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         data: {
           status: "SKIPPED_DEDUP",
           matchedKeyword: matchResult.matchedKeyword,
-          errorMessage: `Another campaign (${privateReplyUsedBy.automation?.name ?? "unknown"}) already sent the one private reply Instagram allows for this comment`,
+          errorMessage: privateReplyUsedBy.sent
+            ? `Another campaign (${privateReplyUsedBy.name}) already sent the one private reply Instagram allows for this comment`
+            : `Another campaign (${privateReplyUsedBy.name}) is sending, or may have sent, the one private reply Instagram allows for this comment`,
         },
       });
       continue;
@@ -891,7 +1059,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           },
           {
             delay: rateLimit.requeueDelayMs,
-            jobId: `comment_${instagramAccountId}_${commentId}_retry_${requeueAttempt + 1}`,
+            jobId: `${commentJobBase(job.data)}_retry_${requeueAttempt + 1}`,
           }
         );
         continue;
@@ -948,7 +1116,12 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
 
     let claimed;
     try {
-      claimed = await claimCommentDelivery(automation.id, commentId, "dm");
+      claimed = await claimCommentDelivery(
+        automation.id,
+        commentId,
+        "dm",
+        manual ? { matchedKeyword: MANUAL_MATCHED_KEYWORD } : undefined
+      );
     } catch (error) {
       if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
       await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
@@ -957,6 +1130,41 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     if (!claimed) {
       if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
       await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
+      continue;
+    }
+
+    // The claim is per campaign, the private reply per comment. A manual send
+    // can claim the comment for its campaign while an automatic job claims it
+    // for another. So after its claim, a manual send looks for any other
+    // campaign's claim or DM, and an automatic job for a manual send's: of
+    // two sends that claim at the same moment, at least one sees the other.
+    // That one gives its claim back, with its attempt (nothing was sent), and
+    // leaves the comment to the other campaign.
+    let rival: string | null;
+    try {
+      rival = manual
+        ? ((await privateReplyTakenBy(commentId, automation.id))?.name ?? null)
+        : await manualSendHolding(commentId, automation.id);
+    } catch (error) {
+      // Nothing was sent: the claim goes back, and the job is retried.
+      await releaseCommentClaim(automation.id, commentId, formatError(error)).catch(
+        () => false
+      );
+      if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
+      await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
+      throw error;
+    }
+    if (rival !== null) {
+      if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
+      await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
+      await releaseCommentClaim(
+        automation.id,
+        commentId,
+        manual
+          ? `Not sent: another campaign (${rival}) is sending, or may have sent, the one private reply Instagram allows for this comment`
+          : `Not sent: this comment's DM was sent by hand with another campaign (${rival}); Instagram allows one private reply per comment`,
+        "SKIPPED_DEDUP"
+      );
       continue;
     }
     let delivered = false;

@@ -9,6 +9,8 @@ interface DashboardShellProps {
   workspaceName: string;
   instagramUsername: string | null;
   instagramAccountCount: number;
+  /** Owner or admin: sees the pages only they can use. */
+  canManage: boolean;
 }
 
 export default function DashboardShell({
@@ -16,6 +18,7 @@ export default function DashboardShell({
   workspaceName,
   instagramUsername,
   instagramAccountCount,
+  canManage,
 }: DashboardShellProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
@@ -27,6 +30,7 @@ export default function DashboardShell({
         isOpen={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
         workspaceName={workspaceName}
+        canManage={canManage}
       />
 
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">

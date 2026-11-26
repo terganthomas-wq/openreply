@@ -685,6 +685,54 @@ export async function getRecentMediaComments(
     .slice(0, max);
 }
 
+/**
+ * The newest comments on a media, newest first, each with who replied: one
+ * request, never a second page. The Kommentare page reads one page per post
+ * (at most `limit`, 50 by Meta's cap), so a page view costs a known number of
+ * reads however busy a post is.
+ */
+export async function getLatestMediaComments(
+  auth: MetaAuth,
+  mediaId: string,
+  limit = 50
+): Promise<InstagramComment[]> {
+  const url = new URL(`${instagramGraphBase(auth)}/${mediaId}/comments`);
+  url.searchParams.set("fields", "id,text,timestamp,from,replies{from}");
+  url.searchParams.set("order", "reverse_chronological");
+  url.searchParams.set("limit", String(Math.min(Math.max(limit, 1), 50)));
+  url.searchParams.set("access_token", tokenOf(auth));
+
+  const page = await handleResponse<{ data?: InstagramComment[] }>(
+    await metaFetch(auth, url.toString())
+  );
+  return page.data ?? [];
+}
+
+/** One comment as a manual send checks it: its author, its time and its post. */
+export interface InstagramCommentDetail {
+  id: string;
+  text?: string;
+  timestamp?: string;
+  from?: { id: string; username?: string };
+  media?: { id: string };
+}
+
+/** Read one comment by its id (`/{comment-id}`), with its author and its post. */
+export async function getComment(
+  auth: MetaAuth,
+  commentId: string
+): Promise<InstagramCommentDetail> {
+  const url = new URL(
+    `${instagramGraphBase(auth)}/${encodeURIComponent(commentId)}`
+  );
+  url.searchParams.set("fields", "id,text,timestamp,from{id,username},media{id}");
+  url.searchParams.set("access_token", tokenOf(auth));
+
+  return handleResponse<InstagramCommentDetail>(
+    await metaFetch(auth, url.toString())
+  );
+}
+
 // --- Direct message inbox (Conversations API) ---------------------------
 
 export interface InstagramParticipant {

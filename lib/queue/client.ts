@@ -20,7 +20,8 @@ export function getRedisConnection(): Redis {
 
 // ─── DM Queue ───────────────────────────────────────────────────────────────────
 
-export type CommentSource = "WEBHOOK" | "POLLING";
+// MANUAL: the owner sent it from the Kommentare page (lib/comments/server.ts).
+export type CommentSource = "WEBHOOK" | "POLLING" | "MANUAL";
 
 export interface ProcessCommentJob {
   accountConnectionId?: string;
@@ -41,6 +42,16 @@ export interface ProcessCommentJob {
   // Which path enqueued this comment. It is not copied to ProcessedComment or
   // used for reconciliation dedup.
   source?: CommentSource;
+  // A manual send (source MANUAL): exactly this campaign answers, whatever
+  // its keywords, its question filter, its post and whether it is active.
+  // Every claim and the one private reply per comment hold as for any
+  // comment. Its job id and its copies' are manualSendJobId and
+  // manualSendJobBase (lib/comments/manual.ts).
+  forceAutomationId?: string;
+  // With forceAutomationId: whether the public reply goes out, in place of
+  // the campaign's own setting (off when the owner already answered in
+  // public). Absent: the campaign decides.
+  publicReplyOverride?: boolean;
 }
 
 // Delivered when a user taps an opening DM's button — carries the reveal target.

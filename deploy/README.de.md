@@ -157,6 +157,80 @@ Damit es gar nicht so weit kommt: Bei Tests nicht Dutzende Kommentare in
 wenigen Minuten schreiben, und große Abrufe (etwa viele Unterhaltungen auf
 einmal) nicht direkt vor einem Test.
 
+## Manuell senden
+
+Die Seite *Kommentare* im Menü (nur für Inhaber und Admins) zeigt die
+Kommentare unter deinen 15 neuesten Beiträgen aus den letzten 7 Tagen, die
+neuesten zuerst. „Mehr laden“ nimmt jeweils 15 Beiträge dazu, bis 60. Deine
+eigenen Kommentare stehen nicht drin, Antworten unter einem Kommentar sind
+keine eigene Zeile. Zuerst siehst du nur die Kommentare „Ohne DM“, mit „Alle“
+auch die, zu denen schon eine DM rausging.
+
+Pro Kommentar steht da:
+
+- „DM gesendet · Kampagne“ (mit „von Hand“, wenn du sie hier geschickt hast,
+  oder „nicht bestätigt“, wenn Meta unklar geantwortet hat), sonst „Keine DM“
+  und darunter, wie der letzte Versuch ausging.
+- „Du hast geantwortet“, wenn dein Konto unter dem Kommentar öffentlich
+  geantwortet hat.
+- „Frage“, wenn der Kommentar ein Fragezeichen hat: Kampagnen mit
+  Fragen-Filter lassen ihn von selbst aus.
+- „Passt zu: Kampagne“, wenn eine Kampagne ihn von selbst beantworten würde.
+  Die Seite rechnet das wie der Worker: Keyword als ganzes Wort (sofern die
+  Kampagne nichts anderes sagt), Fragen-Filter, und eine Kampagne für genau
+  diesen Beitrag geht vor einer für alle Beiträge.
+
+Darunter wählst du die Kampagne (vorausgewählt ist die passende, sonst
+keine) und tippst „DM senden“. Gedacht ist das für Kommentare ohne das genaue
+Keyword („kallt“, „Guide bitte“, das Keyword mitten in einem längeren Wort),
+für Kommentare, die du erst von Hand beantwortet hast, und für jemanden, der
+unter deiner Antwort nach dem Guide fragt (dann schickst du die DM zu seinem
+ursprünglichen Kommentar).
+
+- Die DM geht raus wie bei einem Kommentar mit Keyword, mit allem, was die
+  Kampagne danach macht: Follow-Gate, Link, Tag, Folgenachricht, Angebote.
+  Auch eine pausierte Kampagne lässt sich so senden; die Seite sagt dazu,
+  dass sie pausiert ist.
+- „Öffentlich antworten“ postet die öffentliche Antwort der Kampagne unter
+  den Kommentar. Es ist an, außer wenn du dort schon geantwortet hast. Lässt
+  du es aus, postet auch später kein automatischer Durchlauf die Antwort zu
+  diesem Kommentar.
+- Nach dem Tippen steht in der Zeile „Wird gesendet …“, nach ein paar
+  Sekunden das Ergebnis aus dem DM-Protokoll. Dort steht bei solchen DMs
+  „(manuell)“ als Keyword.
+
+Was nicht geht, und warum:
+
+- Instagram erlaubt pro Kommentar genau eine DM (private Antwort). Ging schon
+  eine raus, auch mit einer anderen Kampagne, oder vielleicht (unklare
+  Antwort von Meta), ist „DM senden“ gesperrt. Schickt der Worker in dem
+  Moment selbst eine DM zu demselben Kommentar, tritt einer von beiden
+  zurück: Doppelt geht nichts raus.
+- Instagram erlaubt die DM nur bis 7 Tage nach dem Kommentar. Ältere
+  Kommentare zeigt die Seite nicht.
+- Hat Instagram die DM einer Kampagne zu einem Kommentar dreimal abgelehnt,
+  ist mit dieser Kampagne Schluss (wie bei den automatischen Versuchen).
+- Während einer Meta-Pause (siehe *Meta-Limits* oben) liest die Seite nichts
+  und zeigt, bis wann die Pause dauert.
+- Höchstens 30 DMs pro Minute und Person.
+- Nur für Konten, die über die eigene Meta-App verbunden sind, nicht über
+  Zernio.
+
+Was das bei Meta kostet: Ein Aufruf der Seite liest einmal die Beiträge und
+je Beitrag einmal die neuesten 50 Kommentare, bei 15 Beiträgen also 16
+Leseanfragen. Die App hebt die Antworten 60 Sekunden lang auf: Wer die Seite
+in dieser Zeit neu lädt oder mehr lädt, fragt Meta nur nach dem, was noch
+fehlt. Im Hintergrund liest die Seite nichts; nach dem Senden fragt sie nur
+das DM-Protokoll ab. „DM senden“ liest den einen Kommentar noch einmal bei
+Instagram nach (unter welchem Beitrag, wie alt, von wem) und legt die DM dann
+in die Warteschlange des Workers, der sie verschickt.
+
+Beim Ausrollen muss auch der Worker aktualisiert werden (siehe *Updates*).
+Solange noch der alte Worker läuft, lehnt die Seite „DM senden“ ab („Der
+Versand-Dienst ist noch nicht auf dem neuesten Stand“): Der alte Worker
+würde den Kommentar sonst wie einen normalen behandeln und mit der Kampagne
+beantworten, die von selbst passt, oder gar nicht.
+
 ## Zugangsdaten
 
 Nie in dieses Repository. Alle Werte stehen in einem Ordner außerhalb des Repos:

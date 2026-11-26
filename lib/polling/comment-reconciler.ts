@@ -32,7 +32,7 @@
  * finds them.
  */
 
-import { isQuestionComment } from "@/lib/automation/question-filter";
+import { matchCommentToCampaign } from "@/lib/automation/comment-match";
 import { MAX_COMMENT_SEND_ATTEMPTS } from "@/lib/queue/comment-delivery";
 import {
   hasLegacyUnconfirmedDelivery,
@@ -52,7 +52,6 @@ import {
   createInstagramContext,
   type InstagramContext,
 } from "@/lib/instagram/provider";
-import { matchKeywords } from "@/lib/utils/keyword-matcher";
 
 // Only consider comments from the last few days — older ones are outside
 // Instagram's private-reply window anyway, so a DM to them would just fail.
@@ -340,26 +339,15 @@ async function sweepCampaign({
       const authorId = c.from?.id;
       if (!authorId || authorId === account.instagramId) return false;
 
-      // Questions the campaign leaves to a human are not work for the sweep.
-      // The worker skips them without writing a log row, so nothing would ever
-      // mark them handled: they would come back every sweep for the whole
-      // lookback and use up places in the per-sweep cap that comments the
-      // campaign does answer need.
-      if (
-        automation.ignoreQuestionComments &&
-        isQuestionComment(c.text ?? "")
-      ) {
+      // The worker's own rule (lib/automation/comment-match.ts), which the
+      // Kommentare page uses too. Questions the campaign leaves to a human
+      // are not work for the sweep: the worker skips them without writing a
+      // log row, so nothing would ever mark them handled, and they would come
+      // back every sweep for the whole lookback and use up places in the
+      // per-sweep cap that comments the campaign does answer need.
+      if (!matchCommentToCampaign(automation, c.text ?? "").matched) {
         return false;
       }
-
-      const matched = automation.matchAnyWord
-        ? true
-        : matchKeywords(
-            c.text ?? "",
-            automation.keywords,
-            automation.wholeWordMatch
-          ).matched;
-      if (!matched) return false;
       stat.matched += 1;
 
       const ownerReplied = (c.replies?.data ?? []).some(

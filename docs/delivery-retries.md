@@ -56,6 +56,14 @@ sends its link once.
 No campaign is paused by this policy. New comments continue through the normal
 flow. No schema migration is required.
 
+A DM sent by hand from the Comments page ([manual send](manual-send.md)) is a
+comment job for exactly the chosen campaign and takes the same claim. Because
+the claim is per campaign and Instagram's private reply per comment, a manual
+send also checks the other campaigns' rows before and right after its claim,
+and an automatic job checks for a manual send's claim right after its own: of
+two sends that claim one comment at the same moment, one stands back and gives
+its attempt back.
+
 ## Meta's request limits
 
 Meta refuses calls with a request limit when the app, the token, the page or

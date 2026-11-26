@@ -47,6 +47,7 @@ OpenReply is built around Meta's official Instagram private replies. It does not
 - API and MCP: read campaign settings, destination links and aggregate stats, and create campaigns (paused unless the request switches them on), with workspace-scoped revocable keys (30/60/90 days). A landing page reports sign-ups through a REST callback with a key that can do only that and may live up to 365 days. From 14 days before a key expires, API & MCP and Diagnostics show a notice when opened. See [integrations](docs/integrations.md).
 - Inbox. Read your Instagram DM conversations and reply from the dashboard, inside Meta's 24-hour messaging window. Cached so it loads instantly on repeat visits.
 - DM logs. Every send, skip, and failure is logged with a reason.
+- Manual send. The Comments page lists the last 7 days' comments of your newest posts with where each one's DM stands, and sends a campaign's DM by hand for the comments the keywords missed, with the same one-DM-per-comment guarantee as the automation. See [manual send](docs/manual-send.md).
 - Self-comment filtering. Your own comments never trigger a reply, since Meta rejects DMing yourself anyway.
 
 ## How it works

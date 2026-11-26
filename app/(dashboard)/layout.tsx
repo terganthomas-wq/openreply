@@ -5,6 +5,7 @@ import DashboardShell from "@/components/dashboard-shell";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
 import { ensureWorkspaceForUser } from "@/lib/workspace";
+import { canManageWorkspace } from "@/lib/workspace-access";
 
 export async function generateMetadata() {
   const { t } = await getI18n();
@@ -27,11 +28,22 @@ export default async function DashboardLayout({
     session.user.id,
     session.user.email
   );
-  const accounts = await prisma.instagramAccount.findMany({
-    where: { workspaceId: workspace.id },
-    orderBy: { connectedAt: "desc" },
-    select: { username: true },
-  });
+  const [accounts, membership] = await Promise.all([
+    prisma.instagramAccount.findMany({
+      where: { workspaceId: workspace.id },
+      orderBy: { connectedAt: "desc" },
+      select: { username: true },
+    }),
+    // The menu leaves out what only owners and admins can use. Without a
+    // membership row the user is the workspace's owner, as everywhere else
+    // (lib/workspace-access.ts).
+    prisma.workspaceMember.findUnique({
+      where: {
+        workspaceId_userId: { workspaceId: workspace.id, userId: session.user.id },
+      },
+      select: { role: true },
+    }),
+  ]);
 
   return (
     <I18nProvider locale={locale}>
@@ -39,6 +51,7 @@ export default async function DashboardLayout({
         workspaceName={workspace.name}
         instagramUsername={accounts[0]?.username ?? null}
         instagramAccountCount={accounts.length}
+        canManage={canManageWorkspace(membership?.role ?? "OWNER")}
       >
         {children}
       </DashboardShell>

@@ -3,8 +3,10 @@
  * usage warnings use, with expiry on the (possibly faked) clock.
  *
  * `eval` runs the account pause's script (lib/queue/account-pause.ts) the way
- * its Lua does: set or extend, never shorten. It refuses any other script, so
- * a test notices when new Redis logic needs a stand-in of its own.
+ * its Lua does: set or extend, never shorten. It also runs the counter of the
+ * manual sends' rate limit (lib/comments/server.ts): INCR, and an expiry on
+ * the first. It refuses any other script, so a test notices when new Redis
+ * logic needs a stand-in of its own.
  */
 
 type Entry = { value: string; expiresAt: number | null };
@@ -58,6 +60,21 @@ export class FakeRedis {
   }
 
   async eval(script: string, numKeys: number, ...args: (string | number)[]) {
+    if (
+      numKeys === 1 &&
+      script.includes('redis.call("INCR", KEYS[1])') &&
+      script.includes('redis.call("PEXPIRE", KEYS[1], ARGV[1])')
+    ) {
+      const [key, ttl] = args.map(String);
+      this.commands.push(`EVAL counter ${key} ${ttl}`);
+      const entry = this.live(key);
+      const count = Number(entry?.value ?? 0) + 1;
+      this.strings.set(key, {
+        value: String(count),
+        expiresAt: entry ? entry.expiresAt : Date.now() + Number(ttl),
+      });
+      return count;
+    }
     if (
       numKeys !== 1 ||
       !script.includes('redis.call("SET", KEYS[1], ARGV[1], "PX", ARGV[3])')

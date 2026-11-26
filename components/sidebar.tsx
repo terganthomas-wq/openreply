@@ -7,16 +7,21 @@
  */
 
 import LanguageSwitcher from "@/components/language-switcher";
+import type { StaticMessageKey } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
 import Link from "next/link";
 import Image from "next/image";
 import { zernioLink } from "@/lib/zernio-links";
 import { usePathname } from "next/navigation";
 
+// managersOnly: pages that only owners and admins can use; members do not
+// see them in the menu (the page itself says so if they open it).
 const navItems = [
   { label: "Dashboard", href: "/dashboard" },
   { label: "Overview", href: "/overview" },
   { label: "Inbox", href: "/inbox" },
+  // Manual send (M1): every send needs an owner or admin.
+  { label: "Comments", href: "/comments", managersOnly: true },
   { label: "Campaigns", href: "/campaigns" },
   { label: "Offers", href: "/offers" },
   { label: "Contacts", href: "/contacts" },
@@ -24,18 +29,32 @@ const navItems = [
   { label: "Settings", href: "/settings" },
   { label: "API & MCP", href: "/integrations" },
   { label: "Diagnostics", href: "/diagnostics" },
-] as const;
+] as const satisfies readonly {
+  label: StaticMessageKey;
+  href: string;
+  managersOnly?: boolean;
+}[];
+
+/** The menu for this reader: without the owner-and-admin pages for members. */
+export function navItemsFor(canManage: boolean) {
+  return navItems.filter(
+    (item) => canManage || !("managersOnly" in item && item.managersOnly)
+  );
+}
 
 interface SidebarProps {
   isOpen: boolean;
   onClose: () => void;
   workspaceName: string;
+  /** Owner or admin of the workspace. */
+  canManage: boolean;
 }
 
 export default function Sidebar({
   isOpen,
   onClose,
   workspaceName,
+  canManage,
 }: SidebarProps) {
   const { t } = useI18n();
   const pathname = usePathname();
@@ -70,7 +89,7 @@ export default function Sidebar({
         </div>
 
         <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
-          {navItems.map((item) => {
+          {navItemsFor(canManage).map((item) => {
             const isActive =
               pathname === item.href || pathname.startsWith(item.href + "/");
             return (
