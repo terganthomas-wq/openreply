@@ -304,7 +304,16 @@ So verbindest du neu (Inhaber oder Admin, etwa zwei Minuten):
 1. *Einstellungen* öffnen (der Link in der E-Mail führt direkt hin).
 2. „Neu verbinden“ oder „Mit eigener Meta-App verbinden“ tippen und bei
    Meta anmelden.
-3. Das Instagram-Konto wählen und alle Berechtigungen erlauben.
+3. Das Instagram-Konto wählen und, falls es mit einer Facebook-Seite
+   verknüpft ist, auch diese Seite. Alle Berechtigungen erlauben.
+
+Ist Instagram mit einer Facebook-Seite verknüpft (etwa für Musik über
+Metricool), stellt Meta Button-Tipps, DMs und Lesebestätigungen nur zu,
+wenn die App auch die Seite hat. Fehlt sie, kommen Kommentare weiter an,
+aber nach der ersten DM passiert nichts mehr, ohne Fehlermeldung (so am
+25./26.11.2026). Die Anmelde-Konfiguration der Meta-App braucht dafür die
+Asset-Art „Seiten“ und die Rechte `pages_show_list` und
+`pages_read_engagement`; nach einer Änderung dort einmal neu verbinden.
 
 Danach ist die Unterbrechung sofort vorbei, Hinweis und Sperre
 verschwinden. Ohne Neu-Verbinden endet sie mit der ersten Prüfung, die

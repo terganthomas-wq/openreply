@@ -111,11 +111,18 @@ the claim, and Diagnostics shows why.
 ## Reconnecting
 
 Settings, "Reconnect" (or "Connect using your own Meta app"), log in with
-Meta, choose the account and allow all permissions. The callback updates the
+Meta, choose the account (and, if it is linked to a Facebook Page, that Page
+too) and allow all permissions. The callback updates the
 same account row and ends the incident at once; its start moves to
 `connectionCatchUpFrom`. Without a reconnect the incident ends with the first
 check that gets through. Either way the catch-up of the comments of the
 meantime starts right away.
+
+An Instagram account linked to a Facebook Page gets its messaging webhooks
+(button taps, DMs, read receipts) only while the app also has that Page.
+Without it comments still arrive, but nothing after the first DM does, and
+no check reports it. The login configuration therefore needs the asset type
+Pages and the permissions `pages_show_list` and `pages_read_engagement`.
 
 ## The catch-up
 

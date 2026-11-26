@@ -95,7 +95,7 @@ const COPY: Record<AlertLocale, Copy> = {
         : "Öffne in OpenReply die Einstellungen.",
     fixSteps: [
       "Tippe auf „Neu verbinden“ oder „Mit eigener Meta-App verbinden“ und melde dich bei Meta an.",
-      "Wähle dein Instagram-Konto und erlaube alle Berechtigungen.",
+      "Wähle dein Instagram-Konto und, falls es mit einer Facebook-Seite verknüpft ist, auch diese Seite. Erlaube alle Berechtigungen.",
     ],
     openSettings: "Einstellungen öffnen",
     catchUp:
@@ -142,7 +142,7 @@ const COPY: Record<AlertLocale, Copy> = {
       url ? `Open OpenReply's settings: ${url}` : "Open the settings in OpenReply.",
     fixSteps: [
       "Tap “Reconnect” or “Connect using your own Meta app” and log in with Meta.",
-      "Choose your Instagram account and allow all permissions.",
+      "Choose your Instagram account and, if it is linked to a Facebook Page, that Page too. Allow all permissions.",
     ],
     openSettings: "Open settings",
     catchUp: "Afterwards OpenReply catches up on the comments of the meantime by itself.",

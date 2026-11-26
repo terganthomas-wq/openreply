@@ -246,13 +246,18 @@ export default function SettingsPage() {
           </div>
         </div>
 
-        <div className="mt-6 pt-4 border-t border-border flex gap-3">
-          <a
-            href="/api/instagram/connect"
-            className="px-4 py-2 rounded text-sm font-medium transition-colors bg-accent text-white hover:bg-accent-hover"
-          >
-            {t("Connect using your own Meta app")}
-          </a>
+        <div className="mt-6 pt-4 border-t border-border space-y-2">
+          <div className="flex gap-3">
+            <a
+              href="/api/instagram/connect"
+              className="px-4 py-2 rounded text-sm font-medium transition-colors bg-accent text-white hover:bg-accent-hover"
+            >
+              {t("Connect using your own Meta app")}
+            </a>
+          </div>
+          <p className="text-sm text-muted">
+            {t("In the Meta window, choose your Instagram account and, if it is linked to a Facebook Page, that Page too. Without the Page, Instagram stops passing button taps and DMs on to OpenReply.")}
+          </p>
         </div>
       </section>
 

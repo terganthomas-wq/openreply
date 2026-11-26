@@ -324,7 +324,7 @@ describe("the e-mail through Resend", () => {
       "- Das Passwort oder die Sicherheitseinstellungen wurden geändert.",
       "1. Öffne die Einstellungen von OpenReply: https://dm.example.test/settings",
       "2. Tippe auf „Neu verbinden“ oder „Mit eigener Meta-App verbinden“ und melde dich bei Meta an.",
-      "3. Wähle dein Instagram-Konto und erlaube alle Berechtigungen.",
+      "3. Wähle dein Instagram-Konto und, falls es mit einer Facebook-Seite verknüpft ist, auch diese Seite. Erlaube alle Berechtigungen.",
       "Danach holt OpenReply die Kommentare aus der Zwischenzeit von selbst nach.",
     ]) {
       expect(text).toContain(line);
