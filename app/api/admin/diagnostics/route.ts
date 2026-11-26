@@ -128,6 +128,7 @@ export async function GET() {
         messagingAlertSentAt: true,
         messagingAlertCount: true,
         messagingSilenceResult: true,
+        messagingTapSearchFrom: true,
       },
     }),
     prisma.serviceKey.findMany({
@@ -176,7 +177,8 @@ export async function GET() {
   // A2: accounts whose button taps, DMs and read receipts no longer arrive
   // (lib/instagram/messaging-silence-check.ts), since when, and whether the
   // owners got an e-mail about it; and the last silence of each account for
-  // 7 days after it ended.
+  // 7 days after it ended, with the search for its lost taps (running, or
+  // what it found: handles, campaign names and times, never an id).
   const messagingSilences = accounts.flatMap((account) => {
     const silence = messagingSilenceOf(account);
     return silence

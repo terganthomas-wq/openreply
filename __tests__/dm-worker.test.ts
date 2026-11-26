@@ -152,6 +152,7 @@ vi.mock("@/lib/queue/client", () => ({
   MESSAGE_JOB_NAME: "process-message",
   OFFER_JOB_NAME: "process-offer",
   CATCH_UP_JOB_NAME: "process-catch-up",
+  LOST_TAP_SEARCH_JOB_NAME: "process-lost-taps",
 }));
 
 // The real work after a delivered link, observed: tests can read what a
@@ -177,6 +178,19 @@ vi.mock("../lib/offers/worker", async (importOriginal) => {
 const { mockRunCatchUp } = vi.hoisted(() => ({ mockRunCatchUp: vi.fn() }));
 vi.mock("@/lib/instagram/connection-catch-up", () => ({
   runConnectionCatchUp: mockRunCatchUp,
+}));
+// So has the search for lost taps after a messaging silence
+// (lost-tap-search.test.ts, lost-tap-records.test.ts): here only that the
+// worker hands it its job, and what a lost tap's job does with its answer.
+const { mockRunLostTapSearch, mockLostTapAnswered } = vi.hoisted(() => ({
+  mockRunLostTapSearch: vi.fn(),
+  mockLostTapAnswered: vi.fn(),
+}));
+vi.mock("@/lib/instagram/lost-tap-search", () => ({
+  runLostTapSearch: mockRunLostTapSearch,
+}));
+vi.mock("@/lib/instagram/lost-tap-records", () => ({
+  lostTapAnswered: mockLostTapAnswered,
 }));
 
 vi.mock("bullmq", () => {
@@ -1756,6 +1770,152 @@ describe("DM Worker — the claim of a button tap", () => {
   });
 });
 
+// A2: a tap a messaging silence swallowed, found in the conversation by the
+// search after it (lib/instagram/lost-tap-search.ts), comes back as exactly
+// the postback job the tap would have produced, plus the lostTap flag.
+describe("DM Worker — a tap found after a messaging silence", () => {
+  const TAPPED_AT = Date.parse("2026-11-25T20:51:10.000Z");
+  const claimOf = (tapId: string) =>
+    createHash("sha256")
+      .update(JSON.stringify(["ig_account_row_1", "auto_789", "commenter_999", tapId]))
+      .digest("hex");
+  function lostTap(extra: Record<string, unknown> = {}) {
+    return {
+      ...createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        accountConnectionId: "ig_account_row_1",
+        userId: "commenter_999",
+        payload: "reveal:auto_789:open",
+        mid: "m_lost",
+        tappedAt: TAPPED_AT,
+        lostTap: true,
+        ...extra,
+      }),
+      id: "losttap_0123",
+      // Queued hours after the tap, by the search.
+      timestamp: TAPPED_AT + 14 * 60 * 60_000,
+    };
+  }
+
+  beforeEach(() => {
+    mockPrisma.automation.findFirst.mockResolvedValue(mockAutomation);
+    mockLostTapAnswered.mockReset().mockResolvedValue(null);
+  });
+
+  it("asks whether the person was answered since the tap, and then answers it as the tap itself", async () => {
+    await getProcessor()(lostTap());
+
+    expect(mockLostTapAnswered).toHaveBeenCalledWith({
+      instagramId: "ig_456",
+      automationId: "auto_789",
+      userId: "commenter_999",
+      tappedAt: TAPPED_AT,
+      mid: "m_lost",
+    });
+    // The tap's own claim: keyed on its id, as its webhook would have been.
+    expect(mockPrisma.postbackDelivery.create).toHaveBeenCalledWith({
+      data: { id: claimOf("m_lost") },
+    });
+    expect(mockLostTapAnswered.mock.invocationCallOrder[0]).toBeLessThan(
+      mockPrisma.postbackDelivery.create.mock.invocationCallOrder[0]
+    );
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    // The window and what follows the link count from the tap.
+    expect(afterLinkDelivered).toHaveBeenCalledWith(
+      expect.objectContaining({ via: "tap", interactionAt: TAPPED_AT, triggerId: "m_lost" })
+    );
+    expect(mockPrisma.contact.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ lastInteractionAt: new Date(TAPPED_AT) }),
+      })
+    );
+  });
+
+  it("sends nothing when the person tapped again or got the link meanwhile", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      for (const answer of ["link", "dm", "tap"] as const) {
+        vi.clearAllMocks();
+        mockPrisma.automation.findFirst.mockResolvedValue(mockAutomation);
+        mockLostTapAnswered.mockResolvedValue(answer);
+        await getProcessor()(lostTap());
+        expect(mockPrisma.postbackDelivery.create, answer).not.toHaveBeenCalled();
+        expect(mockReserveWorkspaceDMSend, answer).not.toHaveBeenCalled();
+        expect(mockSendDirectMessage, answer).not.toHaveBeenCalled();
+        expect(mockGetUserFollowStatus, answer).not.toHaveBeenCalled();
+      }
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("does not ask again for its copy after a pause or its follow re-check, which go on with the same tap", async () => {
+    await getProcessor()(lostTap({ pauseRequeue: 1, tapId: "m_lost" }));
+    await getProcessor()(
+      lostTap({ payload: "followcheck:auto_789", followRecheck: true, followRecheckAttempt: 1 })
+    );
+    expect(mockLostTapAnswered).not.toHaveBeenCalled();
+  });
+
+  it("is never asked for an ordinary tap", async () => {
+    await getProcessor()(
+      createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        payload: "reveal:auto_789:open",
+        mid: "m_live",
+      })
+    );
+    expect(mockLostTapAnswered).not.toHaveBeenCalled();
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("and the same tap delivered late by its webhook take one claim: one link", async () => {
+    const claims = new Set<string>();
+    mockPrisma.postbackDelivery.create.mockImplementation(
+      async ({ data }: { data: { id: string } }) => {
+        if (claims.has(data.id)) throw { code: "P2002" };
+        claims.add(data.id);
+        return {};
+      }
+    );
+    const process = getProcessor();
+    await process(lostTap());
+    await process(
+      createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        accountConnectionId: "ig_account_row_1",
+        userId: "commenter_999",
+        payload: "reveal:auto_789:open",
+        mid: "m_lost",
+      })
+    );
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    expect([...claims]).toEqual([claimOf("m_lost")]);
+  });
+
+  it("with the follow gate checks the follow and asks a non-follower first, as the tap would have", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue({
+      ...mockAutomation,
+      requireFollow: true,
+      trackedLinks: [],
+    });
+    mockGetUserFollowStatus.mockResolvedValue(false);
+    await getProcessor()(lostTap({ payload: "followcheck:auto_789:open" }));
+    expect(mockSendDirectMessageWithButton).toHaveBeenCalledWith(
+      META_AUTH,
+      "ig_456",
+      "commenter_999",
+      expect.any(String),
+      expect.any(String),
+      "followcheck:auto_789"
+    );
+    expect(mockPrisma.postbackDelivery.create).toHaveBeenCalledWith({
+      data: { id: claimOf("m_lost") },
+    });
+  });
+});
+
 describe("DM Worker — work after a delivered button tap", () => {
   const withFollowUp = {
     ...mockAutomation,
@@ -1893,6 +2053,24 @@ describe("DM Worker — job dispatch", () => {
       });
       expect(mockRunCatchUp).toHaveBeenCalledTimes(1);
       expect(mockRunCatchUp).toHaveBeenCalledWith("ig_account_row_1");
+      expect(prismaCallCount()).toBe(0);
+      expect(mockQueueAdd).not.toHaveBeenCalled();
+      expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("hands a search for lost taps to its account's search, and runs nothing of a comment", async () => {
+    mockRunLostTapSearch.mockResolvedValueOnce("done");
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await getProcessor()({
+        ...createMockJob({ accountConnectionId: "ig_account_row_1", instagramAccountId: "ig_123" }),
+        name: "process-lost-taps",
+      });
+      expect(mockRunLostTapSearch).toHaveBeenCalledTimes(1);
+      expect(mockRunLostTapSearch).toHaveBeenCalledWith("ig_account_row_1");
       expect(prismaCallCount()).toBe(0);
       expect(mockQueueAdd).not.toHaveBeenCalled();
       expect(mockSendPrivateReply).not.toHaveBeenCalled();

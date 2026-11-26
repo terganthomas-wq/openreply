@@ -94,7 +94,14 @@ describe("an account row", () => {
         now
       )
     ).toEqual([
-      { accountId: "a", username: "recent", since: SILENCE.since, endedAt: result.endedAt },
+      {
+        accountId: "a",
+        username: "recent",
+        since: SILENCE.since,
+        endedAt: result.endedAt,
+        searching: false,
+        taps: null,
+      },
     ]);
   });
 });

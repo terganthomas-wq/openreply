@@ -43,6 +43,7 @@ vi.mock("@/lib/queue/client", () => ({
   MESSAGE_JOB_NAME: "process-message",
   OFFER_JOB_NAME: "process-offer",
   CATCH_UP_JOB_NAME: "process-catch-up",
+  LOST_TAP_SEARCH_JOB_NAME: "process-lost-taps",
 }));
 // Closed: a Meta function the comment path starts to use without a mock here
 // fails the suite instead of calling Instagram.

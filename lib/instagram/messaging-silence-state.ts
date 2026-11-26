@@ -9,12 +9,15 @@
  * is not an echo, a read receipt or a reaction for the account. The open
  * incident (messagingSilentSince) is closed in one conditional update that
  * also keeps the silence as the account's last one (messagingSilenceResult)
- * and makes its all-clear e-mail due; the worker's next sweep sends it
+ * and owes the search for the taps Instagram swallowed meanwhile
+ * (messagingTapSearchFrom and messagingTapSearchUntil): onMessagingSilenceEnded
+ * asks the worker for it (lib/instagram/lost-tap-search.ts), which adds what
+ * it found to messagingSilenceResult and makes the all-clear e-mail due
  * (lib/ops/messaging-silence-alert.ts). A first silent check that is still
  * waiting for its second (messagingSilenceCheckAt) is forgotten.
  *
- * Database only, no Meta, mail or queue import: the web app's webhook route
- * uses it.
+ * Database and queue only, no Meta or mail import: the web app's webhook
+ * route uses it.
  */
 
 import type { Prisma } from "@/app/generated/prisma/client";
@@ -23,8 +26,14 @@ import type {
   MessagingSilenceEnd,
   MessagingSilenceResult,
 } from "@/lib/instagram/messaging-silence-incident";
+import { lostTapSearchJobId } from "@/lib/instagram/lost-tap-state";
 import { inboundMessagingAccountIds } from "@/lib/meta/webhook";
 import { MESSAGING_BACK_EVENT } from "@/lib/ops/event-details";
+import {
+  getDMQueue,
+  LOST_TAP_SEARCH_JOB_NAME,
+  type ProcessLostTapSearchJob,
+} from "@/lib/queue/client";
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
@@ -42,20 +51,26 @@ export interface EndedSilence {
   /** When the inbound event that ended it arrived. */
   endedAt: Date;
   via: MessagingSilenceEnd;
+  /**
+   * Where the search for lost taps starts (messagingTapSearchFrom after the
+   * end): `since`, or the start of an earlier silence whose search is still
+   * owed, which this one is searched with.
+   */
+  searchFrom: Date;
 }
 
 /**
- * What the end of a silence writes besides closing it, in the same update.
- *
- * This is where the search for lost taps after a silence (A2 requirement 4)
- * comes in: people who got an opening DM in the silence and tapped its button
- * while Instagram passed nothing on. Until that search exists, the silence
- * becomes the account's last one at once and its all-clear is due right
- * away. With it, the end owes the search here instead (from `since`, like
- * A1's connectionCatchUpFrom), and the search, when it has finished, writes
- * messagingSilenceResult with what it found and makes the all-clear due.
+ * What the end of a silence writes besides closing it, in the same update:
+ * the silence as the account's last one, and the search for the taps that
+ * got lost in it (A2 requirement 4), from its start (or an earlier start
+ * whose search is still owed, like A1's connectionCatchUpFrom) up to its
+ * end. The all-clear waits for that search, which makes it due once it has
+ * finished; an all-clear of an earlier silence that is still owed would only
+ * tell old news now.
  */
-function afterSilence(ended: Pick<EndedSilence, "since" | "endedAt" | "via">) {
+function afterSilence(
+  ended: Pick<EndedSilence, "since" | "endedAt" | "via" | "searchFrom">
+) {
   const result: MessagingSilenceResult = {
     v: 1,
     since: ended.since.toISOString(),
@@ -64,13 +79,68 @@ function afterSilence(ended: Pick<EndedSilence, "since" | "endedAt" | "via">) {
   };
   return {
     messagingSilenceResult: result as unknown as Prisma.InputJsonValue,
-    messagingAllClearDueAt: ended.endedAt,
+    messagingTapSearchFrom: ended.searchFrom,
+    messagingTapSearchUntil: ended.endedAt,
+    messagingAllClearDueAt: null,
   };
+}
+
+// How long a request for the search waits for Redis. The webhook route must
+// not hang on it; the worker's sweep asks again for a search still owed.
+const QUEUE_TIMEOUT_MS = 5_000;
+
+/**
+ * Ask the worker to search the account's lost taps: the job
+ * `losttaps_<account>_<from>_<until>` (lostTapSearchJobId), so the end of the
+ * silence and the worker's sweep queue it once while it waits or runs. With
+ * `runAt`, a delayed job for that time, under its own id: a search that
+ * stopped early (an R1 pause, Meta's usage) goes on then. Removed once it
+ * ends, so a later request is never swallowed by a finished one. False when
+ * it could not be queued; never throws.
+ */
+export async function queueLostTapSearch(
+  account: { id: string; instagramId: string },
+  from: Date,
+  until: Date,
+  { runAt, now = Date.now() }: { runAt?: number; now?: number } = {}
+): Promise<boolean> {
+  const data: ProcessLostTapSearchJob = {
+    accountConnectionId: account.id,
+    instagramAccountId: account.instagramId,
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      getDMQueue().add(LOST_TAP_SEARCH_JOB_NAME, data, {
+        jobId: lostTapSearchJobId(account.id, from, until, runAt),
+        delay: runAt === undefined ? 0 : Math.max(0, runAt - now),
+        removeOnComplete: true,
+        removeOnFail: true,
+      }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("the queue did not answer in time")),
+          QUEUE_TIMEOUT_MS
+        );
+      }),
+    ]);
+    return true;
+  } catch (error) {
+    console.error(
+      "[Messaging silence] Could not queue the search for lost taps:",
+      describeError(error)
+    );
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
  * Called once when a silence ended, by whoever ended it: records it in
- * Diagnostics. Never throws.
+ * Diagnostics and asks the worker for the search for lost taps. Should the
+ * request not reach the queue, the worker's next sweep asks again. Never
+ * throws.
  */
 export async function onMessagingSilenceEnded(ended: EndedSilence): Promise<void> {
   const hours = Math.max(
@@ -99,6 +169,11 @@ export async function onMessagingSilenceEnded(ended: EndedSilence): Promise<void
       describeError(error)
     );
   }
+  await queueLostTapSearch(
+    { id: ended.accountId, instagramId: ended.instagramId },
+    ended.searchFrom,
+    ended.endedAt
+  );
 }
 
 /**
@@ -122,6 +197,7 @@ export async function endMessagingSilence(
         username: true,
         messagingSilentSince: true,
         messagingSilenceCheckAt: true,
+        messagingTapSearchFrom: true,
       },
     });
     if (!current) return null;
@@ -143,13 +219,21 @@ export async function endMessagingSilence(
 
     // An event cannot end a silence before it began.
     const endedAt = at.getTime() > since.getTime() ? at : new Date(since.getTime() + 1);
+    const pending = current.messagingTapSearchFrom ?? null;
+    const searchFrom = pending && pending.getTime() < since.getTime() ? pending : since;
     const ended = await prisma.instagramAccount.updateMany({
-      where: { id: accountId, messagingSilentSince: since },
+      where: {
+        id: accountId,
+        messagingSilentSince: since,
+        // The owed search as it was read: one that finished meanwhile is not
+        // brought back with its old start.
+        messagingTapSearchFrom: pending,
+      },
       data: {
         messagingSilentSince: null,
         messagingSilenceCheckAt: null,
         messagingAlertCount: 0,
-        ...afterSilence({ since, endedAt, via }),
+        ...afterSilence({ since, endedAt, via, searchFrom }),
       },
     });
     if (ended.count === 1) {
@@ -161,6 +245,7 @@ export async function endMessagingSilence(
         since,
         endedAt,
         via,
+        searchFrom,
       };
       await onMessagingSilenceEnded(silence);
       return silence;

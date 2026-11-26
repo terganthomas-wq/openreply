@@ -20,7 +20,9 @@
  *   hour, between 09:22 and 09:51 UTC for every other minute;
  * - its start is the last DM a person sent before it (13:15:16), the owners
  *   and admins get one alert, the first tap after the fix (10:30:57) ends it
- *   at the webhook route, and the all-clear follows with the next sweep.
+ *   at the webhook route and asks for the search for the taps lost in it,
+ *   whose end the all-clear waits for (lost-tap-search.test.ts runs that
+ *   search on this silence).
  */
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -31,6 +33,8 @@ import { FakeRedis } from "./helpers/fake-redis";
 const state = vi.hoisted(() => ({
   db: null as unknown as import("./helpers/fake-connection-db").FakeConnectionDb,
   redis: null as unknown,
+  /** "<name> <job id>" of every job queued. */
+  jobs: [] as string[],
 }));
 
 vi.mock("@/lib/db/client", () => ({
@@ -40,8 +44,14 @@ vi.mock("@/lib/db/client", () => ({
 }));
 vi.mock("@/lib/queue/client", () => ({
   getRedisConnection: () => state.redis,
-  getDMQueue: () => ({ add: vi.fn() }),
+  getDMQueue: () => ({
+    add: async (name: string, _data: unknown, opts: { jobId?: string } = {}) => {
+      state.jobs.push(`${name} ${opts.jobId ?? ""}`);
+      return { id: opts.jobId };
+    },
+  }),
   CATCH_UP_JOB_NAME: "process-catch-up",
+  LOST_TAP_SEARCH_JOB_NAME: "process-lost-taps",
 }));
 
 import {
@@ -144,6 +154,7 @@ interface Replay {
 async function replay(phaseMinutes: number): Promise<Replay> {
   state.redis = new FakeRedis();
   state.db = new FakeConnectionDb();
+  state.jobs = [];
   state.db.accounts.push(fakeAccount({ instagramId: IG }));
   state.db.users.push(
     { id: "u_owner", email: "owner@example.test" },
@@ -273,16 +284,23 @@ describe("the defaults on the production timeline of 2026-11-20 to 26", () => {
     expect(iso(run.opened)).toBe("2026-11-26T09:30:00.000Z");
     expect(run.since?.toISOString()).toBe("2026-11-25T13:15:16.000Z");
     expect(run.ended).toEqual({ at: "2026-11-26T10:30:57.000Z", via: "webhook" });
-    // One alert to the owner and the admin, then the all-clear with the
-    // first sweep after the end.
+    // One alert to the owner and the admin. The end asks the worker for the
+    // search for the taps lost in the silence, once, and the all-clear waits
+    // for it: no sweep after the end sends one by itself.
     expect(
       run.mails.map((mail) => [iso(mail.at), mail.subject.split(":")[0]])
     ).toEqual([
       ["2026-11-26T09:30:00.000Z", "Instagram gibt keine Button-Tipps weiter"],
       ["2026-11-26T09:30:00.000Z", "Instagram gibt keine Button-Tipps weiter"],
-      ["2026-11-26T11:00:00.000Z", "Entwarnung"],
-      ["2026-11-26T11:00:00.000Z", "Entwarnung"],
     ]);
+    expect(state.jobs).toEqual([
+      `process-lost-taps losttaps_account_1_${Date.parse("2026-11-25T13:15:16Z")}_${Date.parse("2026-11-26T10:30:57Z")}`,
+    ]);
+    expect(state.db.account()).toMatchObject({
+      messagingTapSearchFrom: new Date("2026-11-25T13:15:16Z"),
+      messagingTapSearchUntil: new Date("2026-11-26T10:30:57Z"),
+      messagingAllClearDueAt: null,
+    });
     // No judgment while A1's incident was open.
     expect([...run.duringLostConnection]).toEqual(["connection-lost"]);
   });

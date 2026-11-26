@@ -11,6 +11,8 @@
  * Client-safe: no database, queue or Meta import.
  */
 
+import { readLostTapResult, type LostTapResult } from "@/lib/instagram/lost-tap-state";
+
 /** An open silence of one account, as the pages get it. */
 export interface MessagingSilenceIncident {
   accountId: string;
@@ -47,8 +49,9 @@ export type MessagingSilenceEnd = "webhook" | "check";
 
 /**
  * The last silence that ended, as messagingSilenceResult stores it. The
- * search for lost taps after a silence (A2 requirement 4) adds its result to
- * this record; whatever this version does not know is left out when read.
+ * search for lost taps after it (A2 requirement 4,
+ * lib/instagram/lost-tap-search.ts) adds its result once it has finished;
+ * whatever this version does not know is left out when read.
  */
 export interface MessagingSilenceResult {
   v: 1;
@@ -57,6 +60,8 @@ export interface MessagingSilenceResult {
   /** When it ended: the time of the inbound event that ended it, ISO. */
   endedAt: string;
   via: MessagingSilenceEnd;
+  /** The search for lost taps, once it has finished. */
+  taps?: LostTapResult;
 }
 
 /** How long Diagnostics shows the last silence after it ended. */
@@ -71,11 +76,13 @@ export function readMessagingSilenceResult(value: unknown): MessagingSilenceResu
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
   if (raw.v !== 1 || !isTime(raw.since) || !isTime(raw.endedAt)) return null;
+  const taps = readLostTapResult(raw.taps);
   return {
     v: 1,
     since: raw.since,
     endedAt: raw.endedAt,
     via: raw.via === "webhook" ? "webhook" : "check",
+    ...(taps ? { taps } : {}),
   };
 }
 
@@ -85,15 +92,23 @@ export interface MessagingSilenceReport {
   username: string;
   since: string;
   endedAt: string;
+  /** The search for its lost taps is owed or running. */
+  searching: boolean;
+  /** What that search found, once it has finished; null before (or for an older silence). */
+  taps: LostTapResult | null;
 }
 
-/** The accounts whose last silence ended within 7 days, in the given order. */
+/**
+ * The accounts whose last silence ended within 7 days, in the given order,
+ * with the search for its lost taps.
+ */
 export function messagingSilenceReports(
   accounts: readonly {
     id: string;
     username: string;
     messagingSilentSince?: Date | null;
     messagingSilenceResult?: unknown;
+    messagingTapSearchFrom?: Date | null;
   }[],
   now: number = Date.now()
 ): MessagingSilenceReport[] {
@@ -108,6 +123,8 @@ export function messagingSilenceReports(
         username: account.username,
         since: result.since,
         endedAt: result.endedAt,
+        searching: Boolean(account.messagingTapSearchFrom),
+        taps: result.taps ?? null,
       },
     ];
   });

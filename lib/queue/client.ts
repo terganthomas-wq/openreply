@@ -91,6 +91,13 @@ export interface ProcessPostbackJob {
   // How often this tap was put back for the account's pause after a Meta
   // request limit (lib/queue/account-pause.ts), capped at MAX_PAUSE_REQUEUES.
   pauseRequeue?: number;
+  // A2: a tap that a messaging silence swallowed, which the search after it
+  // found in the person's conversation (lib/instagram/lost-tap-search.ts):
+  // `mid` is the tap's id there and `tappedAt` its time. Before it does
+  // anything, the job stands back if the person tapped again or got the link
+  // since (lib/instagram/lost-tap-records.ts); its copies for a pause and its
+  // follow re-checks carry the flag on but continue the same tap.
+  lostTap?: boolean;
 }
 
 // Scheduled after the link is delivered, to send the appreciation follow-up.
@@ -179,13 +186,30 @@ export interface ProcessCatchUpJob {
   pauseRequeue?: number;
 }
 
+// The search for lost taps after a messaging silence (A2,
+// lib/instagram/lost-tap-search.ts) for one account. Queued when a silence
+// ends (at the webhook route or by the worker's check), and by the worker's
+// sweep for a search still owed. It sends nothing itself: it reads the
+// conversations of the people who got an opening DM in the silence and
+// queues the postback job of each tap it finds.
+export interface ProcessLostTapSearchJob {
+  // The InstagramAccount row id.
+  accountConnectionId: string;
+  // The Instagram business id, which recordWorkerFailure reads.
+  instagramAccountId: string;
+  // Not used: the search keeps its own progress on the account row. Here
+  // because code that handles any job reads it.
+  pauseRequeue?: number;
+}
+
 export type DmQueueJob =
   | ProcessCommentJob
   | ProcessPostbackJob
   | ProcessFollowUpJob
   | ProcessMessageJob
   | ProcessOfferJob
-  | ProcessCatchUpJob;
+  | ProcessCatchUpJob
+  | ProcessLostTapSearchJob;
 
 // The worker runs a comment job only under this name (or none at all), so a
 // job name it does not know yet is ignored instead of being read as a comment.
@@ -197,6 +221,8 @@ export const OFFER_JOB_NAME = "process-offer";
 // A worker from before the catch-up ignores this name (dispatchJob), and the
 // catch-up stays owed in the database until a newer worker runs it.
 export const CATCH_UP_JOB_NAME = "process-catch-up";
+// The same holds for the search for lost taps after a messaging silence.
+export const LOST_TAP_SEARCH_JOB_NAME = "process-lost-taps";
 
 let dmQueue: Queue<DmQueueJob> | null = null;
 

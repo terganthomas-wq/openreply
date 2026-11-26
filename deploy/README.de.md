@@ -471,12 +471,48 @@ Die üblichen Ursachen und was du tust:
 Vorbei ist die Störung mit dem ersten Button-Tipp, der ersten DM, Reaktion
 oder Lesebestätigung, die wieder ankommt: sofort, wenn sie ankommt, sonst
 mit dem nächsten Durchlauf. Neu verbinden allein beendet sie nicht, erst
-etwas, das wirklich ankommt. Dann bekommen alle Inhaber und Admins die
-Entwarnung „Instagram gibt wieder Button-Tipps an OpenReply weiter“ mit der
-Dauer der Störung, und die *Diagnose* zeigt sie sieben Tage lang. Wer in der
-Zeit in deiner ersten DM auf den Button getippt hat, hat nichts bekommen.
-Solche Tipps siehst du in Instagram in der Unterhaltung als Nachricht mit dem
-Text des Buttons.
+etwas, das wirklich ankommt.
+
+Gleich danach sucht der Worker die Button-Tipps, die in der Störung verloren
+gegangen sind, genau einmal pro Störung:
+
+- Er schaut sich alle an, die in der Störung eine erste DM bekommen haben
+  und seitdem weder noch einmal getippt noch den Link bekommen haben. Wer
+  nach der Störung selbst noch einmal getippt hat, hat seine Antwort schon.
+  Höchstens 50 Leute, die mit der neuesten ersten DM zuerst; alle weiteren
+  zählen als „nicht nachgesehen“. Kampagnen, die du inzwischen pausiert
+  hast, lässt er aus, außer du hast der Person die DM von Hand geschickt.
+- Ihre Unterhaltungen findet er in der Liste deiner Unterhaltungen bei Meta,
+  die neuesten zuerst. Eine Unterhaltung, in der nach der ersten DM nichts
+  mehr kam, liest er gar nicht, jede andere einmal. Zwischen zwei Anfragen
+  an Meta liegen mindestens 5 Sekunden, damit es nicht wie am 21.11. zu
+  viele auf einmal werden.
+- Ein verlorener Tipp ist eine Nachricht der Person, deren Text genau die
+  Beschriftung eines Buttons der Kampagne ist (der ersten DM oder der Bitte,
+  dir zu folgen) und die nach ihrer ersten DM kam. So zeigt Instagram einen
+  Tipp in der Unterhaltung an.
+- Für jeden solchen Tipp macht OpenReply weiter, als wäre er gleich
+  angekommen: Folge-Check, Link und was danach kommt wie gewohnt, mit dem
+  Tipp als Beginn von Instagrams 24 Stunden. Die ältesten Tipps zuerst, dann
+  etwa einer alle 2,5 Minuten. Den Link bekommt dabei niemand doppelt: Hat
+  die Person inzwischen noch einmal getippt oder den Link schon bekommen,
+  schickt OpenReply nichts.
+- Instagram erlaubt eine Antwort nur bis 24 Stunden nach dem Tipp. Bleibt
+  davon keine Stunde mehr, schickt OpenReply nichts, sondern nennt dir die
+  Person. Ebenso, wenn du die Kampagne inzwischen pausiert hast.
+- Während einer Meta-Pause liest der Worker nichts. Meldet Meta schon 60 %
+  eines Limits, wartet er 15 Minuten. Nach einem Neustart macht er dort
+  weiter, wo er war. Nach 24 Stunden hört er mit dem auf, was er hat.
+
+Ist die Suche fertig, bekommen alle Inhaber und Admins die Entwarnung
+„Instagram gibt wieder Button-Tipps an OpenReply weiter“: wie lange die
+Störung dauerte, bei wie vielen verlorenen Tipps es jetzt weitergeht, bei
+wem es zu spät war (Name, Kampagne, Uhrzeit des Tipps; schreib diesen Leuten
+am besten selbst in Instagram), wie viele die erste DM bekommen, aber nicht
+getippt haben, und bei wem OpenReply nicht nachsehen konnte. Die *Diagnose*
+zeigt dasselbe sieben Tage lang; solange die Suche läuft, steht dort
+„OpenReply sucht gerade nach Button-Tipps, die in dieser Zeit verloren
+gegangen sind …“.
 
 ## Zugangsdaten
 

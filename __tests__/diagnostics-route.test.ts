@@ -108,11 +108,13 @@ describe("Diagnostics and Meta's request limits", () => {
         // A1: its catch-up, running or finished.
         connectionCatchUpFrom: true,
         connectionCatchUpResult: true,
-        // A2: the messaging silence, open or ended.
+        // A2: the messaging silence, open or ended, and the search for its
+        // lost taps.
         messagingSilentSince: true,
         messagingAlertSentAt: true,
         messagingAlertCount: true,
         messagingSilenceResult: true,
+        messagingTapSearchFrom: true,
       },
     });
   });
@@ -430,8 +432,60 @@ describe("Diagnostics and a messaging silence", () => {
         username: "studio",
         since: "2026-11-19T13:15:16.000Z",
         endedAt: "2026-11-20T10:30:57.000Z",
+        searching: false,
+        taps: null,
       },
     ]);
+  });
+
+  it("shows the search for lost taps after it: running, then what it found, with names and never an id", async () => {
+    const result = {
+      v: 1,
+      since: "2026-11-20T13:15:16.000Z",
+      endedAt: "2026-11-21T10:30:57.000Z",
+      via: "webhook",
+    };
+    const taps = {
+      v: 1,
+      finishedAt: "2026-11-21T10:40:00.000Z",
+      people: 4,
+      continued: 1,
+      firstJobAt: "2026-11-21T10:40:00.000Z",
+      lastJobAt: "2026-11-21T10:40:00.000Z",
+      listed: [
+        { username: "gerd", campaign: "Guide", tappedAt: "2026-11-20T13:21:00.000Z", reason: "window" },
+      ],
+      noTap: 2,
+      answered: 0,
+      notChecked: 0,
+      reads: 3,
+      gaveUp: false,
+      complete: true,
+    };
+    mockPrisma.instagramAccount.findMany.mockResolvedValue([
+      {
+        id: "a1",
+        instagramId: "ig_1",
+        username: "studio",
+        messagingSilentSince: null,
+        messagingSilenceResult: result,
+        messagingTapSearchFrom: new Date(result.since),
+      },
+      {
+        id: "a2",
+        instagramId: "ig_2",
+        username: "other",
+        messagingSilentSince: null,
+        messagingSilenceResult: { ...result, taps },
+        messagingTapSearchFrom: null,
+      },
+    ]);
+    const { endedMessagingSilences } = await diagnostics();
+    expect(endedMessagingSilences).toEqual([
+      { accountId: "a1", username: "studio", since: result.since, endedAt: result.endedAt, searching: true, taps: null },
+      { accountId: "a2", username: "other", since: result.since, endedAt: result.endedAt, searching: false, taps },
+    ]);
+    expect(JSON.stringify(endedMessagingSilences)).not.toContain("ig_");
   });
 
   it("hands the page what it needs to name the silence events", async () => {

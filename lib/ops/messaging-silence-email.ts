@@ -8,13 +8,19 @@
  *
  * The alert says what is wrong in plain words, since when (Berlin time in
  * German, UTC in English), what that means, the likely causes and the fix
- * with the link to the settings page. Nothing else: no tracking (no image,
- * no tracked or tagged link), no token, no id.
+ * with the link to the settings page. The all-clear says how long it lasted
+ * and what the search for lost taps after it found
+ * (lib/instagram/lost-tap-search.ts): how many taps go on now, who could not
+ * be helped any more (name, campaign, time), how many people got the first
+ * DM without tapping, and whom it could not look at. Nothing else: no
+ * tracking (no image, no tracked or tagged link), no token, no id.
  *
  * Pure: no database, no clock, no environment.
  */
 
-import { formatDowntime } from "@/lib/ops/connection-all-clear-email";
+import type { ListedTap, LostTapResult } from "@/lib/instagram/lost-tap-state";
+import { LOST_TAP_SPACING_MS } from "@/lib/instagram/lost-tap-state";
+import { catchUpSpacingWords, formatDowntime } from "@/lib/ops/connection-all-clear-email";
 import {
   formatAlertTime,
   type AlertLocale,
@@ -38,7 +44,12 @@ export interface MessagingSilenceAllClearInput {
   username: string;
   since: Date;
   endedAt: Date;
+  /** What the search for lost taps found; absent for a silence without one. */
+  taps?: LostTapResult | null;
 }
+
+/** People the all-clear lists by name; the rest are counted (Diagnostics has them all). */
+export const LOST_TAPS_MAX_LISTED = 50;
 
 interface Copy {
   subject: Record<ConnectionAlertKind, string>;
@@ -65,6 +76,23 @@ interface Copy {
     to: { date: string; time: string };
   }) => string;
   lostTaps: string;
+  continued: (count: number, spacing: string) => string;
+  noneLost: (complete: boolean) => string;
+  listedIntro: (count: number) => string;
+  listedItem: (values: {
+    person: string;
+    campaign: string;
+    date: string;
+    time: string;
+    reason: ListedTap["reason"];
+  }) => string;
+  noName: string;
+  listedMore: (count: number) => string;
+  writeYourself: string;
+  answered: (count: number) => string;
+  noTap: (count: number) => string;
+  notChecked: (count: number) => string;
+  gaveUp: string;
   allClearFooter: string;
 }
 
@@ -119,6 +147,44 @@ const COPY: Record<AlertLocale, Copy> = {
         : `Die Störung dauerte etwa ${duration}: vom ${from.date} um ${from.time} Uhr bis zum ${to.date} um ${to.time} Uhr.`,
     lostTaps:
       "Wer in dieser Zeit in deiner ersten DM auf den Button getippt hat, hat nichts bekommen: Der Tipp kam nicht bei OpenReply an. In Instagram siehst du so einen Tipp in der Unterhaltung als Nachricht mit dem Text des Buttons.",
+    continued: (count, spacing) =>
+      count === 1
+        ? "1 Person hat in dieser Zeit auf den Button in deiner ersten DM getippt, ohne dass der Tipp ankam. OpenReply hat das in der Unterhaltung gefunden und macht bei ihr jetzt weiter, als wäre der Tipp gleich angekommen."
+        : `${count} Leute haben in dieser Zeit auf den Button in deiner ersten DM getippt, ohne dass der Tipp ankam. OpenReply hat das in den Unterhaltungen gefunden und macht bei ihnen jetzt nach und nach weiter, als wäre der Tipp gleich angekommen, etwa bei einer Person alle ${spacing}.`,
+    noneLost: (complete) =>
+      complete
+        ? "OpenReply hat in den Unterhaltungen nachgesehen: In dieser Zeit ist kein Button-Tipp verloren gegangen."
+        : "In den Unterhaltungen, in die OpenReply schauen konnte, ist in dieser Zeit kein Button-Tipp verloren gegangen.",
+    listedIntro: (count) =>
+      count === 1
+        ? "Bei 1 Person ging das nicht mehr:"
+        : `Bei diesen ${count} Leuten ging das nicht mehr:`,
+    listedItem: ({ person, campaign, date, time, reason }) =>
+      `${person}, Kampagne „${campaign}“, getippt am ${date} um ${time} Uhr: ${
+        reason === "window"
+          ? "Instagram erlaubt eine Antwort nur bis 24 Stunden nach dem Tipp."
+          : "Die Kampagne ist pausiert."
+      }`,
+    noName: "(ohne Namen)",
+    listedMore: (count) =>
+      count === 1
+        ? "… und 1 weitere Person, die du in der Diagnose von OpenReply findest."
+        : `… und ${count} weitere, die du in der Diagnose von OpenReply findest.`,
+    writeYourself:
+      "Schreib ihnen am besten selbst in Instagram, damit sie bekommen, worum sie gebeten haben.",
+    answered: (count) =>
+      count === 1
+        ? "Bei 1 Person ging es nach der Störung von selbst weiter, zum Beispiel weil sie noch einmal getippt hat."
+        : `Bei ${count} Leuten ging es nach der Störung von selbst weiter, zum Beispiel weil sie noch einmal getippt haben.`,
+    noTap: (count) =>
+      count === 1
+        ? "1 Person hat in dieser Zeit deine erste DM bekommen, aber nicht auf den Button getippt."
+        : `${count} Leute haben in dieser Zeit deine erste DM bekommen, aber nicht auf den Button getippt.`,
+    notChecked: (count) =>
+      count === 1
+        ? "Bei 1 Person konnte OpenReply nicht nachsehen. Schau dort selbst in Instagram in die Unterhaltung."
+        : `Bei ${count} Leuten konnte OpenReply nicht nachsehen. Schau dort selbst in Instagram in die Unterhaltungen.`,
+    gaveUp: "Die Suche hat zu lange gedauert: OpenReply hat sie nach 24 Stunden beendet.",
     allClearFooter:
       "Diese E-Mail hat deine OpenReply-Installation automatisch geschickt. Die Störung siehst du auch in der Diagnose.",
   },
@@ -170,6 +236,43 @@ const COPY: Record<AlertLocale, Copy> = {
         : `It lasted about ${duration}: from ${from.date}, ${from.time} UTC to ${to.date}, ${to.time} UTC.`,
     lostTaps:
       "Whoever tapped the button in your first DM in that time got nothing: the tap did not reach OpenReply. In Instagram such a tap shows in the conversation as a message with the button's text.",
+    continued: (count, spacing) =>
+      count === 1
+        ? "1 person tapped the button in your first DM in that time, and the tap got lost. OpenReply found it in the conversation and continues with them now as if the tap had arrived."
+        : `${count} people tapped the button in your first DM in that time, and the taps got lost. OpenReply found them in the conversations and continues with them now as if the taps had arrived, one after the other, about one person every ${spacing}.`,
+    noneLost: (complete) =>
+      complete
+        ? "OpenReply looked through the conversations: no button tap got lost in that time."
+        : "In the conversations OpenReply could look at, no button tap got lost in that time.",
+    listedIntro: (count) =>
+      count === 1
+        ? "For 1 person that was no longer possible:"
+        : `For these ${count} people that was no longer possible:`,
+    listedItem: ({ person, campaign, date, time, reason }) =>
+      `${person}, campaign “${campaign}”, tapped on ${date}, ${time} UTC: ${
+        reason === "window"
+          ? "Instagram allows an answer only within 24 hours of the tap."
+          : "the campaign is paused."
+      }`,
+    noName: "(no name)",
+    listedMore: (count) =>
+      count === 1
+        ? "… and 1 more person, whom you find in OpenReply's Diagnostics."
+        : `… and ${count} more, whom you find in OpenReply's Diagnostics.`,
+    writeYourself: "Best write to them yourself in Instagram, so they get what they asked for.",
+    answered: (count) =>
+      count === 1
+        ? "For 1 person it went on by itself after the silence, for example because they tapped again."
+        : `For ${count} people it went on by itself after the silence, for example because they tapped again.`,
+    noTap: (count) =>
+      count === 1
+        ? "1 person got your first DM in that time but did not tap the button."
+        : `${count} people got your first DM in that time but did not tap the button.`,
+    notChecked: (count) =>
+      count === 1
+        ? "OpenReply could not look at the conversation of 1 person. Check it yourself in Instagram."
+        : `OpenReply could not look at the conversations of ${count} people. Check them yourself in Instagram.`,
+    gaveUp: "The search took too long: OpenReply ended it after 24 hours.",
     allClearFooter:
       "This e-mail was sent automatically by your OpenReply installation. Diagnostics shows it as well.",
   },
@@ -272,6 +375,61 @@ export function buildMessagingSilenceAlertEmail(
   return { subject, text, html };
 }
 
+// One line of user content (a name, a campaign), at most this long.
+const NAME_MAX = 80;
+
+function oneLine(value: string): string {
+  const line = value.replace(/\s+/g, " ").trim();
+  return line.length > NAME_MAX ? `${line.slice(0, NAME_MAX - 1).trimEnd()}…` : line;
+}
+
+/** One paragraph of the all-clear, or a list with its lines. */
+type Block =
+  | { kind: "p"; text: string }
+  | { kind: "list"; intro: string; items: string[]; more: string | null };
+
+/**
+ * What the search for lost taps found: the taps that go on, the people it
+ * was too late for (or whose campaign is paused), with the advice to write
+ * to them, how many did not tap, and whom it could not look at.
+ */
+function tapsPart(copy: Copy, locale: AlertLocale, taps: LostTapResult): Block[] {
+  const part: Block[] = [];
+  const listed = taps.listed;
+  if (taps.continued > 0) {
+    part.push({
+      kind: "p",
+      text: copy.continued(taps.continued, catchUpSpacingWords(locale, LOST_TAP_SPACING_MS)),
+    });
+  } else if (listed.length === 0 && taps.answered === 0) {
+    part.push({ kind: "p", text: copy.noneLost(taps.complete) });
+  }
+  if (listed.length > 0) {
+    const shown = listed.slice(0, LOST_TAPS_MAX_LISTED);
+    part.push({
+      kind: "list",
+      intro: copy.listedIntro(listed.length),
+      items: shown.map((entry) => {
+        const { date, time } = formatAlertTime(new Date(entry.tappedAt), locale);
+        return copy.listedItem({
+          person: entry.username ? `@${oneLine(entry.username)}` : copy.noName,
+          campaign: oneLine(entry.campaign),
+          date,
+          time,
+          reason: entry.reason,
+        });
+      }),
+      more: listed.length > shown.length ? copy.listedMore(listed.length - shown.length) : null,
+    });
+    part.push({ kind: "p", text: copy.writeYourself });
+  }
+  if (taps.answered > 0) part.push({ kind: "p", text: copy.answered(taps.answered) });
+  if (taps.noTap > 0) part.push({ kind: "p", text: copy.noTap(taps.noTap) });
+  if (taps.notChecked > 0) part.push({ kind: "p", text: copy.notChecked(taps.notChecked) });
+  if (taps.gaveUp) part.push({ kind: "p", text: copy.gaveUp });
+  return part;
+}
+
 /** The all-clear after a silence: subject, plain text and simple HTML. */
 export function buildMessagingSilenceAllClearEmail(
   input: MessagingSilenceAllClearInput
@@ -284,14 +442,22 @@ export function buildMessagingSilenceAllClearEmail(
     to: formatAlertTime(input.endedAt, input.locale),
   });
   const subject = copy.allClearSubject;
+  // Without a search (a silence from before it existed), what a tap in that
+  // time meant.
+  const part: Block[] = input.taps
+    ? tapsPart(copy, input.locale, input.taps)
+    : [{ kind: "p", text: copy.lostTaps }];
 
   const text = [
     copy.greeting,
     "",
     back,
     lasted,
-    "",
-    copy.lostTaps,
+    ...part.flatMap((entry) =>
+      entry.kind === "p"
+        ? ["", entry.text]
+        : ["", entry.intro, ...entry.items.map((item) => `- ${item}`), ...(entry.more ? [entry.more] : [])]
+    ),
     "",
     "--",
     copy.allClearFooter,
@@ -304,7 +470,17 @@ export function buildMessagingSilenceAllClearEmail(
       paragraph(copy.greeting),
       `<p style="margin:0 0 16px;font-weight:600">${escapeHtml(back)}</p>`,
       paragraph(lasted),
-      paragraph(copy.lostTaps),
+      ...part.flatMap((entry) =>
+        entry.kind === "p"
+          ? [paragraph(entry.text)]
+          : [
+              paragraph(entry.intro, ";font-weight:600"),
+              `<ul style="margin:0 0 16px;padding-left:20px">${entry.items
+                .map((item) => `<li style="margin:0 0 8px;overflow-wrap:anywhere">${escapeHtml(item)}</li>`)
+                .join("")}</ul>`,
+              entry.more ? paragraph(entry.more) : "",
+            ]
+      ),
     ],
     copy.allClearFooter
   );

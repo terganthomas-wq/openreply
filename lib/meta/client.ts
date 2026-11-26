@@ -957,20 +957,69 @@ export async function getConversations(
   throw new Error("Instagram conversation pagination exceeded its safety limit");
 }
 
+/** One page of the account's conversations, and the cursor of the next one. */
+export interface ConversationPage {
+  data: InstagramConversation[];
+  /** The OUTER cursor of the next page; null at the end of the list. */
+  after: string | null;
+}
+
+/**
+ * One page of the account's conversations, newest first, with who takes
+ * part and when each last changed (A2's search for lost taps,
+ * lib/instagram/lost-tap-search.ts): one read, no message expansion. The
+ * caller pages with `after` and decides what a failed page means (code 1
+ * for a single broken entry: see getConversations above).
+ */
+export async function getConversationPage(
+  auth: MetaAuth,
+  igUserId: string,
+  {
+    limit,
+    after = null,
+    fields = "id,updated_time,participants",
+  }: { limit: number; after?: string | null; fields?: string }
+): Promise<ConversationPage> {
+  const url = new URL(`${instagramGraphBase(auth)}/${igUserId}/conversations`);
+  url.searchParams.set("platform", "instagram");
+  url.searchParams.set("fields", fields);
+  url.searchParams.set("limit", String(Math.max(1, Math.min(50, Math.floor(limit)))));
+  if (after) url.searchParams.set("after", after);
+  const page = await handleResponse<{
+    data?: InstagramConversation[];
+    paging?: { next?: string; cursors?: { after?: string } };
+  }>(
+    await metaFetch(auth, url.toString(), {
+      headers: { Authorization: `Bearer ${tokenOf(auth)}` },
+      signal: AbortSignal.timeout(10_000),
+    })
+  );
+  const data = Array.isArray(page.data) ? page.data : [];
+  // Never Meta's next URL: only its cursor, on our own host.
+  const next = page.paging?.next ? page.paging.cursors?.after : undefined;
+  return { data, after: data.length > 0 && next ? next : null };
+}
+
 /**
  * The messages in a conversation, with content. Meta only returns full details
  * for the 20 most recent messages, newest first.
  */
 export async function getConversationMessages(
   auth: MetaAuth,
-  conversationId: string
+  conversationId: string,
+  // The worker's search for lost taps must not hang on one read; the inbox
+  // keeps waiting as before.
+  { timeoutMs }: { timeoutMs?: number } = {}
 ): Promise<InstagramMessage[]> {
   const accessToken = tokenOf(auth);
   const url = new URL(`${instagramGraphBase(auth)}/${conversationId}`);
   url.searchParams.set("fields", "messages{id,created_time,from,to,message}");
   url.searchParams.set("access_token", accessToken);
 
-  const response = await metaFetch(auth, url.toString());
+  const response =
+    timeoutMs === undefined
+      ? await metaFetch(auth, url.toString())
+      : await metaFetch(auth, url.toString(), { signal: AbortSignal.timeout(timeoutMs) });
   const data = await handleResponse<{ messages?: { data: InstagramMessage[] } }>(
     response
   );

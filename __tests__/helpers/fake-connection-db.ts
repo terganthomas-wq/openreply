@@ -4,7 +4,9 @@
  * OperationalEvent, Workspace, WorkspaceMember, User, Automation, DmLog, and
  * the ad copies of posts the sweep finds in WebhookEvent ($queryRaw). The
  * messaging silence check (A2) adds WebhookEvent rows themselves (its
- * findMany, with Postgres's JSON containment for `path` + `array_contains`).
+ * findMany, with Postgres's JSON containment for `path` + `array_contains`),
+ * and the search for lost taps after a silence DmLog's findFirst and
+ * findUnique (by automationId_commentId).
  *
  * Unlike a plain mock it evaluates the where clauses of updateMany, because
  * that is where the check's, the e-mail's and the catch-up's guarantees live:
@@ -51,6 +53,10 @@ export interface FakeAccount {
   messagingAlertCount: number;
   messagingAllClearDueAt: Date | null;
   messagingAllClearSentAt: Date | null;
+  messagingTapSearchFrom: Date | null;
+  messagingTapSearchUntil: Date | null;
+  messagingTapSearchClaimedAt: Date | null;
+  messagingTapSearchProgress: unknown;
 }
 
 export interface FakeEvent {
@@ -76,6 +82,9 @@ export interface FakeCampaign {
   openingDmEnabled?: boolean;
   openingDmMessage?: string | null;
   openingDmButtonLabel?: string | null;
+  requireFollow?: boolean;
+  followPromptButtonLabel?: string | null;
+  followPromptRetryButtonLabel?: string | null;
 }
 
 export interface FakeDmLog {
@@ -87,7 +96,12 @@ export interface FakeDmLog {
   dmDeliveryUnconfirmed?: boolean;
   errorMessage?: string | null;
   commenterId?: string;
+  commenterName?: string | null;
+  matchedKeyword?: string | null;
   dmSentAt?: Date | null;
+  /** When the row was written and last changed; both default to dmSentAt (or long ago). */
+  createdAt?: Date;
+  updatedAt?: Date;
 }
 
 /** A stored webhook, as the webhook route keeps it. */
@@ -232,6 +246,10 @@ export function fakeAccount(overrides: Partial<FakeAccount> = {}): FakeAccount {
     messagingAlertCount: 0,
     messagingAllClearDueAt: null,
     messagingAllClearSentAt: null,
+    messagingTapSearchFrom: null,
+    messagingTapSearchUntil: null,
+    messagingTapSearchClaimedAt: null,
+    messagingTapSearchProgress: null,
     ...overrides,
   };
 }
@@ -273,6 +291,23 @@ export class FakeConnectionDb {
   ads: Record<string, string[]> = {};
   /** Every updateMany, for tests that check what was asked. */
   updates: { where: Record<string, unknown>; data: Record<string, unknown> }[] = [];
+
+  private dmLogRows(): Row[] {
+    return this.dmLogs.map((log) => {
+      const written = log.dmSentAt ?? new Date("2026-01-01T00:00:00.000Z");
+      return {
+        attempts: 0,
+        dmDeliveryUnconfirmed: false,
+        errorMessage: null,
+        dmSentAt: null,
+        commenterName: null,
+        matchedKeyword: null,
+        createdAt: log.createdAt ?? written,
+        updatedAt: log.updatedAt ?? written,
+        ...log,
+      } as unknown as Row;
+    });
+  }
 
   account(id = "account_1"): FakeAccount {
     const account = this.accounts.find((row) => row.id === id);
@@ -360,19 +395,21 @@ export class FakeConnectionDb {
       // default (no attempt, nothing unconfirmed, no error, not sent), and
       // the conditions see those defaults too.
       findMany: async ({ where }: { where: Record<string, unknown> }) =>
-        this.dmLogs
-          .map(
-            (log) =>
-              ({
-                attempts: 0,
-                dmDeliveryUnconfirmed: false,
-                errorMessage: null,
-                dmSentAt: null,
-                ...log,
-              }) as unknown as Row
-          )
+        this.dmLogRows()
           .filter((log) => matches(log, where))
           .map((log) => copy(log)),
+      findFirst: async ({ where }: { where: Record<string, unknown> }) => {
+        const row = this.dmLogRows().find((log) => matches(log, where));
+        return row ? copy(row) : null;
+      },
+      findUnique: async ({
+        where,
+      }: {
+        where: { automationId_commentId: { automationId: string; commentId: string } };
+      }) => {
+        const row = this.dmLogRows().find((log) => matches(log, where.automationId_commentId));
+        return row ? copy(row) : null;
+      },
     },
     // Newest first, then by id, as the silence check (A2) asks; a page of them.
     webhookEvent: {

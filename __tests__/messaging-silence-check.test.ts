@@ -17,6 +17,8 @@ import { FakeRedis } from "./helpers/fake-redis";
 const state = vi.hoisted(() => ({
   db: null as unknown as import("./helpers/fake-connection-db").FakeConnectionDb,
   redis: null as unknown,
+  // The jobs queued: the search for lost taps after a silence.
+  adds: [] as { name: string; data: unknown; opts: Record<string, unknown> }[],
 }));
 
 vi.mock("@/lib/db/client", () => ({
@@ -26,8 +28,14 @@ vi.mock("@/lib/db/client", () => ({
 }));
 vi.mock("@/lib/queue/client", () => ({
   getRedisConnection: () => state.redis,
-  getDMQueue: () => ({ add: vi.fn() }),
+  getDMQueue: () => ({
+    add: async (name: string, data: unknown, opts: Record<string, unknown>) => {
+      state.adds.push({ name, data, opts });
+      return { id: opts.jobId };
+    },
+  }),
   CATCH_UP_JOB_NAME: "process-catch-up",
+  LOST_TAP_SEARCH_JOB_NAME: "process-lost-taps",
 }));
 
 import {
@@ -174,6 +182,7 @@ beforeEach(() => {
   openingDm("p2", "2026-11-25T20:49:24Z");
   openingDm("p3", "2026-11-25T20:51:36Z");
   sent = [];
+  state.adds = [];
   mailAnswer = () => ({ ok: true });
   resetMailWarnings();
   resetMessagingSilenceMailWarnings();
@@ -400,31 +409,82 @@ describe("the end of a silence", () => {
     sent = [];
   }
 
-  it("comes with the next check once anything arrived, and the all-clear goes out with it", async () => {
+  it("comes with the next check once anything arrived, and the all-clear waits for the search for lost taps", async () => {
     await open();
     inbound(at("2026-11-26T10:30:57Z"), "postback", "p1");
     const summary = await check(Date.parse("2026-11-26T11:00:00Z"));
-    expect(summary).toMatchObject({ outcomes: { ended: 1 }, mailed: 1 });
+    expect(summary).toMatchObject({ outcomes: { ended: 1 }, mailed: 0 });
+    const result = {
+      v: 1,
+      since: LAST_INBOUND.toISOString(),
+      endedAt: "2026-11-26T10:30:57.000Z",
+      via: "check",
+    };
     expect(account()).toMatchObject({
       messagingSilentSince: null,
       messagingSilenceCheckAt: null,
       messagingAlertCount: 0,
       messagingAllClearDueAt: null,
-      messagingAllClearSentAt: at("2026-11-26T11:00:00Z"),
-      messagingSilenceResult: {
-        v: 1,
-        since: LAST_INBOUND.toISOString(),
-        endedAt: "2026-11-26T10:30:57.000Z",
-        via: "check",
-      },
+      // The search for the taps lost in it, from its start to its end.
+      messagingTapSearchFrom: LAST_INBOUND,
+      messagingTapSearchUntil: at("2026-11-26T10:30:57Z"),
+      messagingSilenceResult: result,
     });
     expect(events("messaging-back")[0]).toMatchObject({ source: "WORKER", level: "INFO" });
+    // The worker is asked for it at once, under the search's own id.
+    expect(state.adds).toEqual([
+      {
+        name: "process-lost-taps",
+        data: { accountConnectionId: "account_1", instagramAccountId: IG },
+        opts: expect.objectContaining({
+          jobId: `losttaps_account_1_${LAST_INBOUND.getTime()}_${Date.parse("2026-11-26T10:30:57Z")}`,
+          delay: 0,
+        }),
+      },
+    ]);
+    // Nothing goes out while it is owed.
+    expect(sent).toHaveLength(0);
+    expect((await check(Date.parse("2026-11-26T11:30:00Z"))).mailed).toBe(0);
+
+    // Once it has finished (lost-tap-search.test.ts) the all-clear is due,
+    // and the next sweep sends it with what the search found.
+    Object.assign(account(), {
+      messagingTapSearchFrom: null,
+      messagingTapSearchUntil: null,
+      messagingAllClearDueAt: at("2026-11-26T11:35:00Z"),
+      messagingSilenceResult: {
+        ...result,
+        taps: {
+          v: 1,
+          finishedAt: "2026-11-26T11:35:00.000Z",
+          people: 3,
+          continued: 0,
+          firstJobAt: null,
+          lastJobAt: null,
+          listed: [],
+          noTap: 2,
+          answered: 1,
+          notChecked: 0,
+          reads: 1,
+          gaveUp: false,
+          complete: true,
+        },
+      },
+    });
+    expect((await check(Date.parse("2026-11-26T12:00:00Z"))).mailed).toBe(1);
+    expect(account()).toMatchObject({
+      messagingAllClearDueAt: null,
+      messagingAllClearSentAt: at("2026-11-26T12:00:00Z"),
+    });
     expect(sent.map((message) => message.subject)).toEqual([
       "Entwarnung: Instagram gibt wieder Button-Tipps an OpenReply weiter",
       "Entwarnung: Instagram gibt wieder Button-Tipps an OpenReply weiter",
     ]);
     expect(sent[0].text).toContain(
       "Die Störung dauerte etwa 21 Stunden und 15 Minuten: vom 25.11.2026 um 14:15 Uhr bis zum 26.11.2026 um 11:30 Uhr."
+    );
+    expect(sent[0].text).toContain(
+      "2 Leute haben in dieser Zeit deine erste DM bekommen, aber nicht auf den Button getippt."
     );
     expect(sent[0].text).not.toMatch(FORMAL);
   });
@@ -459,17 +519,42 @@ describe("the end of a silence", () => {
     ).toBe(1);
     expect(account()).toMatchObject({
       messagingSilentSince: null,
-      messagingAllClearDueAt: at("2026-11-26T10:30:57Z"),
+      messagingAllClearDueAt: null,
+      messagingTapSearchFrom: LAST_INBOUND,
+      messagingTapSearchUntil: at("2026-11-26T10:30:57Z"),
       messagingSilenceResult: { via: "webhook", endedAt: "2026-11-26T10:30:57.000Z" },
     });
     expect(events("messaging-back")[0]).toMatchObject({ source: "SYSTEM" });
+    expect(state.adds.map((add) => add.name)).toEqual(["process-lost-taps"]);
     // Nothing open any more: no write at all.
     const quiet = { ...account() };
     const after = reads();
     expect(await endMessagingSilencesFor(payload("read", "p2") as never, [quiet])).toBe(0);
     expect(reads()).toBe(after);
-    // The next sweep sends the all-clear.
-    expect((await check(Date.parse("2026-11-26T11:00:00Z"))).mailed).toBe(1);
+    // The all-clear waits for the search.
+    expect((await check(Date.parse("2026-11-26T11:00:00Z"))).mailed).toBe(0);
+  });
+
+  it("keeps the start of an earlier silence whose search is still owed, and drops an old all-clear", async () => {
+    const earlier = at("2026-11-24T08:00:00Z");
+    await open();
+    Object.assign(account(), {
+      messagingTapSearchFrom: earlier,
+      messagingTapSearchUntil: at("2026-11-24T23:00:00Z"),
+      messagingAllClearDueAt: at("2026-11-24T23:30:00Z"),
+    });
+    inbound(at("2026-11-26T10:30:57Z"), "read", "p2");
+    await check(Date.parse("2026-11-26T11:00:00Z"));
+    expect(account()).toMatchObject({
+      messagingTapSearchFrom: earlier,
+      messagingTapSearchUntil: at("2026-11-26T10:30:57Z"),
+      messagingAllClearDueAt: null,
+      messagingSilenceResult: { since: LAST_INBOUND.toISOString(), endedAt: "2026-11-26T10:30:57.000Z" },
+    });
+    expect(state.adds.map((add) => add.opts.jobId)).toEqual([
+      `losttaps_account_1_${earlier.getTime()}_${Date.parse("2026-11-26T10:30:57Z")}`,
+    ]);
+    expect(sent).toHaveLength(0);
   });
 
   it("forgets a first silent check at the webhook route too", async () => {

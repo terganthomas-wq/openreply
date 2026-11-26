@@ -2,8 +2,9 @@
  * The e-mails about a messaging silence (A2): the alert when the worker's
  * check opens one (lib/instagram/messaging-silence-check.ts), one reminder 24
  * hours later if nothing arrived by then, and the all-clear once something
- * did (lib/instagram/messaging-silence-state.ts). The words are in
- * lib/ops/messaging-silence-email.ts.
+ * did (lib/instagram/messaging-silence-state.ts) and the search for the taps
+ * lost meanwhile has finished (lib/instagram/lost-tap-search.ts), with what
+ * it found. The words are in lib/ops/messaging-silence-email.ts.
  *
  * A1's infrastructure and rules (lib/ops/incident-mail.ts): the same
  * recipients (every owner and admin of the workspace, never members), the
@@ -267,6 +268,7 @@ export async function sendMessagingSilenceAllClear(
         username: account.username,
         since: new Date(result.since),
         endedAt: new Date(result.endedAt),
+        taps: result.taps ?? null,
       }),
     idempotencyKey: (to) =>
       messagingAllClearIdempotencyKey({ accountId: account.id, endedAt: due, to }),

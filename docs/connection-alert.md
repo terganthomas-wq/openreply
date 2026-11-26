@@ -298,18 +298,24 @@ about it once per start in Diagnostics.
 ### State
 
 On `InstagramAccount` (migration `20261127090000_messaging_silence`, which
-also adds the index on `WebhookEvent.createdAt`):
+also adds the index on `WebhookEvent.createdAt`, and
+`20261127120000_messaging_tap_search` for the search for lost taps; both
+additive, NULL for existing rows):
 
 | Column | Meaning |
 | --- | --- |
 | `messagingSilenceCheckAt` | The first silent check of the current run. |
 | `messagingSilentSince` | Open incident: since when nothing arrived. |
-| `messagingSilenceResult` | The last silence that ended: `since`, `endedAt`, `via` (`webhook` or `check`). |
+| `messagingSilenceResult` | The last silence that ended: `since`, `endedAt`, `via` (`webhook` or `check`), and `taps`, what the search for lost taps found, once it has finished. |
 | `messagingAlertSentAt` | When the last warning e-mail about a silence went out, for any silence of the account. |
 | `messagingAlertRearmedAt` | When such a warning went out inside the 24 hours of the last one, after an all-clear. |
 | `messagingAlertCount` | E-mails for the open silence: 1 after the alert, 2 after the reminder. |
-| `messagingAllClearDueAt` | The all-clear of the last silence is still to go out. |
+| `messagingAllClearDueAt` | The all-clear of the last silence is still to go out: set when its search has finished. |
 | `messagingAllClearSentAt` | When the last all-clear about a silence reached an owner or admin. |
+| `messagingTapSearchFrom` | The start of an ended silence whose lost taps are still to be searched (the earlier one, when a search is still owed). Null once the search has run. |
+| `messagingTapSearchUntil` | The end of the last silence that search covers. |
+| `messagingTapSearchClaimedAt` | The lease of the search that runs right now, renewed while it reads; taken over after 10 minutes. |
+| `messagingTapSearchProgress` | How far a search that stopped early got. |
 
 ### The end
 
@@ -324,11 +330,89 @@ have grown too old to count. A reconnect does not end it either; only an
 event that arrives does.
 
 The end is one conditional update that also keeps the silence as
-`messagingSilenceResult` and makes its all-clear due. This is the hook for
-the search for lost taps after a silence (A2 requirement 4): with it, the end
-owes that search instead (from `since`, like A1's `connectionCatchUpFrom`),
-and the search writes the result and makes the all-clear due once it has
-finished (`afterSilence` in `lib/instagram/messaging-silence-state.ts`).
+`messagingSilenceResult` and owes the search for the taps lost in it:
+`messagingTapSearchFrom` is its start (or the start of an earlier silence
+whose search is still owed, like A1's `connectionCatchUpFrom`) and
+`messagingTapSearchUntil` its end. An all-clear of an earlier silence that is
+still owed is dropped: it would only tell old news now. Whoever ended the
+silence asks the worker for the search at once, as the queue job
+`losttaps_<account>_<from>_<until>`; the worker's sweep asks again for a
+search that is owed but neither running nor queued for later.
+
+### The search for lost taps
+
+`lib/instagram/lost-tap-search.ts`, once per silence:
+
+- The people: everyone who got an opening DM in the silence (a `SENT` comment
+  row of a campaign whose DM has a button, sent after `messagingTapSearchFrom`
+  and at the latest at `messagingTapSearchUntil`) of a campaign that still
+  answers taps (active, or paused but sent to this person by hand on the
+  Comments page), and who has no tap or link on record for that campaign
+  since their opening DM (`lib/instagram/lost-tap-records.ts`: a
+  `reveal:<person>` or `dm:<mid>` row written after it, or a stored webhook
+  with their tap on one of the campaign's buttons). Whoever tapped again
+  after the silence was answered the ordinary way. The newest opening DMs
+  first, at most 50 people; the others count as not checked.
+- Their conversations: the account's conversation list
+  (`/{ig-id}/conversations?platform=instagram&fields=id,updated_time,participants`),
+  newest first, 50 per page, each matched by participant id, until everybody
+  is found or a page reaches back before the oldest opening DM still wanted
+  (a conversation with a tap would have moved up); at most 10 pages. Whoever
+  is not found had no conversation that changed after the opening DM: no tap.
+  A page Meta refuses with code 1 (one entry that cannot be read with its
+  participants, docs/conversation-recovery.md) is halved until that entry is
+  alone and then stepped over; a person not found after that counts as not
+  checked. A conversation that did not change after the person's opening DM
+  is not read; every other one is read once (its 20 newest messages).
+- A lost tap is a message from the person (no one else's, never the
+  account's own) whose text is the title of one of the campaign's buttons (the
+  opening DM's, the follow prompt's or the second follow request's, as the
+  worker sends them, 20 characters at most) and that is newer than the
+  person's opening DM of that campaign. Of several, the newest. (A tap shows
+  up in the Conversations API as such a message, verified on 2026-11-26.)
+- It is continued with exactly the postback job the tap would have
+  produced: `payload` rebuilt (`followcheck:<campaign>:open` or
+  `reveal:<campaign>:open`, `followcheck:<campaign>` and
+  `followcheck:<campaign>:retry` for the follow prompts), `mid` the message's
+  id, `tappedAt` its time, `lostTap: true`, job id `losttap_<hash of account,
+  person and mid>`. The oldest tap first, the first right away (at the
+  earliest two minutes after a tap that fresh, whose webhook may still be on
+  its way), then one every 2.5 minutes, in a pace of their own
+  (`pace:taps:<ig>`), so they never wait behind a catch-up's comments. Only
+  while Instagram's 24 hours from the tap leave at least an hour when the job
+  runs; otherwise, and for a campaign paused meanwhile, the person is listed.
+- Exactly once: the job takes the tap's own claim, keyed on its `mid`, so
+  the same tap delivered late by its webhook gets one link. Before it does
+  anything, it stands back if, since the tap, the campaign's link went out to
+  the person, may have or waits for a pause, the campaign answered a DM
+  keyword of theirs, or another tap of theirs on the campaign's buttons
+  arrived: then that answer stands, and nobody gets the link twice. Its
+  copies for an R1 pause and its follow re-checks go on with the same tap.
+  The window, the follow-up and a late offer count from the tap.
+- Meta's limits, as A1's catch-up: nothing is read while the account is
+  paused; a pause, a request limit on a read, Meta reporting 60 % of a limit,
+  three conversation reads in a row refused for the account, or a worker
+  shutdown stops the run where it is, its progress is kept after every read
+  (`messagingTapSearchProgress`) and a delayed job goes on from there. The
+  reads are at least 5 seconds apart (on 2026-11-21 about 25 private replies
+  and 50 conversation reads in one hour ran into Meta's app limit). Nothing is
+  read while the account's connection is lost (A1). After 24 hours of trying
+  it ends with what it has.
+- Once per silence: the job id is the same for every request, the run holds a
+  lease on the account row, and its end is one conditional update that sets
+  `messagingTapSearchFrom` back to null with the result. A second run stands
+  back and looks again when the lease would run out; a run that died is taken
+  over after 10 minutes, and a tap found again is the same job. One more
+  silence that ends while the search is owed is searched with it.
+
+On the production silence of 2026-11-25/26 (the calibration timeline,
+`__tests__/lost-tap-search.test.ts`): five people got an opening DM in it,
+between 20:49 UTC and 10:04 UTC. The one whose tap at 10:30:57 ended it got
+the link a second later and is left alone. The other four are found with one
+page of the list, and only the conversations that changed after the opening
+DM are read: five reads at most. Every tap of that silence came after 20:49,
+so each still had more than ten hours of its 24 when the silence ended, and
+each would have been continued.
 
 ### The e-mails and the dashboard
 
@@ -348,9 +432,12 @@ default for Instagram under "Conversation routing" in the Business Suite) and
 the fix with the link to `{NEXTAUTH_URL}/settings`.
 
 The all-clear ("Instagram passes button taps on to OpenReply again") goes
-out with the sweep after the end: how long the silence lasted, and that taps
-in that time got nothing. It is dropped when it could not go out within 24
-hours, or once a silence or a lost connection is open again.
+out when the search for lost taps has finished: how long the silence lasted,
+how many lost taps go on now, the people it was too late for or whose
+campaign is paused (name, campaign and time of the tap; the owner is asked to
+write to them in Instagram), how many got the opening DM without tapping,
+and how many could not be looked at. It is dropped when it could not go out
+within 24 hours, or once a silence or a lost connection is open again.
 
 - A banner above every dashboard page, "Instagram is not passing on button
   taps", with since when, what it means, the causes and "Reconnect" (members
@@ -358,8 +445,10 @@ hours, or once a silence or a lost connection is open again.
   is lost, only the lost connection is shown.
 - Settings shows "Messages not arriving" instead of "Connected", and the
   account's notice with since when, the causes and the fix.
-- Diagnostics lists the open silence with the e-mail, the last silence for 7
-  days after it ended, and names the events in the reader's language.
+- Diagnostics lists the open silence with the e-mail, and the last silence
+  for 7 days after it ended: from when to when and how long, while its search
+  runs that it runs, then what it found as in the all-clear. It names the
+  events in the reader's language.
 - `/api/health` reports it in `checks.instagram`: `"status": "degraded"` and
   `silences: [{ account, since, reason: "messaging-silence", alertSentAt }]`,
   next to A1's `incidents`. The HTTP status and the top-level `status` stay as

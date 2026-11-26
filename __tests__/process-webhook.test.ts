@@ -25,6 +25,7 @@ vi.mock("@/lib/queue/client", () => ({
   COMMENT_JOB_NAME: "process-comment",
   POSTBACK_JOB_NAME: "process-postback",
   MESSAGE_JOB_NAME: "process-message",
+  LOST_TAP_SEARCH_JOB_NAME: "process-lost-taps",
 }));
 
 import { processInstagramWebhook } from "../lib/queue/process-webhook";
@@ -317,7 +318,7 @@ describe("inbound messaging events and the messaging silence", () => {
       mockPrisma.instagramAccount.updateMany.mock.invocationCallOrder[0]
     );
     expect(mockPrisma.instagramAccount.updateMany).toHaveBeenCalledWith({
-      where: { id: "account_row_1", messagingSilentSince: SILENT_SINCE },
+      where: { id: "account_row_1", messagingSilentSince: SILENT_SINCE, messagingTapSearchFrom: null },
       data: {
         messagingSilentSince: null,
         messagingSilenceCheckAt: null,
@@ -328,9 +329,22 @@ describe("inbound messaging events and the messaging silence", () => {
           endedAt: ARRIVED.toISOString(),
           via: "webhook",
         },
-        messagingAllClearDueAt: ARRIVED,
+        // The search for the taps lost in the silence is owed; the all-clear
+        // waits for it.
+        messagingTapSearchFrom: SILENT_SINCE,
+        messagingTapSearchUntil: ARRIVED,
+        messagingAllClearDueAt: null,
       },
     });
+    // The worker is asked for that search right away.
+    expect(queueAdd).toHaveBeenCalledWith(
+      "process-lost-taps",
+      { accountConnectionId: "account_row_1", instagramAccountId: ACCOUNT },
+      expect.objectContaining({
+        jobId: `losttaps_account_row_1_${SILENT_SINCE.getTime()}_${ARRIVED.getTime()}`,
+        delay: 0,
+      })
+    );
     // The tap itself is handled as always.
     expect(queueAdd).toHaveBeenCalledWith("process-postback", expect.objectContaining({ userId: READER }), expect.anything());
   });

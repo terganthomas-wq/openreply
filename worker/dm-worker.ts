@@ -9,6 +9,10 @@ import {
   resumeConnectionCatchUps,
   stopConnectionCatchUps,
 } from "@/lib/instagram/connection-catch-up";
+import {
+  resumeLostTapSearches,
+  stopLostTapSearches,
+} from "@/lib/instagram/lost-tap-search";
 import os from "node:os";
 
 // A WARNING in Diagnostics once a Meta response reports 80 % of a request
@@ -80,6 +84,20 @@ async function poll() {
     console.error("[DM Worker] Messaging silence check failed:", message);
   }
 
+  // A2: the search for the taps a silence swallowed, owed but neither running
+  // nor queued (its request was lost, or the worker restarted), is asked for
+  // again. No Meta call here; the search itself runs as a queue job
+  // (lib/instagram/lost-tap-search.ts).
+  try {
+    const searches = await resumeLostTapSearches();
+    if (searches.requested > 0) {
+      console.log("[DM Worker] Search for lost taps:", searches);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    console.error("[DM Worker] Lost-tap search look failed:", message);
+  }
+
   // A1: a catch-up of missed comments that is owed but neither running nor
   // queued (its request was lost, or the worker restarted) is asked for
   // again, and an all-clear e-mail still owed goes out. No Meta call here;
@@ -114,9 +132,11 @@ async function shutdown(signal: string) {
   console.log(`[DM Worker] ${signal} received, closing worker`);
   clearInterval(heartbeatTimer);
   clearInterval(pollTimer);
-  // A catch-up that reads stops before its next read and queues the rest for
-  // a minute later, so the shutdown does not wait for its reads.
+  // A catch-up or a search for lost taps that reads stops before its next
+  // read and queues the rest for a minute later, so the shutdown does not
+  // wait for its reads.
   stopConnectionCatchUps();
+  stopLostTapSearches();
   await worker.close();
   process.exit(0);
 }

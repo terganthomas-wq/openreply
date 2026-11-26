@@ -60,6 +60,8 @@ import {
   runConnectionCatchUp,
 } from "@/lib/instagram/connection-catch-up";
 import { classifyConnectionError } from "@/lib/instagram/connection-check";
+import { lostTapAnswered } from "@/lib/instagram/lost-tap-records";
+import { runLostTapSearch } from "@/lib/instagram/lost-tap-search";
 import { recentAccountUsagePercent } from "@/lib/meta/usage";
 import { createHash } from "node:crypto";
 import { UnrecoverableError, Worker, type Job } from "bullmq";
@@ -68,6 +70,7 @@ import {
   getRedisConnection,
   CATCH_UP_JOB_NAME,
   COMMENT_JOB_NAME,
+  LOST_TAP_SEARCH_JOB_NAME,
   MESSAGE_JOB_NAME,
   POSTBACK_JOB_NAME,
   FOLLOWUP_JOB_NAME,
@@ -75,6 +78,7 @@ import {
   type DmQueueJob,
   type ProcessCatchUpJob,
   type ProcessCommentJob,
+  type ProcessLostTapSearchJob,
   type ProcessMessageJob,
   type ProcessOfferJob,
   type ProcessPostbackJob,
@@ -1922,6 +1926,29 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     if (answeredByDm) return;
   }
 
+  // A2: a tap that a messaging silence swallowed, which the search after it
+  // found in the conversation (lib/instagram/lost-tap-search.ts). Since then
+  // the person may have tapped again, or got the link another way (a read
+  // fallback, a DM keyword, this very tap delivered late after all): that
+  // answer stands and this job sends nothing, so nobody gets the link twice
+  // (lib/instagram/lost-tap-records.ts). Its copies for a pause and its
+  // follow re-checks continue it and are not asked again.
+  if (job.data.lostTap && !job.data.pauseRequeue && !job.data.followRecheck) {
+    const answered = await lostTapAnswered({
+      instagramId: instagramAccountId,
+      automationId: automation.id,
+      userId,
+      tappedAt: tapTime(job),
+      mid: job.data.mid ?? null,
+    });
+    if (answered) {
+      console.log(
+        `[DM Worker] Lost tap ${job.id} was answered meanwhile (${answered}): nothing sent`
+      );
+      return;
+    }
+  }
+
   let accessToken: InstagramContext;
   try {
     accessToken = await createInstagramContext(
@@ -3152,6 +3179,16 @@ async function dispatchJob(job: Job<DmQueueJob>): Promise<void> {
       (job as Job<ProcessCatchUpJob>).data.accountConnectionId
     );
     console.log(`[DM Worker] Catch-up ${job.id}: ${outcome}`);
+    return;
+  }
+  // The search for lost taps after a messaging silence (A2): it reads the
+  // conversations of the people who got an opening DM in the silence and
+  // queues the postback job of each tap it finds; it sends nothing itself.
+  if (job.name === LOST_TAP_SEARCH_JOB_NAME) {
+    const outcome = await runLostTapSearch(
+      (job as Job<ProcessLostTapSearchJob>).data.accountConnectionId
+    );
+    console.log(`[DM Worker] Lost-tap search ${job.id}: ${outcome}`);
     return;
   }
   // Every other name used to fall through to processComment. A job type this

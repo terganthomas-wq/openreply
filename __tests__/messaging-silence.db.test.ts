@@ -6,7 +6,8 @@
  * the links a tap delivered, and the guarantees in the where clauses hold on
  * the real tables: two checks at once open one incident and send one e-mail
  * per person, an inbound event at the webhook route wins over a check that
- * would open the incident, and a silence's end keeps it for the all-clear.
+ * would open the incident, and a silence's end keeps it for the all-clear
+ * and owes the search for its lost taps (lost-tap-search.db.test.ts runs it).
  *
  * Redis (the R1 pause) is an in-memory stand-in and the mail transport
  * records what it is given. Skipped without TEST_DATABASE_URL; each run builds
@@ -35,6 +36,7 @@ vi.mock("@/lib/queue/client", () => ({
   getRedisConnection: () => state.redis,
   getDMQueue: () => ({ add: vi.fn() }),
   CATCH_UP_JOB_NAME: "process-catch-up",
+  LOST_TAP_SEARCH_JOB_NAME: "process-lost-taps",
 }));
 
 import {
@@ -147,7 +149,7 @@ describe.skipIf(!databaseUrl)("the messaging silence check on Postgres", () => {
       .map((entry) => entry.name)
       .sort((a, b) => a.localeCompare(b));
     expect(dirs).toContain(MIGRATION);
-    expect(dirs.at(-1)).toBe(MIGRATION);
+    // The later migrations add other columns: applied before this one.
     for (const name of dirs.filter((name) => name !== MIGRATION)) {
       await sql.query(readFileSync(path.join(root, name, "migration.sql"), "utf8"));
     }
@@ -346,17 +348,21 @@ describe.skipIf(!databaseUrl)("the messaging silence check on Postgres", () => {
     expect(opened).toHaveLength(1);
     expect(opened[0].payload).toMatchObject({ kind: "messaging-silent", since: LAST_INBOUND.toISOString(), people: 3 });
 
-    // A tap at the webhook route ends it, and keeps it for the all-clear.
+    // A tap at the webhook route ends it, keeps it for the all-clear and
+    // owes the search for the taps lost in it. (The route stored it first.)
+    await webhook("2026-11-26T10:30:57.000Z", { id: IG, messaging: [item("postback", "p1")] });
     const ended = await endMessagingSilence("account_db", {
       via: "webhook",
       at: new Date("2026-11-26T10:30:57.000Z"),
     });
-    expect(ended).toMatchObject({ since: LAST_INBOUND, via: "webhook" });
+    expect(ended).toMatchObject({ since: LAST_INBOUND, via: "webhook", searchFrom: LAST_INBOUND });
     expect(await account()).toMatchObject({
       messagingSilentSince: null,
       messagingSilenceCheckAt: null,
       messagingAlertCount: 0,
-      messagingAllClearDueAt: new Date("2026-11-26T10:30:57.000Z"),
+      messagingAllClearDueAt: null,
+      messagingTapSearchFrom: LAST_INBOUND,
+      messagingTapSearchUntil: new Date("2026-11-26T10:30:57.000Z"),
       messagingSilenceResult: {
         v: 1,
         since: LAST_INBOUND.toISOString(),
@@ -366,11 +372,22 @@ describe.skipIf(!databaseUrl)("the messaging silence check on Postgres", () => {
     });
     expect(await endMessagingSilence("account_db", { via: "check", at: new Date() })).toBeNull();
 
+    // The all-clear waits for the search; once it has finished, the next
+    // sweep sends it, once.
     sent = [];
-    expect((await check(Date.parse("2026-11-26T11:00:00.000Z"))).mailed).toBe(1);
+    expect((await check(Date.parse("2026-11-26T11:00:00.000Z"))).mailed).toBe(0);
+    await state.db.instagramAccount.update({
+      where: { id: "account_db" },
+      data: {
+        messagingTapSearchFrom: null,
+        messagingTapSearchUntil: null,
+        messagingAllClearDueAt: new Date("2026-11-26T11:05:00.000Z"),
+      },
+    });
+    expect((await check(Date.parse("2026-11-26T11:30:00.000Z"))).mailed).toBe(1);
     expect(sent).toHaveLength(2);
     expect((await account()).messagingAllClearDueAt).toBeNull();
-    expect((await check(Date.parse("2026-11-26T11:30:00.000Z"))).mailed).toBe(0);
+    expect((await check(Date.parse("2026-11-26T12:00:00.000Z"))).mailed).toBe(0);
   });
 
   it("lets an inbound event at the webhook route win over a check that would open the incident", async () => {

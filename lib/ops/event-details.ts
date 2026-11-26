@@ -37,6 +37,8 @@ export const MESSAGING_BACK_EVENT = "messaging-back";
 export const MESSAGING_ALERT_EVENT = "messaging-alert";
 /** A2: the all-clear e-mail after a silence went out. */
 export const MESSAGING_ALL_CLEAR_EVENT = "messaging-all-clear";
+/** A2: the search for lost taps after a silence finished (lib/instagram/lost-tap-search.ts). */
+export const MESSAGING_TAP_SEARCH_EVENT = "messaging-tap-search";
 
 export type EventDetail =
   | { kind: typeof META_PAUSE_EVENT; resumeAt: string; account: string | null }
@@ -66,7 +68,14 @@ export type EventDetail =
       recipients: number;
       reminder: boolean;
     }
-  | { kind: typeof MESSAGING_ALL_CLEAR_EVENT; account: string | null; recipients: number };
+  | { kind: typeof MESSAGING_ALL_CLEAR_EVENT; account: string | null; recipients: number }
+  | {
+      kind: typeof MESSAGING_TAP_SEARCH_EVENT;
+      account: string | null;
+      continued: number;
+      listed: number;
+      noTap: number;
+    };
 
 function text(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
@@ -139,6 +148,16 @@ export function eventDetail(payload: unknown): EventDetail | null {
     case MESSAGING_ALL_CLEAR_EVENT:
       return isCount(p.recipients) && p.recipients > 0
         ? { kind: MESSAGING_ALL_CLEAR_EVENT, account, recipients: p.recipients }
+        : null;
+    case MESSAGING_TAP_SEARCH_EVENT:
+      return isCount(p.continued) && isCount(p.listed) && isCount(p.noTap)
+        ? {
+            kind: MESSAGING_TAP_SEARCH_EVENT,
+            account,
+            continued: p.continued,
+            listed: p.listed,
+            noTap: p.noTap,
+          }
         : null;
     default:
       return null;

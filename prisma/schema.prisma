@@ -252,11 +252,30 @@ model InstagramAccount {
   /// E-mails for the open silence: 1 after the alert, 2 after the one
   /// reminder. Back to 0 when a silence starts or ends.
   messagingAlertCount     Int       @default(0)
-  /// The all-clear e-mail of the last silence is still to go out: when that
-  /// silence ended. Null once it went out or was given up.
+  /// The all-clear e-mail of the last silence is still to go out: when the
+  /// search for its lost taps finished. Null once it went out or was given up.
   messagingAllClearDueAt  DateTime?
   /// When the last all-clear about a silence reached an owner or admin.
   messagingAllClearSentAt DateTime?
+
+  // The search for lost taps after a silence (A2, lib/instagram/lost-tap-search.ts):
+  // once the silence is over, the worker reads the conversations of the people
+  // who got an opening DM in it, finds the button taps Instagram swallowed and
+  // continues those flows; its result goes into messagingSilenceResult, and
+  // the all-clear is due once it has finished.
+
+  /// The start of an ended silence whose lost taps are still to be searched
+  /// (its messagingSilentSince; the earlier one, if a search is still owed).
+  /// The search sets it back to null once it has run.
+  messagingTapSearchFrom      DateTime?
+  /// The end of the last silence that search covers: opening DMs up to here.
+  messagingTapSearchUntil     DateTime?
+  /// Held by the search that runs right now, renewed while it reads. Another
+  /// run takes over only once it is 10 minutes old (a worker that died).
+  messagingTapSearchClaimedAt DateTime?
+  /// How far a search that stopped early got (an R1 pause, Meta's usage, a
+  /// worker restart), so the next run continues there. Null otherwise.
+  messagingTapSearchProgress  Json?
 
   workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   automations Automation[]

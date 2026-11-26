@@ -22,6 +22,9 @@
  *   (lib/polling/comment-reconciler.ts).
  * - Manual sends (lib/comments/server.ts) have a pace of their own, so they
  *   never wait behind hours of catch-up.
+ * - So do the taps the search after a messaging silence continues
+ *   (lib/instagram/lost-tap-search.ts): Instagram's 24 hours from a tap run
+ *   out long before a catch-up's 7 days for a comment.
  */
 
 import { getRedisConnection } from "./client";
@@ -86,4 +89,9 @@ export function recoveryPaceKey(instagramId: string): string {
 /** The manual sends' pace of an account. */
 export function manualSendPaceKey(instagramId: string): string {
   return `pace:manual:${instagramId}`;
+}
+
+/** The pace of the lost taps an account's search after a messaging silence continues. */
+export function lostTapPaceKey(instagramId: string): string {
+  return `pace:taps:${instagramId}`;
 }

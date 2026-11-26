@@ -11,6 +11,7 @@ import StatusBadge from "@/components/status-badge";
 import ConnectionCatchUpReport from "@/components/connection-catch-up";
 import { ReconnectButton } from "@/components/connection-incident";
 import { MESSAGING_SILENCE_TEXT } from "@/components/messaging-silence";
+import MessagingSilenceReports from "@/components/messaging-silence-report";
 import type { MessagingSilenceReport } from "@/lib/instagram/messaging-silence-incident";
 import { catchUpEventText, type CatchUpReport } from "@/lib/instagram/catch-up-report";
 import {
@@ -217,6 +218,18 @@ function eventMessage(
             count: detail.recipients,
           })
         : event.message;
+    case "messaging-tap-search":
+      return detail.account
+        ? t(
+            "Search for lost button taps of @{account} done: {continued} continued, {listed} could not be continued, {noTap} without a tap.",
+            {
+              account: detail.account,
+              continued: detail.continued,
+              listed: detail.listed,
+              noTap: detail.noTap,
+            }
+          )
+        : event.message;
     default:
       return event.message;
   }
@@ -392,34 +405,7 @@ export default function DiagnosticsPage() {
       ) : null}
 
       {data?.endedMessagingSilences?.length ? (
-        <section className="panel rounded p-4 sm:p-6">
-          <h2 className="text-base font-semibold text-foreground">
-            {t("After the missing button taps")}
-          </h2>
-          <ul className="mt-3 space-y-3 text-sm text-foreground">
-            {data.endedMessagingSilences.map((report) => (
-              <li key={report.accountId} className="min-w-0 break-words">
-                <p className="font-semibold">
-                  {t("@{account}: button taps arrive again since {time}", {
-                    account: report.username,
-                    time: formatIncidentTime(report.endedAt, locale),
-                  })}
-                </p>
-                <p className="mt-0.5 text-muted">
-                  {t("No button taps, DMs or read receipts arrived from {from} to {to}.", {
-                    from: formatIncidentTime(report.since, locale),
-                    to: formatIncidentTime(report.endedAt, locale),
-                  })}
-                </p>
-              </li>
-            ))}
-          </ul>
-          <p className="mt-3 text-sm text-muted">
-            {t(
-              "Whoever tapped the button in your first DM in that time got nothing: the tap did not reach OpenReply. In Instagram such a tap shows in the conversation as a message with the button's text."
-            )}
-          </p>
-        </section>
+        <MessagingSilenceReports reports={data.endedMessagingSilences} />
       ) : null}
 
       {data?.accountPauses.length ? (
