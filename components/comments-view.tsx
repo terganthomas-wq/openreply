@@ -13,6 +13,7 @@
 
 import { useEffect, useState } from "react";
 import AccountSelect, { type AccountOption } from "@/components/account-select";
+import { ReconnectButton } from "@/components/connection-incident";
 import {
   COMMENTS_MAX_POSTS,
   COMMENTS_PAGE_POSTS,
@@ -34,6 +35,7 @@ import {
 } from "@/lib/comments/view";
 import type { I18n } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
+import { formatIncidentTime } from "@/lib/instagram/connection-incident";
 
 // How often, and how long, the page asks for a send's outcome.
 const POLL_INTERVAL_MS = 3_000;
@@ -72,6 +74,8 @@ export function blockText(
       return t("A DM for this comment already went out. Instagram allows only one per comment.");
     case "too-old":
       return t("Older than 7 days: Instagram no longer allows a DM.");
+    case "connection-lost":
+      return t("The connection to Instagram is lost. Reconnect first.");
     case "paused":
       return t("Sending paused until {time}: Instagram limit reached.", {
         time: formatClock(block.until, locale),
@@ -116,6 +120,8 @@ export function refusalText(
       return t("This campaign no longer exists. Reload the page.");
     case "provider":
       return t("Sending by hand needs an account connected with your own Meta app.");
+    case "connection_lost":
+      return t("The connection to Instagram is lost. Reconnect first.");
     case "worker_outdated":
       return t("The sending service is not updated yet. Try again later.");
     case "rate_limited":
@@ -176,6 +182,8 @@ export interface CommentCardProps {
   /** A refused send or a send without an outcome, in the reader's words. */
   notice: string | null;
   pausedUntil: string | null;
+  /** Since when the account's connection is lost (A1); null while it works. */
+  connectionLostAt?: string | null;
   /** The answer's time (ms): ages and the 7 days count from it. */
   now: number;
   onCampaignChange: (campaignId: string) => void;
@@ -192,6 +200,7 @@ export function CommentCard({
   sending,
   notice,
   pausedUntil,
+  connectionLostAt = null,
   now,
   onCampaignChange,
   onPublicReplyChange,
@@ -200,7 +209,14 @@ export function CommentCard({
   const i18n = useI18n();
   const { t, locale } = i18n;
   const campaign = campaigns.find((option) => option.id === campaignId) ?? null;
-  const block = sendBlock({ row, campaignId, pausedUntil, sending, now });
+  const block = sendBlock({
+    row,
+    campaignId,
+    pausedUntil,
+    connectionLostAt,
+    sending,
+    now,
+  });
   const reason = block ? blockText(block, i18n) : null;
   // Nothing to choose any more once the DM is out or the 7 days are over.
   const settled = block?.kind === "sent" || block?.kind === "too-old";
@@ -318,6 +334,7 @@ export function CommentCard({
       )}
 
       {reason && <p className="text-xs text-muted">{reason}</p>}
+      {block?.kind === "connection-lost" && <ReconnectButton />}
       {notice && (
         <p role="status" className="text-xs text-error">
           {notice}
@@ -359,6 +376,9 @@ export default function CommentsView() {
   // Comments sent from here stay in "Ohne DM" until the next load.
   const [touched, setTouched] = useState<Record<string, true>>({});
   const [pollTick, setPollTick] = useState(0);
+  // A send refused because the connection is lost (A1), before the page
+  // itself knew.
+  const [lostSince, setLostSince] = useState<string | null>(null);
 
   const currentKey = requestKey(accountId, posts, reloads);
   const loading = loadedKey !== currentKey;
@@ -396,9 +416,10 @@ export default function CommentsView() {
         if (!payload?.success) return setFailure("error");
         setFailure(null);
         setData(payload.data as CommentsPageData);
-        // The fresh list has the newest statuses.
+        // The fresh list has the newest statuses, and the connection's state.
         setStatuses({});
         setTouched({});
+        setLostSince(null);
       })
       .catch(() => {
         if (active) setFailure("error");
@@ -504,6 +525,13 @@ export default function CommentsView() {
         const status = payload.status as CommentStatus;
         setStatuses((map) => ({ ...map, [row.id]: status }));
       }
+      if (payload?.reason === "connection_lost") {
+        setLostSince(
+          typeof payload.connectionLostAt === "string"
+            ? payload.connectionLostAt
+            : new Date().toISOString()
+        );
+      }
       setNotices((map) => ({
         ...map,
         [row.id]: refusalText(payload?.reason, payload?.pausedUntil, i18n),
@@ -537,6 +565,7 @@ export default function CommentsView() {
   }
 
   const now = data ? Date.parse(data.generatedAt) : 0;
+  const connectionLostAt = data?.connectionLostAt ?? lostSince;
   const rows = (data?.comments ?? []).map((row) => withStatus(row, statuses[row.id]));
   const shown = rows.filter(
     (row) => filter === "all" || !row.delivery || touched[row.id]
@@ -572,6 +601,20 @@ export default function CommentsView() {
         )}
       </div>
 
+      {connectionLostAt && (
+        <div
+          role="status"
+          className="space-y-3 rounded border border-error/20 bg-error/10 px-4 py-3 text-sm text-error"
+        >
+          <p>
+            {t(
+              "The connection to Instagram has been lost since {time}. Reconnect, then you can send DMs here again.",
+              { time: formatIncidentTime(connectionLostAt, i18n.locale) }
+            )}
+          </p>
+          <ReconnectButton />
+        </div>
+      )}
       {data?.pausedUntil && (
         <p role="status" className={NOTICE}>
           {t("Sending paused until {time}: Instagram limit reached. The comments load again after that.", {
@@ -604,7 +647,7 @@ export default function CommentsView() {
         </div>
       ) : !data ? (
         <div className="panel h-64 rounded" aria-busy="true" />
-      ) : data.pausedUntil ? null : shown.length === 0 ? (
+      ) : data.pausedUntil || data.connectionLostAt ? null : shown.length === 0 ? (
         <div className="panel rounded p-8 text-center">
           <p className="text-sm text-muted">
             {filter === "without-dm"
@@ -627,6 +670,7 @@ export default function CommentsView() {
                 sending={Boolean(pending[row.id] || starting[row.id])}
                 notice={notices[row.id] ?? null}
                 pausedUntil={data.pausedUntil}
+                connectionLostAt={connectionLostAt}
                 now={now}
                 onCampaignChange={(id) =>
                   setChoices((map) => ({ ...map, [row.id]: id }))
@@ -644,7 +688,7 @@ export default function CommentsView() {
         </ul>
       )}
 
-      {data && data.hasMore && !data.pausedUntil && posts < COMMENTS_MAX_POSTS && (
+      {data && data.hasMore && !data.pausedUntil && !connectionLostAt && posts < COMMENTS_MAX_POSTS && (
         <div className="text-center">
           <button
             type="button"

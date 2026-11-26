@@ -73,6 +73,11 @@ export interface CommentsPageData {
   account: { id: string; username: string };
   /** The account's sending is paused for a Meta request limit until then. */
   pausedUntil: string | null;
+  /**
+   * Since when the account's connection is lost (A1): nothing is read from
+   * Instagram and nothing can be sent until it is reconnected.
+   */
+  connectionLostAt: string | null;
   campaigns: CampaignOption[];
   /** Newest first; only comments within the 7-day private-reply window. */
   comments: CommentRow[];
@@ -92,6 +97,7 @@ export type SendBlock =
   | { kind: "sent" }
   | { kind: "sending" }
   | { kind: "too-old" }
+  | { kind: "connection-lost" }
   | { kind: "paused"; until: string }
   | { kind: "attempts" }
   | { kind: "no-campaign" };
@@ -121,19 +127,22 @@ export function defaultPublicReply(row: CommentRow): boolean {
 /**
  * Why the row cannot be sent right now. In this order: its DM went out or
  * may have (Instagram allows one per comment), the 7 days are over, the
- * account is paused for a Meta limit, a send is under way, no campaign is
- * chosen, the chosen campaign used up its attempts for this comment.
+ * account's connection is lost (A1: reconnect first), the account is paused
+ * for a Meta limit, a send is under way, no campaign is chosen, the chosen
+ * campaign used up its attempts for this comment.
  */
 export function sendBlock({
   row,
   campaignId,
   pausedUntil,
+  connectionLostAt = null,
   sending,
   now,
 }: {
   row: CommentRow;
   campaignId: string;
   pausedUntil: string | null;
+  connectionLostAt?: string | null;
   sending: boolean;
   now: number;
 }): SendBlock | null {
@@ -141,6 +150,7 @@ export function sendBlock({
     return row.delivery.state === "sending" ? { kind: "sending" } : { kind: "sent" };
   }
   if (!withinPrivateReplyWindow(row.timestamp, now)) return { kind: "too-old" };
+  if (connectionLostAt) return { kind: "connection-lost" };
   if (pausedUntil && Date.parse(pausedUntil) > now) {
     return { kind: "paused", until: pausedUntil };
   }

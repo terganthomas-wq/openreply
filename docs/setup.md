@@ -103,10 +103,10 @@ Copy `.env.example` to `.env` for local work, or set these in Vercel and Railway
 | `ENCRYPTION_KEY` | 32-byte hex. `openssl rand -hex 32`. Encrypts provider credentials and Instagram tokens. Identical across web and worker. |
 | `DATABASE_URL` | PostgreSQL connection string. Public Railway URL on Vercel; internal on the worker. |
 | `REDIS_URL` | Redis connection string. Must support blocking commands, so an HTTP-only Redis will not work with BullMQ. |
-| `RESEND_API_KEY` | Resend key. Login is email magic links only, so without this nobody can sign in. |
-| `EMAIL_FROM` | A sender on a domain you verified in Resend. The placeholder will not deliver. |
+| `RESEND_API_KEY` | Resend key. Login is email magic links only, so without this nobody can sign in. Set it on the worker too: the worker e-mails the owners when an Instagram connection is lost ([connection alert](connection-alert.md)). |
+| `EMAIL_FROM` | A sender on a domain you verified in Resend. The placeholder will not deliver. Also on the worker, for the connection alert. |
 | `ALLOWED_EMAILS` | Optional. Comma-separated allowlist of addresses that may sign in, case insensitive. Unset, anyone who reaches your public URL can request a magic link and gets their own workspace, which is worth closing on an instance you run for yourself. |
-| `EMAIL_SERVER` | Optional. An SMTP URL, for example `smtps://login%40example.com:password@mail.example.com:465`. Set it to send magic links through your own mail server instead of Resend; then `RESEND_API_KEY` is not needed. URL-encode special characters in the user and password (`@` becomes `%40`). Port 465 with `smtps://` is implicit TLS, port 587 with `smtp://` is STARTTLS. |
+| `EMAIL_SERVER` | Optional. An SMTP URL, for example `smtps://login%40example.com:password@mail.example.com:465`. Set it to send magic links through your own mail server instead of Resend; then `RESEND_API_KEY` is not needed. URL-encode special characters in the user and password (`@` becomes `%40`). Port 465 with `smtps://` is implicit TLS, port 587 with `smtp://` is STARTTLS. Set on the worker as well, the connection alert goes out through it too. |
 | `BLOB_READ_WRITE_TOKEN` | Optional, web app only. Lets the offer editor upload card images to Vercel Blob. A Blob store connected to the Vercel project sets it; redeploy afterwards. Unset, the editor asks for a link to the image instead. See [docs/offers.md](offers.md#the-card-image). |
 
 **Direct Meta only.** Leave these unset if all accounts use Zernio:
@@ -317,7 +317,7 @@ Meta's `/me` returns two IDs. The `id` field is app-scoped. The `user_id` field 
 4. From a different Instagram account, comment `TEST` on that post. It must be a different account, because OpenReply ignores your own comments on purpose.
 5. Watch for the DM. If nothing arrives, check the DM Logs page and `/api/health`.
 
-Hit `/api/health` any time. It reports the database, Redis, queue, and worker heartbeat. If `worker.healthy` is false, the worker is not running or cannot reach Redis, and no DM will send even though webhooks are being received.
+Hit `/api/health` any time. It reports the database, Redis, queue, and worker heartbeat. If `worker.healthy` is false, the worker is not running or cannot reach Redis, and no DM will send even though webhooks are being received. `checks.instagram` is `degraded` while an account's connection is lost ([connection alert](connection-alert.md)); it does not change the HTTP status.
 
 If you want to inspect where a comment stopped, the Postgres tables tell you: `WebhookEvent` for delivery, `DmLog` for send status and errors, `OperationalEvent` for worker crashes and the polling reconciler's sweep logs.
 

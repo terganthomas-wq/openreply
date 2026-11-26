@@ -3,6 +3,7 @@ import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
 import { getBaseUrl, isUnifiedLogin, requireEnv } from "@/lib/env";
 import { canConnectInstagramAccount } from "@/lib/instagram-accounts";
+import { clearConnectionIncident } from "@/lib/instagram/connection-state";
 import {
   getAssignedInstagramAccounts,
   getLongLivedToken,
@@ -131,6 +132,18 @@ export async function GET(request: NextRequest) {
           where: { id: existing.id, workspaceId: state.workspaceId, provider: 'META' }, data,
         });
         if (!updated.count) continue;
+        // A1: the reconnect ends a lost-connection incident at once (and
+        // forgets a single failed check); its start stays for the catch-up
+        // of the missed comments (lib/instagram/connection-state.ts). Never
+        // fails the connect: the worker's next check would end it as well.
+        await clearConnectionIncident(existing.id, { via: "reconnect" }).catch(
+          (clearError) => {
+            console.error(
+              "[Instagram Callback] Could not end the connection incident:",
+              clearError instanceof Error ? clearError.message : clearError
+            );
+          }
+        );
       } else {
         await prisma.instagramAccount.create({ data: { ...data, workspaceId: state.workspaceId, instagramId, provider: 'META' } });
       }

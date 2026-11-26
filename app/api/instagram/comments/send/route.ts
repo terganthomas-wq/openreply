@@ -95,6 +95,9 @@ export async function POST(request: NextRequest) {
   if (!result.ok) {
     return fail(result.status, result.reason, result.error, {
       ...(result.pausedUntil ? { pausedUntil: result.pausedUntil } : {}),
+      ...(result.connectionLostAt
+        ? { connectionLostAt: result.connectionLostAt }
+        : {}),
       ...(result.commentStatus ? { status: result.commentStatus } : {}),
     });
   }

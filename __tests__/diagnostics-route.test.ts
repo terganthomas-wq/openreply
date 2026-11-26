@@ -96,7 +96,15 @@ describe("Diagnostics and Meta's request limits", () => {
     ]);
     expect(mockPrisma.instagramAccount.findMany).toHaveBeenCalledWith({
       where: { workspaceId: "workspace" },
-      select: { instagramId: true, username: true },
+      select: {
+        instagramId: true,
+        username: true,
+        // A1: the lost-connection incident of each account.
+        connectionLostAt: true,
+        connectionLostReason: true,
+        connectionAlertSentAt: true,
+        connectionAlertCount: true,
+      },
     });
   });
 
@@ -172,6 +180,98 @@ describe("Diagnostics and Meta's request limits", () => {
     workspaceContext.mockResolvedValue(null);
     expect((await GET()).status).toBe(401);
     expect(mockPrisma.serviceKey.findMany).not.toHaveBeenCalled();
+  });
+});
+
+// A1: accounts whose connection Meta dropped, from the worker's check.
+describe("Diagnostics and a lost Instagram connection", () => {
+  it("lists no incident while every connection works", async () => {
+    expect((await diagnostics()).connectionIncidents).toEqual([]);
+  });
+
+  it("lists each open incident: since when, why, Meta's code and the e-mail", async () => {
+    mockPrisma.instagramAccount.findMany.mockResolvedValue([
+      {
+        instagramId: "ig_1",
+        username: "studio",
+        connectionLostAt: new Date("2026-11-21T11:45:00.000Z"),
+        connectionLostReason: "missing (Meta 100/33)",
+        connectionAlertSentAt: new Date("2026-11-21T12:15:00.000Z"),
+        connectionAlertCount: 1,
+      },
+      {
+        instagramId: "ig_2",
+        username: "other",
+        connectionLostAt: new Date("2026-11-21T12:30:00.000Z"),
+        connectionLostReason: "token (Meta 190)",
+        // An e-mail about an earlier incident: none about this one yet.
+        connectionAlertSentAt: new Date("2026-11-21T02:00:00.000Z"),
+        connectionAlertCount: 0,
+      },
+      {
+        instagramId: "ig_3",
+        username: "fine",
+        connectionLostAt: null,
+        connectionLostReason: null,
+        connectionAlertSentAt: null,
+        connectionAlertCount: 0,
+      },
+    ]);
+
+    const data = await diagnostics();
+    expect(data.connectionIncidents).toEqual([
+      {
+        username: "studio",
+        since: "2026-11-21T11:45:00.000Z",
+        reason: "missing",
+        code: "Meta 100/33",
+        alertSentAt: "2026-11-21T12:15:00.000Z",
+      },
+      {
+        username: "other",
+        since: "2026-11-21T12:30:00.000Z",
+        reason: "token",
+        code: "Meta 190",
+        alertSentAt: null,
+      },
+    ]);
+    expect(JSON.stringify(data.connectionIncidents)).not.toContain("ig_");
+  });
+
+  it.each([
+    ["OWNER", true],
+    ["ADMIN", true],
+    ["MEMBER", false],
+  ] as const)("tells whether a reader with the role %s can reconnect", async (role, canReconnect) => {
+    workspaceContext.mockResolvedValue(signedIn(role));
+    expect((await diagnostics()).canReconnect).toBe(canReconnect);
+  });
+
+  it("hands the page what it needs to name the connection events", async () => {
+    mockPrisma.operationalEvent.findMany.mockResolvedValue([
+      {
+        id: "e1",
+        source: "WORKER",
+        level: "WARNING",
+        message: "Instagram connection lost for @studio since 2026-11-21T11:45:00.000Z (missing (Meta 100/33)): …",
+        createdAt: new Date(NOW),
+        resolvedAt: null,
+        payload: {
+          kind: "connection-lost",
+          instagramAccountId: "ig_1",
+          account: "studio",
+          lostAt: "2026-11-21T11:45:00.000Z",
+          reason: "missing (Meta 100/33)",
+        },
+      },
+    ]);
+    const { operationalEvents } = await diagnostics();
+    expect(operationalEvents[0].detail).toEqual({
+      kind: "connection-lost",
+      account: "studio",
+      lostAt: "2026-11-21T11:45:00.000Z",
+    });
+    expect(JSON.stringify(operationalEvents)).not.toContain("ig_1");
   });
 });
 

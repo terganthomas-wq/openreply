@@ -6,6 +6,10 @@ import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
 import { ensureWorkspaceForUser } from "@/lib/workspace";
 import { canManageWorkspace } from "@/lib/workspace-access";
+import {
+  connectionIncidentOf,
+  type ConnectionIncident,
+} from "@/lib/instagram/connection-incident";
 
 export async function generateMetadata() {
   const { t } = await getI18n();
@@ -32,7 +36,13 @@ export default async function DashboardLayout({
     prisma.instagramAccount.findMany({
       where: { workspaceId: workspace.id },
       orderBy: { connectedAt: "desc" },
-      select: { username: true },
+      // The incident fields feed the banner about a lost connection (A1).
+      select: {
+        id: true,
+        username: true,
+        connectionLostAt: true,
+        connectionLostReason: true,
+      },
     }),
     // The menu leaves out what only owners and admins can use. Without a
     // membership row the user is the workspace's owner, as everywhere else
@@ -45,6 +55,13 @@ export default async function DashboardLayout({
     }),
   ]);
 
+  // Accounts whose connection Meta dropped: a banner above every page with
+  // "Neu verbinden". The layout renders on a full page load (the reconnect
+  // ends with one), not on every navigation within the dashboard.
+  const connectionIncidents = accounts
+    .map(connectionIncidentOf)
+    .filter((incident): incident is ConnectionIncident => incident !== null);
+
   return (
     <I18nProvider locale={locale}>
       <DashboardShell
@@ -52,6 +69,7 @@ export default async function DashboardLayout({
         instagramUsername={accounts[0]?.username ?? null}
         instagramAccountCount={accounts.length}
         canManage={canManageWorkspace(membership?.role ?? "OWNER")}
+        connectionIncidents={connectionIncidents}
       >
         {children}
       </DashboardShell>

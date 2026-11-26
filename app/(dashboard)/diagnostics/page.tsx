@@ -8,6 +8,12 @@ import KeyExpiryNotice, {
   type KeyNeedingAttention,
 } from "@/components/key-expiry-notice";
 import StatusBadge from "@/components/status-badge";
+import { ReconnectButton } from "@/components/connection-incident";
+import {
+  CONNECTION_LOST_REASON_TEXT,
+  formatIncidentTime,
+  type ConnectionLostKind,
+} from "@/lib/instagram/connection-incident";
 
 interface DiagnosticsData {
   queueCounts: Record<string, number>;
@@ -62,6 +68,16 @@ interface DiagnosticsData {
     resumeAt: string;
     waiting: number | null;
   }>;
+  // A1: accounts whose connection Meta dropped, from the worker's check.
+  connectionIncidents?: Array<{
+    username: string;
+    since: string;
+    reason: ConnectionLostKind;
+    code: string | null;
+    alertSentAt: string | null;
+  }>;
+  // Owners and admins can reconnect an account.
+  canReconnect?: boolean;
   // Service keys that expire within 14 days, or expired although something
   // used them in the last 30 days.
   keyWarnings: KeyNeedingAttention[];
@@ -115,6 +131,32 @@ function eventMessage(
             { account: detail.account }
           )
         : event.message;
+    case "connection-lost":
+      return detail.account
+        ? t(
+            "Instagram connection of @{account} lost since {time}. No DMs go out until it is reconnected.",
+            { account: detail.account, time: formatIncidentTime(detail.lostAt, locale) }
+          )
+        : event.message;
+    case "connection-back":
+      return detail.account
+        ? t("Instagram connection of @{account} is back.", { account: detail.account })
+        : event.message;
+    case "connection-alert":
+      if (!detail.account) return event.message;
+      return detail.reminder
+        ? t("Reminder about the lost connection of @{account} sent. Recipients: {count}", {
+            account: detail.account,
+            count: detail.recipients,
+          })
+        : t("Alert e-mail about the lost connection of @{account} sent. Recipients: {count}", {
+            account: detail.account,
+            count: detail.recipients,
+          });
+    case "mail-unconfigured":
+      return t(
+        "Alert e-mails about a lost Instagram connection cannot go out: the sending service has no e-mail settings (RESEND_API_KEY and EMAIL_FROM)."
+      );
     default:
       return event.message;
   }
@@ -202,6 +244,51 @@ export default function DiagnosticsPage() {
           {t("Refresh")}
         </button>
       </div>
+
+      {data?.connectionIncidents?.length ? (
+        <section className="rounded border border-error/30 bg-error/10 p-4 sm:p-6">
+          <h2 className="text-base font-semibold text-foreground">
+            {t("Instagram connection lost")}
+          </h2>
+          <p className="mt-2 text-sm text-foreground">
+            {t(
+              "OpenReply is not sending DMs right now: no DMs for comments, no replies to button taps, no public replies."
+            )}
+          </p>
+          <ul className="mt-3 space-y-3 text-sm text-foreground">
+            {data.connectionIncidents.map((incident) => (
+              <li key={incident.username} className="break-words">
+                <p className="font-semibold">
+                  {t("@{account}: connection lost since {time}", {
+                    account: incident.username,
+                    time: formatIncidentTime(incident.since, locale),
+                  })}
+                </p>
+                <p className="mt-0.5">
+                  {t(CONNECTION_LOST_REASON_TEXT[incident.reason])}
+                  {incident.code ? (
+                    <span className="text-muted"> ({incident.code})</span>
+                  ) : null}
+                </p>
+                <p className="mt-0.5 text-muted">
+                  {incident.alertSentAt
+                    ? t("Alert e-mail sent: {time}", {
+                        time: formatIncidentTime(incident.alertSentAt, locale),
+                      })
+                    : t("No alert e-mail sent yet")}
+                </p>
+              </li>
+            ))}
+          </ul>
+          {data.canReconnect ? (
+            <ReconnectButton className="mt-4" />
+          ) : (
+            <p className="mt-3 text-sm text-muted">
+              {t("Ask your workspace owner or an admin to reconnect Instagram.")}
+            </p>
+          )}
+        </section>
+      ) : null}
 
       {data?.accountPauses.length ? (
         <section className="rounded border border-warning/30 bg-warning/10 p-4 sm:p-6">

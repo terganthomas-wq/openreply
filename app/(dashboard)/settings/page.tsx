@@ -6,6 +6,8 @@ import { Suspense, useEffect, useState } from "react";
 import type { AccountOption } from "@/components/account-select";
 import { ZernioConnection } from "@/components/zernio-connection";
 import { InstagramConnectNotice } from "@/components/instagram-connect-notice";
+import { ConnectionIncidentNotice } from "@/components/connection-incident";
+import { connectionIncidentOf } from "@/lib/instagram/connection-incident";
 
 interface SettingsData {
   workspace: {
@@ -24,6 +26,9 @@ interface SettingsData {
       provider?: "META" | "ZERNIO";
       tokenExpiresAt: string | null;
       webhookSubscribed: boolean;
+      // A1: set while the worker's check finds the connection lost.
+      connectionLostAt?: string | null;
+      connectionLostReason?: string | null;
     }
   >;
 }
@@ -133,6 +138,7 @@ export default function SettingsPage() {
   const canManageMembers =
     membersData?.currentUserRole === "OWNER" ||
     membersData?.currentUserRole === "ADMIN";
+  const connectionLost = accounts.some((account) => connectionIncidentOf(account));
 
   return (
     <div className="max-w-2xl mx-auto space-y-8">
@@ -163,13 +169,19 @@ export default function SettingsPage() {
               </p>
             </div>
             <span
-              className={`px-3 py-1.5 rounded-full text-xs font-medium ${
-                accounts.length > 0
-                  ? "bg-success/10 text-success"
-                  : "bg-warning/10 text-warning"
+              className={`shrink-0 px-3 py-1.5 rounded-full text-xs font-medium ${
+                connectionLost
+                  ? "bg-error/10 text-error"
+                  : accounts.length > 0
+                    ? "bg-success/10 text-success"
+                    : "bg-warning/10 text-warning"
               }`}
             >
-              {accounts.length > 0 ? t("Connected") : t("Not connected")}
+              {connectionLost
+                ? t("Connection lost")
+                : accounts.length > 0
+                  ? t("Connected")
+                  : t("Not connected")}
             </span>
           </div>
 
@@ -191,15 +203,25 @@ export default function SettingsPage() {
                 {t("Connect an Instagram professional account to launch campaigns.")}
               </p>
             )}
-            {accounts.map((account) => (
+            {accounts.map((account) => {
+              const incident = connectionIncidentOf(account);
+              return (
               <div
                 key={account.id}
                 className="flex flex-col gap-3 rounded border border-border bg-surface/70 p-4 sm:flex-row sm:items-center sm:justify-between"
               >
-                <div>
-                  <p className="text-sm font-semibold text-foreground">
+                <div className="min-w-0">
+                  <p className="break-words text-sm font-semibold text-foreground">
                     @{account.username}
                   </p>
+                  {incident ? (
+                    // Not "Connected … Webhook ready": the worker's check
+                    // finds the connection lost (A1).
+                    <ConnectionIncidentNotice
+                      incident={incident}
+                      canManage={canManageMembers}
+                    />
+                  ) : (
                   <p className="mt-1 text-xs text-muted">
                     {account.provider === "ZERNIO" ? t("Connected via Zernio") : <>{t("Token expires")}{" "}
                     {account.tokenExpiresAt
@@ -207,18 +229,20 @@ export default function SettingsPage() {
                       : t("not available")}</>}{" "}
                     · {account.webhookSubscribed ? t("Webhook ready") : t("Webhook pending")}
                   </p>
+                  )}
                 </div>
                 <button
                   onClick={() => disconnectInstagram(account.id)}
                   disabled={busy === `disconnect:${account.id}`}
-                  className="inline-flex items-center justify-center rounded border border-error/20 px-4 py-2 text-sm font-medium text-error transition-all hover:border-error/40 hover:bg-error/10 disabled:opacity-50"
+                  className="inline-flex shrink-0 items-center justify-center rounded border border-error/20 px-4 py-2 text-sm font-medium text-error transition-all hover:border-error/40 hover:bg-error/10 disabled:opacity-50"
                 >
                   {busy === `disconnect:${account.id}`
                     ? t("Disconnecting...")
                     : t("Disconnect")}
                 </button>
               </div>
-            ))}
+              );
+            })}
           </div>
         </div>
 

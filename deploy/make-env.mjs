@@ -151,6 +151,9 @@ if (metaSet > 0 && metaSet < META.length) {
   process.exit(2);
 }
 const pick = (k) => (usable(k) ? u[k] : undefined);
+// Resend's shared test sender: without a domain of your own it delivers only
+// to the address of the Resend account itself, which is LOGIN_EMAIL.
+const EMAIL_ADDRESS = "onboarding@resend.dev";
 
 write(path.join(dir, "vercel.env"), [
   ["NEXTAUTH_URL", u.APP_URL],
@@ -161,7 +164,7 @@ write(path.join(dir, "vercel.env"), [
   ["DATABASE_URL", u.DATABASE_URL],
   ["REDIS_URL", u.REDIS_URL],
   ["RESEND_API_KEY", u.RESEND_API_KEY],
-  ["EMAIL_FROM", "OpenReply Login <onboarding@resend.dev>"],
+  ["EMAIL_FROM", `OpenReply Login <${EMAIL_ADDRESS}>`],
   ["ALLOWED_EMAILS", u.LOGIN_EMAIL],
   ["META_GRAPH_API_VERSION", "v25.0"],
   ["META_APP_ID", pick("META_APP_ID")],
@@ -181,11 +184,18 @@ write(path.join(dir, "vercel.env"), [
 write(path.join(dir, "worker.env"), [
   ["NODE_ENV", "production"],
   ["TZ", "UTC"],
+  // Also the link in the e-mail about a lost Instagram connection
+  // ({NEXTAUTH_URL}/settings).
   ["NEXTAUTH_URL", u.APP_URL],
   ["NEXTAUTH_SECRET", intern.NEXTAUTH_SECRET],
   ["ENCRYPTION_KEY", intern.ENCRYPTION_KEY],
   ["DATABASE_URL", u.DATABASE_URL],
   ["REDIS_URL", u.REDIS_URL],
+  // The worker e-mails the owners when the Instagram connection is lost
+  // (A1), through Resend like the login e-mails, and in German.
+  ["RESEND_API_KEY", u.RESEND_API_KEY],
+  ["EMAIL_FROM", `OpenReply <${EMAIL_ADDRESS}>`],
+  ["DEFAULT_LOCALE", "de"],
   ["META_GRAPH_API_VERSION", "v25.0"],
   // Neon Free sleeps after 5 idle minutes and allows 100 CU-hours a month.
   // The default 5-minute sweep would keep it awake around the clock.

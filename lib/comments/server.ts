@@ -78,6 +78,8 @@ const ERROR_MESSAGE_MAX = 300;
 export type CommentsAccount = ProviderAccount & {
   id: string;
   username: string;
+  /** An open lost-connection incident (A1): no reads, no sends. */
+  connectionLostAt?: Date | null;
 };
 
 // ─── Cache ─────────────────────────────────────────────────────────────────
@@ -418,7 +420,9 @@ function campaignOption(campaign: CampaignRow): CampaignOption {
  * The page: the comments of the account's newest `posts` posts within the 7
  * days, newest first, never the account's own, each with where its DM stands
  * and the campaign that would answer it on its own. While the account is
- * paused for a Meta limit: the pause, and no read at all.
+ * paused for a Meta limit: the pause, and no read at all. While its
+ * connection is lost (A1): since when, and no read either, as every read
+ * would be refused.
  */
 export async function loadCommentsPage({
   workspaceId,
@@ -438,11 +442,14 @@ export async function loadCommentsPage({
   const base = {
     account: { id: account.id, username: account.username },
     pausedUntil: pausedUntil === null ? null : new Date(pausedUntil).toISOString(),
+    connectionLostAt: account.connectionLostAt
+      ? account.connectionLostAt.toISOString()
+      : null,
     campaigns: campaigns.map(campaignOption),
     posts,
     generatedAt: new Date(now).toISOString(),
   };
-  if (pausedUntil !== null) {
+  if (pausedUntil !== null || base.connectionLostAt !== null) {
     return { ...base, comments: [], hasMore: false, readLimited: false, failedPosts: 0 };
   }
 
@@ -517,6 +524,7 @@ export type ManualSendReason =
   | "campaign_not_found"
   | "not_comment_campaign"
   | "provider"
+  | "connection_lost"
   | "worker_outdated"
   | "paused"
   | "already_sent"
@@ -536,6 +544,8 @@ export type ManualSendResult =
       reason: ManualSendReason;
       error: string;
       pausedUntil?: string;
+      /** For connection_lost: since when (A1). */
+      connectionLostAt?: string;
       /** For already_sent: where the comment's DM stands. */
       commentStatus?: CommentStatus;
     };
@@ -544,7 +554,11 @@ function refuse(
   status: number,
   reason: ManualSendReason,
   error: string,
-  extra: { pausedUntil?: string; commentStatus?: CommentStatus } = {}
+  extra: {
+    pausedUntil?: string;
+    connectionLostAt?: string;
+    commentStatus?: CommentStatus;
+  } = {}
 ): ManualSendResult {
   return { ok: false, status, reason, error, ...extra };
 }
@@ -567,7 +581,7 @@ async function isAccountMedia(
  * Queue a campaign's DM for one comment, sent by hand from the Kommentare
  * page. Checked first, cheapest first, and nothing queued unless all hold:
  * - the campaign belongs to the workspace, has a DM text, and its account is
- *   connected through Meta;
+ *   connected through Meta, with no lost-connection incident open (A1);
  * - the running worker knows manual sends (an older one would read the job
  *   as an ordinary comment and answer it with whichever campaign matches);
  * - the account is not paused for a Meta limit (then Meta is not asked);
@@ -606,6 +620,7 @@ export async function sendCommentManually({
           metaLogin: true,
           accessToken: true,
           zernioAccountId: true,
+          connectionLostAt: true,
         },
       },
     },
@@ -622,6 +637,16 @@ export async function sendCommentManually({
       400,
       "provider",
       "Manual sending needs an account connected through your own Meta app"
+    );
+  }
+  // A1: Meta refuses the account until it is reconnected, so neither the
+  // check of the comment nor the worker's send could get through.
+  if (account.connectionLostAt) {
+    return refuse(
+      409,
+      "connection_lost",
+      "The Instagram connection is lost; reconnect the account first",
+      { connectionLostAt: account.connectionLostAt.toISOString() }
     );
   }
 

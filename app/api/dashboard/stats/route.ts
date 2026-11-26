@@ -83,6 +83,10 @@ export async function GET(request: NextRequest) {
         provider: true,
         tokenExpiresAt: true,
         webhookSubscribed: true,
+        // A1: an open lost-connection incident, which Settings shows instead
+        // of "Connected" (lib/instagram/connection-incident.ts).
+        connectionLostAt: true,
+        connectionLostReason: true,
       },
     }),
     prisma.automation.count({ where: { workspaceId, ...accountFilter } }),

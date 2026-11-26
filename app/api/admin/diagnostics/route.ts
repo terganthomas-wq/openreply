@@ -4,6 +4,10 @@ import { getDMQueue } from "@/lib/queue/client";
 import { readAccountPauses } from "@/lib/queue/account-pause";
 import { keyExpiryBounds, keyExpiryWarning } from "@/lib/integrations/key-lifetime";
 import { eventDetail } from "@/lib/ops/event-details";
+import {
+  connectionLostCode,
+  connectionLostKind,
+} from "@/lib/instagram/connection-incident";
 import { getWorkerAlerts, getWorkerHealth } from "@/lib/ops/worker-health";
 import { canManageWorkspace, getCurrentWorkspaceContext } from "@/lib/workspace-access";
 
@@ -105,7 +109,14 @@ export async function GET() {
     }),
     prisma.instagramAccount.findMany({
       where: { workspaceId },
-      select: { instagramId: true, username: true },
+      select: {
+        instagramId: true,
+        username: true,
+        connectionLostAt: true,
+        connectionLostReason: true,
+        connectionAlertSentAt: true,
+        connectionAlertCount: true,
+      },
     }),
     prisma.serviceKey.findMany({
       where: {
@@ -131,6 +142,21 @@ export async function GET() {
   // Accounts whose sending is paused for a Meta request limit, until when
   // and how many jobs wait for it (lib/queue/account-pause.ts).
   const accountPauses = await readAccountPauses(accounts);
+  // A1: accounts whose connection Meta dropped (lib/instagram/connection-check.ts),
+  // since when, why, and whether the owners got an e-mail about it.
+  const connectionIncidents = accounts
+    .filter((account) => account.connectionLostAt)
+    .map((account) => ({
+      username: account.username,
+      since: account.connectionLostAt!.toISOString(),
+      reason: connectionLostKind(account.connectionLostReason),
+      code: connectionLostCode(account.connectionLostReason),
+      // Only an e-mail about this incident: the time stays from earlier ones.
+      alertSentAt:
+        account.connectionAlertCount > 0 && account.connectionAlertSentAt
+          ? account.connectionAlertSentAt.toISOString()
+          : null,
+    }));
   // The keys by the same rule as the API & MCP page; when they were last
   // used stays on the server.
   const keyWarnings = expiringKeys.flatMap((key) => {
@@ -164,10 +190,13 @@ export async function GET() {
         detail: eventDetail(payload),
       })),
       accountPauses,
+      connectionIncidents,
       keyWarnings,
       // Only owners and admins create and revoke keys (the keys route
-      // refuses everyone else): a member is asked to have one of them do it.
+      // refuses everyone else), and only they can reconnect an account: a
+      // member is asked to have one of them do it.
       canManageKeys: canManageWorkspace(context.role),
+      canReconnect: canManageWorkspace(context.role),
     },
   });
 }

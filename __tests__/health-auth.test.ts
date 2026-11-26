@@ -8,11 +8,14 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const queryRaw = vi.fn();
+const findLostAccounts = vi.fn();
 const ping = vi.fn();
 const getJobCounts = vi.fn();
 const getWorkerHealth = vi.fn();
 
-vi.mock("@/lib/db/client", () => ({ prisma: { $queryRaw: queryRaw } }));
+vi.mock("@/lib/db/client", () => ({
+  prisma: { $queryRaw: queryRaw, instagramAccount: { findMany: findLostAccounts } },
+}));
 vi.mock("@/lib/queue/client", () => ({
   getRedisConnection: () => ({ ping }),
   getDMQueue: () => ({ getJobCounts }),
@@ -34,6 +37,7 @@ beforeEach(() => {
   ping.mockResolvedValue("PONG");
   getJobCounts.mockResolvedValue({ waiting: 0, active: 0, delayed: 0, failed: 0 });
   getWorkerHealth.mockResolvedValue({ healthy: true, heartbeat: null, ageMs: 1000 });
+  findLostAccounts.mockResolvedValue([]);
 });
 
 describe("GET /api/health", () => {
@@ -41,6 +45,7 @@ describe("GET /api/health", () => {
     const response = await GET(request());
     expect(response.status).toBe(401);
     expect(queryRaw).not.toHaveBeenCalled();
+    expect(findLostAccounts).not.toHaveBeenCalled();
     expect(ping).not.toHaveBeenCalled();
     expect(getWorkerHealth).not.toHaveBeenCalled();
   });
@@ -71,5 +76,83 @@ describe("GET /api/health", () => {
     const response = await GET(request("Bearer health-test-secret"));
     expect(response.status).toBe(503);
     expect((await response.json()).status).toBe("degraded");
+  });
+});
+
+// A1: a lost Instagram connection is a degraded check in the JSON, never a
+// change of the HTTP status or the top-level status.
+describe("GET /api/health and a lost Instagram connection", () => {
+  const lostAccount = {
+    username: "thomas.tergan",
+    connectionLostAt: new Date("2026-11-25T16:45:00.000Z"),
+    connectionLostReason: "missing (Meta 100/33)",
+    connectionAlertSentAt: new Date("2026-11-25T17:15:00.000Z"),
+    connectionAlertCount: 1,
+  };
+
+  it("reports the Instagram connections as ok while none is lost", async () => {
+    const body = await (await GET(request("Bearer health-test-secret"))).json();
+    expect(body.checks.instagram).toEqual({ status: "ok" });
+    expect(findLostAccounts).toHaveBeenCalledWith({
+      where: { connectionLostAt: { not: null } },
+      orderBy: { connectionLostAt: "asc" },
+      take: 50,
+      select: {
+        username: true,
+        connectionLostAt: true,
+        connectionLostReason: true,
+        connectionAlertSentAt: true,
+        connectionAlertCount: true,
+      },
+    });
+  });
+
+  it("reports an incident as degraded, with 200 and status ok as before", async () => {
+    findLostAccounts.mockResolvedValue([
+      lostAccount,
+      // An e-mail about an earlier incident: none about this one yet.
+      { ...lostAccount, username: "second", connectionAlertCount: 0 },
+    ]);
+    const response = await GET(request("Bearer health-test-secret"));
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.status).toBe("ok");
+    expect(body.checks.instagram).toEqual({
+      status: "degraded",
+      incidents: [
+        {
+          account: "thomas.tergan",
+          lostAt: "2026-11-25T16:45:00.000Z",
+          reason: "missing",
+          code: "Meta 100/33",
+          alertSentAt: "2026-11-25T17:15:00.000Z",
+        },
+        {
+          account: "second",
+          lostAt: "2026-11-25T16:45:00.000Z",
+          reason: "missing",
+          code: "Meta 100/33",
+          alertSentAt: null,
+        },
+      ],
+    });
+  });
+
+  it("keeps 503 for a missing worker, incident or not", async () => {
+    findLostAccounts.mockResolvedValue([lostAccount]);
+    getWorkerHealth.mockResolvedValue({ healthy: false, heartbeat: null, ageMs: null });
+    const response = await GET(request("Bearer health-test-secret"));
+    expect(response.status).toBe(503);
+    expect((await response.json()).checks.instagram.status).toBe("degraded");
+  });
+
+  it("does not fail health when the incidents cannot be read", async () => {
+    findLostAccounts.mockRejectedValue(new Error("relation does not exist"));
+    const response = await GET(request("Bearer health-test-secret"));
+    expect(response.status).toBe(200);
+    expect((await response.json()).checks.instagram).toEqual({
+      status: "error",
+      detail: "relation does not exist",
+    });
   });
 });

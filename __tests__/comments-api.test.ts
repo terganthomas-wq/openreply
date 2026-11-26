@@ -434,6 +434,31 @@ describe("GET /api/instagram/comments", () => {
     expect(graphCalls).toHaveLength(0);
   });
 
+  // A1: every read would be refused until the account is reconnected.
+  it("reads nothing while the account's connection is lost, and says since when", async () => {
+    const lostAt = new Date(NOW - 2 * HOUR);
+    mockPrisma.instagramAccount.findFirst.mockResolvedValue({ ...ACCOUNT, connectionLostAt: lostAt });
+
+    const response = await getRequest();
+    expect(response.status).toBe(200);
+    const { data } = await json(response);
+    expect(data.connectionLostAt).toBe(lostAt.toISOString());
+    expect(data.comments).toEqual([]);
+    expect(data.hasMore).toBe(false);
+    expect(graphCalls).toHaveLength(0);
+    // The campaigns stay listed.
+    expect(data.campaigns.map((campaign: { id: string }) => campaign.id)).toEqual([
+      "c_any",
+      "c_post",
+      "c_paused",
+    ]);
+  });
+
+  it("says nothing about a lost connection while it works", async () => {
+    const { data } = await json(await getRequest());
+    expect(data.connectionLostAt).toBeNull();
+  });
+
   it("stops reading at a Meta limit and says some posts are missing", async () => {
     media = Array.from({ length: 12 }, (_, index) => ({
       id: `media_${index + 1}`,
@@ -672,6 +697,33 @@ describe("POST /api/instagram/comments/send", () => {
     });
     expect(graphCalls).toHaveLength(0);
     expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+
+  it("asks Instagram nothing and queues nothing while the account's connection is lost", async () => {
+    const lostAt = new Date(NOW - 2 * HOUR);
+    mockPrisma.automation.findFirst.mockResolvedValue({
+      ...CAMPAIGN,
+      instagramAccount: { ...ACCOUNT, connectionLostAt: lostAt },
+    });
+    const response = await send();
+    expect(response.status).toBe(409);
+    expect(await json(response)).toMatchObject({
+      success: false,
+      reason: "connection_lost",
+      connectionLostAt: lostAt.toISOString(),
+    });
+    expect(graphCalls).toHaveLength(0);
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+    // The campaign's account is read with its incident.
+    expect(mockPrisma.automation.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: expect.objectContaining({
+          instagramAccount: {
+            select: expect.objectContaining({ connectionLostAt: true }),
+          },
+        }),
+      })
+    );
   });
 
   it("reports a Meta limit on the check without pausing the account", async () => {

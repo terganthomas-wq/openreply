@@ -144,6 +144,95 @@ describe("Instagram OAuth callback", () => {
     });
   });
 
+  // A1: the reconnect ends a lost-connection incident at once.
+  describe("an account whose connection was lost", () => {
+    const lostAt = new Date("2026-11-25T16:45:00.000Z");
+
+    function unifiedReconnect() {
+      vi.stubEnv("META_LOGIN_CONFIG_ID", "config");
+      vi.stubEnv("META_APP_ID", "app");
+      vi.stubEnv("FACEBOOK_APP_SECRET", "secret");
+      mockExchange.mockResolvedValue({ accessToken: "suat", userId: "" });
+      respond({ data: { expires_at: 0 } });
+      respond({ data: [{ id: "ig1" }] });
+      respond({ id: "ig1", username: "one" });
+      respond({ success: true });
+    }
+
+    it("ends the incident and keeps its start for the catch-up", async () => {
+      mockPrisma.instagramAccount.findUnique.mockResolvedValue({
+        id: "row",
+        workspaceId: "workspace",
+        username: "one",
+        connectionLostAt: lostAt,
+        connectionCheckFailedAt: lostAt,
+        connectionCatchUpFrom: null,
+      });
+      mockPrisma.instagramAccount.updateMany.mockResolvedValue({ count: 1 });
+      unifiedReconnect();
+
+      const response = await callback();
+
+      expect(response.headers.get("location")).toBe(
+        "https://app.test/dashboard?connected=true"
+      );
+      // First the new token, then the incident, on the same row.
+      expect(mockPrisma.instagramAccount.updateMany).toHaveBeenCalledTimes(2);
+      expect(mockPrisma.instagramAccount.updateMany).toHaveBeenNthCalledWith(2, {
+        where: { id: "row", connectionLostAt: lostAt },
+        data: {
+          connectionLostAt: null,
+          connectionLostReason: null,
+          connectionCheckFailedAt: null,
+          connectionAlertCount: 0,
+          connectionRecoveredAt: expect.any(Date),
+          connectionCatchUpFrom: lostAt,
+        },
+      });
+      expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          workspaceId: "workspace",
+          source: "SYSTEM",
+          level: "INFO",
+          payload: expect.objectContaining({
+            kind: "connection-back",
+            account: "one",
+            via: "reconnect",
+            lostAt: lostAt.toISOString(),
+            catchUpFrom: lostAt.toISOString(),
+          }),
+        }),
+      });
+    });
+
+    it("still connects when the incident cannot be ended", async () => {
+      mockPrisma.instagramAccount.findUnique
+        .mockResolvedValueOnce({ id: "row" })
+        .mockRejectedValueOnce(new Error("Connection terminated unexpectedly"));
+      mockPrisma.instagramAccount.updateMany.mockResolvedValue({ count: 1 });
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      unifiedReconnect();
+
+      const response = await callback();
+
+      expect(response.headers.get("location")).toBe(
+        "https://app.test/dashboard?connected=true"
+      );
+      expect(error).toHaveBeenCalledWith(
+        "[Instagram Callback] Could not end the connection incident:",
+        "Connection terminated unexpectedly"
+      );
+      error.mockRestore();
+    });
+
+    it("has nothing to end for a newly connected account", async () => {
+      unifiedReconnect();
+      await callback();
+      expect(mockPrisma.instagramAccount.create).toHaveBeenCalledTimes(1);
+      expect(mockPrisma.instagramAccount.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
   it("explains a Unified login that granted no Instagram account", async () => {
     vi.stubEnv("META_LOGIN_CONFIG_ID", "config");
     vi.stubEnv("META_APP_ID", "app");

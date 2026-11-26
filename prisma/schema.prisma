@@ -167,6 +167,33 @@ model InstagramAccount {
   connectedAt       DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
+  // The connection check (A1, lib/instagram/connection-check.ts). With every
+  // comment sweep the worker reads the account's own node once. A token or
+  // permission error, or Meta no longer finding the account (100/33), is a
+  // "lost" check; two of them at least one sweep interval apart open an
+  // incident, and one check that gets through (or a reconnect) ends it.
+
+  /// The first "lost" check of the current run. Cleared by a check that gets
+  /// through and by a reconnect.
+  connectionCheckFailedAt DateTime?
+  /// Open incident: since when the connection is lost, which is the time of
+  /// that first "lost" check. Null while the connection works.
+  connectionLostAt        DateTime?
+  /// Why, short and never a token: "<token|permission|missing> (Meta <code>/<subcode>)".
+  connectionLostReason    String?
+  /// When the last alert e-mail went out, for any incident of the account: at
+  /// most one e-mail per 24 hours. Kept when the incident ends.
+  connectionAlertSentAt   DateTime?
+  /// E-mails sent for the open incident: 1 after the alert, 2 after the one
+  /// reminder. Back to 0 when an incident starts or ends.
+  connectionAlertCount    Int       @default(0)
+  /// When the last incident ended: a check got through, or a reconnect.
+  connectionRecoveredAt   DateTime?
+  /// The start of an ended incident whose missed comments are still to be
+  /// caught up. Set when an incident ends (the earlier one, if a catch-up is
+  /// still pending); the catch-up sets it back to null once it has run.
+  connectionCatchUpFrom   DateTime?
+
   workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   automations Automation[]
   dmLogs      DmLog[]

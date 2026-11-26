@@ -3,6 +3,10 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db/client";
 import { getDMQueue, getRedisConnection } from "@/lib/queue/client";
 import { getWorkerHealth } from "@/lib/ops/worker-health";
+import {
+  connectionLostCode,
+  connectionLostKind,
+} from "@/lib/instagram/connection-incident";
 
 export const runtime = "nodejs";
 // Health must reflect live state (worker heartbeat, queue depth), never a
@@ -81,6 +85,62 @@ async function checkQueue(): Promise<HealthCheck & { counts?: unknown }> {
   }
 }
 
+// A1: Instagram accounts whose connection Meta dropped (the worker's check,
+// lib/instagram/connection-check.ts). Degraded while any incident is open,
+// but it never changes the HTTP status or the top-level status: an external
+// monitor would flap with every incident, and the owners get an e-mail and
+// the dashboard's banner anyway. A monitor that wants to know reads
+// checks.instagram.status.
+interface InstagramConnectionCheck {
+  status: "ok" | "degraded" | "error";
+  incidents?: {
+    account: string;
+    lostAt: string;
+    reason: string;
+    code: string | null;
+    alertSentAt: string | null;
+  }[];
+  detail?: string;
+}
+
+async function checkInstagramConnections(): Promise<InstagramConnectionCheck> {
+  try {
+    const lost = await prisma.instagramAccount.findMany({
+      where: { connectionLostAt: { not: null } },
+      orderBy: { connectionLostAt: "asc" },
+      take: 50,
+      select: {
+        username: true,
+        connectionLostAt: true,
+        connectionLostReason: true,
+        connectionAlertSentAt: true,
+        connectionAlertCount: true,
+      },
+    });
+    if (lost.length === 0) return { status: "ok" };
+    return {
+      status: "degraded",
+      incidents: lost.map((account) => ({
+        account: account.username,
+        lostAt: account.connectionLostAt!.toISOString(),
+        reason: connectionLostKind(account.connectionLostReason),
+        code: connectionLostCode(account.connectionLostReason),
+        // Only an e-mail about this incident: the time stays from earlier ones.
+        alertSentAt:
+          account.connectionAlertCount > 0 && account.connectionAlertSentAt
+            ? account.connectionAlertSentAt.toISOString()
+            : null,
+      })),
+    };
+  } catch (error) {
+    return {
+      status: "error",
+      detail:
+        error instanceof Error ? error.message : "Instagram connection check failed",
+    };
+  }
+}
+
 // Health answers only with `Authorization: Bearer <CRON_SECRET>`. Unauthorised
 // calls get a 401 before any check runs: the full report names the worker host
 // and raw DB/Redis errors, and every check wakes the database and spends Redis
@@ -98,7 +158,7 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const [database, redis, queue, worker] = await Promise.all([
+  const [database, redis, queue, worker, instagram] = await Promise.all([
     checkDatabase(),
     checkRedis(),
     checkQueue(),
@@ -108,8 +168,10 @@ export async function GET(request: Request) {
       ageMs: null,
       error: error instanceof Error ? error.message : "Worker check failed",
     })),
+    checkInstagramConnections(),
   ]);
 
+  // Not the Instagram connections: see checkInstagramConnections.
   const healthy =
     database.status === "ok" &&
     redis.status === "ok" &&
@@ -124,6 +186,7 @@ export async function GET(request: Request) {
         redis,
         queue,
         worker,
+        instagram,
       },
     },
     { status: healthy ? 200 : 503 }

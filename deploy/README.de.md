@@ -231,6 +231,93 @@ Versand-Dienst ist noch nicht auf dem neuesten Stand“): Der alte Worker
 würde den Kommentar sonst wie einen normalen behandeln und mit der Kampagne
 beantworten, die von selbst passt, oder gar nicht.
 
+## Verbindung verloren
+
+Am 25.11.2026 hat Meta der App nach dem Verknüpfen von Instagram mit Facebook
+still und leise den Zugriff auf das Konto entzogen: Jede Anfrage scheiterte
+mit „Object … does not exist, cannot be loaded due to missing permissions“
+(Fehler 100/33), es kamen keine Webhooks mehr, und trotzdem stand überall
+„Verbunden“. Vier Stunden lang ging keine DM raus, ohne dass es jemand
+merkte. Seitdem prüft der Worker die Verbindung selbst.
+
+So erkennt das Tool es:
+
+- Bei jedem Durchlauf der Kommentar-Suche (alle 30 Minuten,
+  `COMMENT_POLL_INTERVAL_MS`) fragt der Worker jedes über die eigene
+  Meta-App verbundene Konto einmal kurz bei Meta ab
+  (`/{ig-id}?fields=id,username`), auch ein Konto ohne aktive Kampagne. Das
+  ist eine sehr kleine Anfrage, zwei pro Stunde und Konto.
+- Als „verloren“ zählen nur eindeutige Antworten: ein ungültiger oder
+  widerrufener Zugang (Fehler 190, 102, 463, 467), fehlende Berechtigungen
+  (10, 200 bis 299) und „Konto nicht gefunden“ (100/33). Ein Meta-Limit,
+  ein Netzwerkfehler, eine Störung bei Meta (5xx) oder andere Fehler zählen
+  nicht.
+- Erst zwei solche Antworten hintereinander, mindestens einen Durchlauf
+  auseinander, gelten als Unterbrechung: Ein kurzer Aussetzer löst keinen
+  Alarm aus. Bei 30 Minuten weißt du es also 30 bis 60 Minuten nach dem
+  Verlust. „Unterbrochen seit“ nennt die Zeit der ersten fehlgeschlagenen
+  Prüfung.
+- Während einer Meta-Pause (siehe *Meta-Limits* oben) fragt der Worker
+  nicht nach und meldet auch keine Unterbrechung.
+- Über Zernio verbundene Konten prüft das Tool nicht.
+
+Was dann passiert:
+
+- Alle Inhaber und Admins des Workspaces bekommen eine E-Mail an die
+  Adresse, mit der sie sich anmelden: „Instagram-Verbindung unterbrochen:
+  OpenReply sendet gerade keine DMs“, mit der Uhrzeit (deutsche Zeit), was
+  das bedeutet, den üblichen Ursachen und den drei Schritten zum
+  Neu-Verbinden mit einem Link auf die Einstellungen. Mitglieder bekommen
+  sie nicht. Ist die Verbindung 24 Stunden später noch weg, kommt genau eine
+  Erinnerung. Mehr als eine E-Mail in 24 Stunden pro Konto gibt es nicht,
+  auch wenn die Verbindung mehrmals abreißt. Die E-Mail enthält weder
+  Tracking noch Zugangsdaten (in Resend das Öffnungs- und Klick-Tracking
+  der Domain ausgeschaltet lassen).
+- Oben auf jeder Seite des Dashboards steht ein roter Hinweis
+  „Instagram-Verbindung unterbrochen“ mit dem Grund und „Neu verbinden“.
+  In den *Einstellungen* steht beim Konto „Verbindung unterbrochen seit …“
+  statt „Verbunden“, mit dem Grund. Die *Diagnose* listet die Unterbrechung oben auf, mit Grund,
+  Meta-Code und ob die E-Mail raus ist. Auf der Seite *Kommentare* ist
+  „DM senden“ gesperrt, bis du neu verbunden hast.
+- `GET /api/health` meldet sie unter `checks.instagram` mit
+  `"status": "degraded"` und der Liste der Konten. Der HTTP-Status und der
+  oberste `status` bleiben, wie sie sind: Ein externer Monitor schlägt
+  deshalb nicht an. Wer darauf reagieren will, liest `checks.instagram`.
+
+So verbindest du neu (Inhaber oder Admin, etwa zwei Minuten):
+
+1. *Einstellungen* öffnen (der Link in der E-Mail führt direkt hin).
+2. „Neu verbinden“ oder „Mit eigener Meta-App verbinden“ tippen und bei
+   Meta anmelden.
+3. Das Instagram-Konto wählen und alle Berechtigungen erlauben.
+
+Danach ist die Unterbrechung sofort vorbei, Hinweis und Sperre
+verschwinden. Ohne Neu-Verbinden endet sie mit der ersten Prüfung, die
+wieder durchkommt. Kommentare aus der Zwischenzeit findet die regelmäßige
+Suche nach verpassten Kommentaren wieder (Kommentare der letzten 72
+Stunden, siehe oben). Den Beginn der Unterbrechung hebt das Tool auf
+(`connectionCatchUpFrom`), damit die verpassten Kommentare nachgeholt werden
+können.
+
+Neu verbinden musst du immer, wenn sich bei der Verknüpfung etwas ändert:
+Instagram mit Facebook verknüpft oder davon getrennt, Änderungen im
+Unternehmensportfolio (Meta Business Suite), die App in Instagram unter
+„Apps und Websites“ entfernt, Passwort- oder Sicherheitsänderungen.
+
+Damit die E-Mail rausgeht, braucht der Worker die E-Mail-Einstellungen:
+`deploy/make-env.mjs` schreibt `RESEND_API_KEY`, `EMAIL_FROM` und
+`DEFAULT_LOCALE=de` jetzt auch in `worker.env`; die Adresse für den Link in
+der E-Mail steht dort schon als `NEXTAUTH_URL`. Auf einem schon laufenden
+Server erst `worker.env` neu erzeugen (`node deploy/make-env.mjs <ordner>`)
+und hochladen (`bash deploy/oracle/upload-env.sh <server-ip>
+<ordner>/worker.env`). Fehlen die Einstellungen, schreibt der Worker einmal
+pro Start eine Warnung in die *Diagnose* und schickt keine E-Mail; der
+Hinweis im Dashboard kommt trotzdem. Ohne eigene Domain in Resend
+(Absender `onboarding@resend.dev`) kommt die E-Mail, wie die Login-Mails,
+nur an der Adresse deines Resend-Kontos an. Läuft die Anmeldung über einen
+eigenen SMTP-Server (`EMAIL_SERVER`), schickt der Worker auch die E-Mail
+darüber.
+
 ## Zugangsdaten
 
 Nie in dieses Repository. Alle Werte stehen in einem Ordner außerhalb des Repos:
@@ -488,5 +575,7 @@ dann testen (`npm run typecheck && npm test`) und wie oben ausrollen.
 
 - Server: `pm2 status` und `pm2 logs openreply-worker` (erwartet: `[DM Worker] Started`)
 - Gesamtzustand: `GET /api/health` mit `Authorization: Bearer <CRON_SECRET>`.
-  Ohne Schlüssel kommt absichtlich `401`.
+  Ohne Schlüssel kommt absichtlich `401`. Eine unterbrochene
+  Instagram-Verbindung steht unter `checks.instagram` (siehe *Verbindung
+  verloren*).
 - Dashboard: Seite *Diagnostics* und *DM Logs*.

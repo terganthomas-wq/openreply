@@ -143,6 +143,27 @@ describe("a comment row on the Kommentare page", () => {
     expect(inactive).toMatch(/type="checkbox"[^>]*disabled=""/);
   });
 
+  // A1: no DM can go out while the connection is lost.
+  it("blocks the send while the connection is lost, with Neu verbinden", () => {
+    const html = render({
+      row: row({ match: { id: "c_guide", name: "Guide" } }),
+      connectionLostAt: new Date(NOW - 60 * MINUTE).toISOString(),
+    });
+    expect(html).toContain("Die Verbindung zu Instagram ist unterbrochen. Verbinde zuerst neu.");
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>DM senden/);
+    expect(html).toMatch(/<a href="\/api\/instagram\/connect"[^>]*>Neu verbinden<\/a>/);
+
+    // A DM that went out still says so, and needs no reconnect.
+    const sent = render({
+      row: row({
+        delivery: { state: "sent", campaignId: "c_guide", campaignName: "Guide", manual: false },
+      }),
+      connectionLostAt: new Date(NOW - 60 * MINUTE).toISOString(),
+    });
+    expect(sent).toContain("DM gesendet · Guide");
+    expect(sent).not.toContain("Neu verbinden");
+  });
+
   it("shows a send under way and the outcome of an earlier try", () => {
     const sending = render({ row: row(), campaignId: "c_guide", sending: true });
     expect(sending).toContain("Wird gesendet …");
@@ -193,6 +214,17 @@ describe("the rules behind a row", () => {
     });
     // A pause that is over blocks nothing.
     expect(sendBlock({ ...base, row: row(), pausedUntil: new Date(NOW - MINUTE).toISOString() })).toBeNull();
+    // A1: a lost connection after the 7 days and before the pause.
+    const lostAt = new Date(NOW - 60 * MINUTE).toISOString();
+    expect(sendBlock({ ...base, row: old, connectionLostAt: lostAt })).toEqual({ kind: "too-old" });
+    expect(
+      sendBlock({ ...base, row: row(), connectionLostAt: lostAt, pausedUntil: new Date(NOW + MINUTE).toISOString() })
+    ).toEqual({ kind: "connection-lost" });
+    expect(sendBlock({ ...base, row: row(), campaignId: "", connectionLostAt: lostAt })).toEqual({
+      kind: "connection-lost",
+    });
+    expect(sendBlock({ ...base, row: sent, connectionLostAt: lostAt })).toEqual({ kind: "sent" });
+    expect(sendBlock({ ...base, row: row(), connectionLostAt: null })).toBeNull();
     expect(sendBlock({ ...base, row: row(), sending: true })).toEqual({ kind: "sending" });
     expect(sendBlock({ ...base, row: row(), campaignId: "" })).toEqual({ kind: "no-campaign" });
     const exhausted = row({
@@ -285,6 +317,7 @@ describe("the rules behind a row", () => {
       "campaign_not_found",
       "not_comment_campaign",
       "provider",
+      "connection_lost",
       "worker_outdated",
       "paused",
       "already_sent",
@@ -308,6 +341,12 @@ describe("the rules behind a row", () => {
       /^Senden pausiert bis \d\d:\d\d: Instagram-Limit erreicht\.$/
     );
     expect(blockText({ kind: "no-campaign" }, i18n)).toBeNull();
+    expect(refusalText("connection_lost", undefined, i18n)).toBe(
+      "Die Verbindung zu Instagram ist unterbrochen. Verbinde zuerst neu."
+    );
+    expect(blockText({ kind: "connection-lost" }, i18n)).toBe(
+      "Die Verbindung zu Instagram ist unterbrochen. Verbinde zuerst neu."
+    );
   });
 
   it("names the job after the comment, the campaign and its attempts, without a colon", () => {
@@ -351,6 +390,9 @@ describe("the page's texts", () => {
     "Send a campaign's DM by hand, for example for a comment without the exact keyword. Instagram allows one DM per comment, up to 7 days after the comment.",
     "No comments without a DM in the last 7 days.",
     "No result yet. Reload the page in a moment.",
+    "The connection to Instagram is lost. Reconnect first.",
+    "The connection to Instagram has been lost since {time}. Reconnect, then you can send DMs here again.",
+    "Reconnect",
   ] as const;
 
   it("exist in every language", () => {

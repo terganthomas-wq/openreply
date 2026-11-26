@@ -38,8 +38,9 @@ press "Send DM".
 - `POST /api/instagram/comments/send` with
   `{ "commentId": "…", "automationId": "…", "publicReply": true }` checks, in
   this order: the campaign belongs to the workspace and has a DM text, the
-  account is connected through your own Meta app, the running worker knows
-  manual sends, the account is not paused for a Meta request limit, no DM
+  account is connected through your own Meta app, its connection is not lost
+  ([connection alert](connection-alert.md): refused with `connection_lost`,
+  the page shows "Reconnect"), the running worker knows manual sends, the account is not paused for a Meta request limit, no DM
   for the comment went out (or may have, or is on its way), the campaign has
   send attempts left for it, and Instagram still has the comment
   (`/{comment-id}?fields=id,text,timestamp,from{id,username},media{id}`),
@@ -89,7 +90,8 @@ A page view costs one read of the posts and one read of each post's newest 50
 comments (16 reads for 15 posts), never a second page. Each read is cached in
 Redis for 60 seconds per account, so a reload or "Load more" only reads what
 is missing. The page reads nothing in the background, nothing while the
-account is paused, and stops at a Meta limit on a read. A send costs one read
+account is paused or its connection is lost (it shows since when, with
+"Reconnect"), and stops at a Meta limit on a read. A send costs one read
 of the comment (plus one of the posts, unless they are cached).
 
 ## Rollout

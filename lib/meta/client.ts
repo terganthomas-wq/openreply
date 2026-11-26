@@ -922,6 +922,33 @@ export async function getUserInfo(
   return isUnified(auth) ? { ...user, user_id: user.id } : user;
 }
 
+/** How long the connection check waits for Meta before it counts as no answer. */
+const ACCOUNT_NODE_TIMEOUT_MS = 15_000;
+
+/**
+ * The account's own node with two fields, `id,username`: the connection
+ * check's one read per account and sweep (lib/instagram/connection-check.ts),
+ * the cheapest call that still needs a working token and the account's basic
+ * permission. Throws Meta's error as every read does; a request that takes
+ * longer than 15 seconds is aborted.
+ */
+export async function getAccountNode(
+  auth: MetaAuth,
+  igUserId?: string
+): Promise<{ id: string; username?: string }> {
+  const node = instagramNode(auth, igUserId);
+  const url = new URL(`${instagramGraphBase(auth)}/${node}`);
+  url.searchParams.set("fields", "id,username");
+  url.searchParams.set("access_token", tokenOf(auth));
+
+  return handleResponse<{ id: string; username?: string }>(
+    await metaFetch(auth, url.toString(), {
+      method: "GET",
+      signal: AbortSignal.timeout(ACCOUNT_NODE_TIMEOUT_MS),
+    })
+  );
+}
+
 const MEDIA_FIELDS =
   "id,caption,media_type,media_product_type,media_url,thumbnail_url,timestamp,permalink,like_count,comments_count";
 
