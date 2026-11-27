@@ -920,9 +920,14 @@ deshalb absichtlich.
 4. Erst danach auf dem Server: `bash ~/openreply/deploy/oracle/update-worker.sh`.
    Am Ende steht „Worker now at <sha> …“.
 
-Was `update-worker.sh` macht: `git pull --ff-only`, dann prüft
-`npx prisma migrate status`, ob die Datenbank jede Migration des neuen Stands
-hat. Nur dann folgen `npm ci`, `prisma generate` und der Neustart über pm2.
+Was `update-worker.sh` macht: Es holt den neuen Stand (`git fetch`) und legt
+zuerst nur dessen Ordner `prisma/migrations` neben den Code, mit dem der
+Worker läuft. Dann prüft `npx prisma migrate status`, ob die Datenbank jede
+Migration des neuen Stands hat, und der Ordner geht wieder auf den alten
+Stand; sonst ändert das Skript dabei nichts an der Kopie. Startet pm2 den
+Worker in diesen Sekunden neu, läuft er also mit dem alten Code und den
+Paketen, die dazu passen. Nur wenn alles da ist, folgen der Fast-Forward auf
+den neuen Stand, `npm ci`, `prisma generate` und der Neustart über pm2.
 
 - **„Stopped: the database lacks migrations of this commit. Wait until
   Vercel shows success, then run this again. The worker keeps running at
@@ -930,14 +935,22 @@ hat. Nur dann folgen `npm ci`, `prisma generate` und der Neustart über pm2.
   weil Vercel noch baut. Ein neuer Worker würde dann jeden Kommentar, jeden
   Tipp, jede DM, jede Folgenachricht und jedes Angebot mit „column does not
   exist“ scheitern lassen (wiederholt nach 5 und 15 Minuten, dann verworfen;
-  für Tipps holt kein Durchlauf etwas nach). Das Skript setzt deshalb nur die
-  Kopie auf dem Server auf den alten Stand zurück (`origin/main` bleibt, wie
-  es ist; `npm ci` lief noch nicht, die Pakete passen also zum alten Stand)
-  und startet nichts neu. Der laufende Worker arbeitet mit dem alten Stand
-  weiter, auch wenn pm2 ihn nach einem Absturz neu startet. Warte, bis Vercel
-  `success` zeigt, und starte das Skript noch einmal. Ausgegeben werden nur
-  die Namen der Migrationen und Prismas Urteil, nie die Adresse der
-  Datenbank.
+  für Tipps holt kein Durchlauf etwas nach). Die Kopie auf dem Server bleibt
+  deshalb beim alten Stand (`origin/main` bleibt, wie es ist; `npm ci` lief
+  nicht, die Pakete passen also dazu), und nichts startet neu. Der laufende
+  Worker arbeitet mit dem alten Stand weiter, auch wenn pm2 ihn nach einem
+  Absturz neu startet. Warte, bis Vercel `success` zeigt, und starte das
+  Skript noch einmal. Ausgegeben werden nur die Namen der Migrationen und
+  Prismas Urteil, nie die Adresse der Datenbank.
+- **„Stopped: node_modules is incomplete (an earlier npm ci did not finish).
+  Nothing was changed or restarted. …“** Ein früheres `npm ci` ist nicht
+  fertig geworden (etwa Netz, Speicher oder eine abgebrochene Verbindung),
+  und `node_modules` ist leer oder unvollständig. Dann kann auch die Prüfung
+  nicht laufen; das Skript ändert nichts. Der laufende Worker arbeitet aus
+  dem Speicher weiter, ein Neustart durch pm2 (Absturz, Speichergrenze)
+  würde aber scheitern, also bald reparieren: Sobald Vercel `success` zeigt,
+  `cd ~/openreply && npm ci --no-fund --no-audit && npx prisma generate`,
+  dann das Skript noch einmal starten.
 - **„Stopped: prisma migrate status could not check the database …“** Prisma
   konnte die Datenbank gar nicht fragen, etwa ohne Verbindung. Auch dann
   bleibt alles beim alten Stand. Die Einzelheiten zeigt das Skript nicht, weil
@@ -983,7 +996,7 @@ später wieder, braucht sie keine zweite Migration für dieselben Spalten.
   sind. Ein neuerer Worker vor seiner Migration scheitert mit „column does
   not exist“; davor schützt `update-worker.sh`.
 - Nie `git reset` oder Force-Push auf `main`: `update-worker.sh` bricht dann
-  bei `git pull --ff-only` ab.
+  beim Fast-Forward (`git merge --ff-only`) ab.
 
 ## Prüfen, ob alles läuft
 
