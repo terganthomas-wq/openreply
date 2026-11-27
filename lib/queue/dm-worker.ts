@@ -1938,6 +1938,43 @@ async function findConversationContact(
 }
 
 /**
+ * A button tap no campaign answers: its campaign was paused (and not sent to
+ * this person by hand), deleted or moved to another account, its account
+ * lost its token, or the payload is none of ours. It opens Instagram's
+ * 24-hour messaging window all the same, so it is recorded on the person's
+ * contact with its time, as every other tap is: a read fallback, a
+ * follow-up or an offer of another campaign reads the window there. A read
+ * fallback is no tap, and a follow re-check repeats a tap recorded already.
+ * Nothing is answered and Meta is not called. Best effort, like
+ * recordMessageSender: a failure is logged, and the job still ends without
+ * an answer.
+ */
+async function recordUnansweredTap(job: Job<ProcessPostbackJob>): Promise<void> {
+  if (job.data.fallback || job.data.followRecheck) return;
+  const { instagramAccountId, accountConnectionId, userId } = job.data;
+  try {
+    const account = await prisma.instagramAccount.findUnique({
+      where: { instagramId: instagramAccountId },
+      select: { id: true, workspaceId: true },
+    });
+    // A job bound to a connection that has since been replaced is not
+    // credited to the new one, as for a DM (recordMessageSender).
+    if (!account || (accountConnectionId && account.id !== accountConnectionId)) {
+      return;
+    }
+    await ensureContactSafe({
+      workspaceId: account.workspaceId,
+      instagramAccountId: account.id,
+      igsid: userId,
+      // A copy for the account's pause and a lost tap carry their tap's time.
+      interactionAt: new Date(tapTime(job)),
+    });
+  } catch (error) {
+    console.error("[DM Worker] Failed to record the tap:", formatError(error));
+  }
+}
+
+/**
  * Deliver the reveal message after a user taps an opening DM's button.
  * The postback payload is `reveal:<automationId>`; the sender is the user's
  * IGSID (same id as their comment author id), which we DM directly.
@@ -1951,7 +1988,11 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
   if (payload.startsWith(OFFER_PAYLOAD_PREFIX)) return processOfferTap(job);
 
   const isFollowCheck = payload.startsWith("followcheck:");
-  if (!isFollowCheck && !payload.startsWith("reveal:")) return;
+  if (!isFollowCheck && !payload.startsWith("reveal:")) {
+    // No button of a campaign, but a tap all the same: it opens the window.
+    await recordUnansweredTap(job);
+    return;
+  }
   // The opening DM's button appends ":open" to the payload; the first follow
   // prompt's button does not. Automation ids are cuids and contain no colon.
   const [automationId, marker] = payload
@@ -1989,7 +2030,9 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
   ) {
     // The campaign was paused (and not sent to this person by hand) or moved
     // to another account while the tap waited, or its account lost its
-    // token. (A deleted campaign took its rows with it.)
+    // token. (A deleted campaign took its rows with it.) The tap still
+    // opened the person's messaging window.
+    await recordUnansweredTap(job);
     if (pauseCopy) {
       await settleWaitingReveal(
         automationId,

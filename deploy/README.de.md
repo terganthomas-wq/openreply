@@ -73,11 +73,16 @@ neu verbinden.
 - Liest jemand die erste DM nur, ohne auf den Button zu tippen, schickt das
   Tool 5 Minuten später den Link nur, wenn Instagrams 24-Stunden-Fenster
   offen ist: Die Person hat in den 24 Stunden davor selbst geschrieben oder
-  einen Button getippt (mit 5 Minuten Sicherheitsabstand). Als Schreiben
-  zählt jede DM, auch eine ohne Text: ein Foto, eine Sprachnachricht, ein
-  Sticker oder das Herz. Eine bloße Reaktion auf eine Nachricht zählt nicht
-  als Schreiben: Für das Tool öffnet sie das Fenster nicht. Bei einer
-  Kampagne mit Follow-Gate prüft es dann wie bisher, ob die Person folgt.
+  einen Button getippt (mit 5 Minuten Sicherheitsabstand). Jeder Button
+  zählt, auch der einer Kampagne, die inzwischen pausiert oder gelöscht ist.
+  Als Schreiben zählt jede DM, auch eine ohne Text: ein Foto, eine
+  Sprachnachricht, ein Sticker oder das Herz. Eine DM ohne Text zählt aber
+  erst ab dem Worker-Update, das sie kennt: Eine, die vorher kam oder in den
+  Minuten zwischen dem Vercel-Deploy und „Worker now at …“, zählt nie (der
+  ältere Worker übergeht ihren Auftrag). Eine bloße Reaktion auf eine
+  Nachricht zählt nicht als Schreiben: Für das Tool öffnet sie das Fenster
+  nicht. Bei einer Kampagne mit Follow-Gate prüft es dann wie bisher, ob die
+  Person folgt.
   Sonst fragt das Tool Instagram gar nicht erst, auch nicht nach Name oder
   Folgen: Lesen öffnet das Fenster nicht, und Meta lehnt solche Nachrichten
   ab. Im Worker-Log (`pm2 logs`) steht dann „Read fallback skipped: no open

@@ -4,9 +4,13 @@ A contact is one Instagram user as one connected account sees them: their
 Instagram-scoped id (IGSID), their handle when a comment carried it, and the
 tags they got. The same person on two connected accounts is two contacts,
 because Instagram gives them a different id on each. A contact is recorded
-when a campaign's keyword matches their comment, on every button tap and on
-every DM they send, also one without text (a photo, a voice note, a sticker,
-the heart), which no campaign answers but which opens the messaging window.
+when a campaign's keyword matches their comment, on every button tap (also
+one on a button of a campaign paused or deleted since, which nothing
+answers) and on every DM they send, also one without text (a photo, a voice
+note, a sticker, the heart), which no campaign answers but which opens the
+messaging window. A DM without text is recorded by its own worker job: a
+worker from before that job skips it, and such a DM is then never recorded,
+also not by the newer worker that follows.
 
 Contacts belong to the account, not to a campaign: pausing or deleting a
 campaign keeps them and their tags. Disconnecting an Instagram account in

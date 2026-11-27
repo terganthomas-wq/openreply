@@ -6173,4 +6173,180 @@ describe("DM Worker — read fallback and follow-up only inside the messaging wi
       expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(windowClosedEvent);
     });
   });
+
+  // A tap opens the window whatever its button: also one of a campaign paused
+  // or deleted since (nothing answers it), and a payload none of ours.
+  describe("a tap no campaign answers", () => {
+    const tapJob = (data: Record<string, unknown>, at: number, id = "postback_tap") => ({
+      name: "process-postback",
+      data: {
+        instagramAccountId: "ig_456",
+        accountConnectionId: "ig_account_row_1",
+        userId: "commenter_999",
+        ...data,
+      },
+      id,
+      attemptsMade: 0,
+      timestamp: at,
+    });
+    const readFallback = () =>
+      tapJob({ payload: "reveal:auto_789", fallback: true }, NOW - MINUTE, "postback_job_001");
+    // The person's contact as the jobs below read and write it: commented,
+    // never tapped or wrote.
+    let stored: { id: string; lastInteractionAt: Date | null };
+
+    beforeEach(() => {
+      stored = { id: "contact_1", lastInteractionAt: null };
+      mockPrisma.contact.upsert.mockImplementation(async () => ({
+        id: stored.id,
+        username: "commenter_user",
+        lastInteractionAt: stored.lastInteractionAt,
+      }));
+      mockPrisma.contact.updateMany.mockImplementation(
+        async ({ data }: { data: { lastInteractionAt?: Date } }) => {
+          const at = data.lastInteractionAt;
+          if (at && (!stored.lastInteractionAt || stored.lastInteractionAt < at)) {
+            stored.lastInteractionAt = at;
+          }
+          return { count: 1 };
+        }
+      );
+      mockPrisma.contact.findUnique.mockImplementation(async () => ({ ...stored }));
+      mockPrisma.instagramAccount.findUnique.mockResolvedValue({
+        id: "ig_account_row_1",
+        workspaceId: "workspace_123",
+      });
+      // Only auto_789 is active (follow-gated); auto_paused is paused and was
+      // never sent to this person by hand, so no campaign answers its button.
+      mockPrisma.automation.findFirst.mockImplementation(
+        async (args: { where: { id: string; isActive: boolean } }) =>
+          args.where.id === "auto_789" && args.where.isActive === true
+            ? { ...mockAutomation, requireFollow: true, trackedLinks: [] }
+            : null
+      );
+      mockPrisma.dmLog.findFirst.mockResolvedValue(null);
+      mockGetUserUsername.mockResolvedValue("live_handle");
+    });
+
+    it.each([
+      "reveal:auto_paused:open",
+      "followcheck:auto_paused",
+      "followcheck:auto_paused:retry",
+      "SOME_OTHER_TOOL_PAYLOAD",
+    ])(
+      "%s: the tap is recorded with its time and answered with nothing, and another campaign's read fallback then sends",
+      async (payload) => {
+        await expect(
+          getProcessor()(tapJob({ payload, mid: "mid_tap_1" }, NOW - 2 * MINUTE))
+        ).resolves.toBeUndefined();
+
+        expect(stored.lastInteractionAt).toEqual(new Date(NOW - 2 * MINUTE));
+        expect(mockPrisma.instagramAccount.findUnique).toHaveBeenCalledWith({
+          where: { instagramId: "ig_456" },
+          select: { id: true, workspaceId: true },
+        });
+        // No answer and no Meta call.
+        expect(mockDecryptToken).not.toHaveBeenCalled();
+        expect(mockGetUserFollowStatus).not.toHaveBeenCalled();
+        expect(mockSendDirectMessage).not.toHaveBeenCalled();
+        expect(mockSendDirectMessageWithButton).not.toHaveBeenCalled();
+        expect(mockSendDirectMessageWithLinkButton).not.toHaveBeenCalled();
+        expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
+
+        await getProcessor()(readFallback());
+
+        expect(log).not.toHaveBeenCalledWith(
+          "[DM Worker] Read fallback skipped: no open messaging window",
+          "postback_job_001"
+        );
+        expect(mockGetUserFollowStatus).toHaveBeenCalledTimes(1);
+        expect(mockSendDirectMessage).toHaveBeenCalledWith(
+          META_AUTH,
+          "ig_456",
+          "commenter_999",
+          "Hey live_handle! Here is the link: https://example.com"
+        );
+      }
+    );
+
+    it("records a tap on a campaign moved to another account, or whose account lost its token", async () => {
+      mockPrisma.automation.findFirst.mockResolvedValue({
+        ...mockAutomation,
+        instagramAccount: { ...mockAutomation.instagramAccount, instagramId: "ig_other" },
+      });
+      await getProcessor()(tapJob({ payload: "reveal:auto_789:open", mid: "m1" }, NOW - 3 * MINUTE));
+      expect(stored.lastInteractionAt).toEqual(new Date(NOW - 3 * MINUTE));
+
+      mockPrisma.automation.findFirst.mockResolvedValue({
+        ...mockAutomation,
+        instagramAccount: { ...mockAutomation.instagramAccount, accessToken: "" },
+      });
+      await getProcessor()(tapJob({ payload: "reveal:auto_789:open", mid: "m2" }, NOW - 2 * MINUTE));
+      expect(stored.lastInteractionAt).toEqual(new Date(NOW - 2 * MINUTE));
+      expect(mockDecryptToken).not.toHaveBeenCalled();
+      expect(mockSendDirectMessage).not.toHaveBeenCalled();
+    });
+
+    it("records a copy for the account's pause with the time of its tap", async () => {
+      await getProcessor()(
+        tapJob(
+          { payload: "reveal:auto_paused:open", tapId: "mid_tap", tappedAt: NOW - 20 * MINUTE, pauseRequeue: 1 },
+          NOW
+        )
+      );
+
+      expect(stored.lastInteractionAt).toEqual(new Date(NOW - 20 * MINUTE));
+    });
+
+    it("records nothing for a read fallback or a follow re-check whose campaign is gone", async () => {
+      await getProcessor()(tapJob({ payload: "reveal:auto_paused", fallback: true }, NOW - MINUTE));
+      await getProcessor()(
+        tapJob(
+          {
+            payload: "followcheck:auto_paused",
+            followRecheck: true,
+            followRecheckAttempt: 1,
+            tappedAt: NOW - 10 * MINUTE,
+          },
+          NOW
+        )
+      );
+
+      expect(mockPrisma.instagramAccount.findUnique).not.toHaveBeenCalled();
+      expect(mockPrisma.contact.upsert).not.toHaveBeenCalled();
+      expect(mockPrisma.contact.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("does not credit a tap bound to a connection replaced since", async () => {
+      mockPrisma.instagramAccount.findUnique.mockResolvedValue({
+        id: "ig_account_row_NEW",
+        workspaceId: "workspace_123",
+      });
+
+      await getProcessor()(tapJob({ payload: "reveal:auto_paused:open", mid: "m" }, NOW - MINUTE));
+
+      expect(mockPrisma.contact.upsert).not.toHaveBeenCalled();
+      expect(stored.lastInteractionAt).toBeNull();
+    });
+
+    it("still ends without an answer when the tap cannot be recorded", async () => {
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        mockPrisma.instagramAccount.findUnique.mockRejectedValueOnce(new Error("database down"));
+        await expect(
+          getProcessor()(tapJob({ payload: "reveal:auto_paused:open", mid: "m1" }, NOW - MINUTE))
+        ).resolves.toBeUndefined();
+
+        mockPrisma.contact.upsert.mockRejectedValue(new Error("database down"));
+        await expect(
+          getProcessor()(tapJob({ payload: "SOME_OTHER_TOOL_PAYLOAD", mid: "m2" }, NOW - MINUTE))
+        ).resolves.toBeUndefined();
+
+        expect(error).toHaveBeenCalled();
+        expect(mockSendDirectMessage).not.toHaveBeenCalled();
+      } finally {
+        error.mockRestore();
+      }
+    });
+  });
 });

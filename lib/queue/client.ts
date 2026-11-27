@@ -237,9 +237,15 @@ export const COMMENT_JOB_NAME = "process-comment";
 export const POSTBACK_JOB_NAME = "process-postback";
 export const FOLLOWUP_JOB_NAME = "process-followup";
 export const MESSAGE_JOB_NAME = "process-message";
-// A worker from before this job ignores its name (dispatchJob): the DM's
-// time is then not recorded, as before. DMs without text never go into the
-// message job, which an older worker would answer for "any word" campaigns.
+// A worker from before this job ignores its name (dispatchJob: "Ignoring
+// unknown job"), and BullMQ counts the job as done: it never runs again, not
+// even on the newer worker that follows, so that DM never counts for the
+// messaging window. Before this job, no DM without text counted at all. So
+// for up to 24 hours after the worker update that brings this job, a DM
+// without text sent before it, or in the minutes between the web app's
+// deploy and the worker's update, opens no window for a read fallback, a
+// follow-up or an offer. DMs without text never go into the message job,
+// which an older worker would answer for "any word" campaigns.
 export const DM_SENDER_JOB_NAME = "process-dm-sender";
 export const OFFER_JOB_NAME = "process-offer";
 // A worker from before the catch-up ignores this name (dispatchJob), and the
