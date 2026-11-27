@@ -193,6 +193,37 @@ eine offene Seite alle 12 Sekunden nach Liste und Unterhaltung, bis zu
   Abruf erlaubt (mit einer Warnung im Log): Die Grenze ist ein
   Sicherheitsnetz, keine Zugangssperre.
 
+#### Übersicht: Statistiken für höchstens 12 Beiträge
+
+Die *Übersicht* zeigt pro Beitrag Aufrufe, Reichweite, Speicherungen und
+Teilen. Dafür fragt sie Instagram für jeden Beitrag einzeln (Recht
+`instagram_manage_insights`). Früher waren das bei „Gesamter Zeitraum“ bis zu
+500 Abfragen bei jedem Öffnen. Jetzt gilt:
+
+- Die Seite öffnet mit „Letzte 12“. Statistiken holt sie nur für die 12
+  neuesten Beiträge, 3 gleichzeitig.
+- Bei 25, 50 oder 100 Beiträgen und bei „Gesamter Zeitraum“ (weiter höchstens
+  500 Beiträge) zeigt sie Likes und Kommentare für alle Beiträge, die
+  Statistiken aber nur für die 12 neuesten. Darüber steht dann „Aufrufe,
+  Reichweite, Speicherungen und Teilen gelten für die 12 neuesten Beiträge.“
+  Die Summen dieser vier Werte zählen nur diese Beiträge.
+- Die Statistik eines Beitrags bleibt 6 Stunden gespeichert (Redis), die ganze
+  Seite 10 Minuten. Öffnest du die Übersicht innerhalb von 10 Minuten wieder,
+  siehst du den gespeicherten Stand („Stand: HH:MM“), und es geht keine
+  Anfrage an Instagram. Die Statistik-Zahlen können also bis zu 6 Stunden alt
+  sein; Likes und Kommentare höchstens 10 Minuten.
+- Die Follower-Zahl kommt aus dem täglichen Eintrag (Cron um 07:00 UTC),
+  sobald es ihn gibt. Sonst fragt die Seite einmal das Profil ab, wie bisher
+  (beim ersten Öffnen eines neuen Kontos mit dem Verlauf der letzten 30 Tage).
+- Meldet Instagram ein Limit, fragt die Seite in diesem Durchgang keinen
+  weiteren Beitrag ab. Eine gescheiterte Abfrage wird nicht gespeichert und
+  beim nächsten Öffnen nach den 10 Minuten wiederholt.
+- Für die App-Prüfung bei Meta: Das Recht `instagram_manage_insights` braucht
+  Aufrufe in den 30 Tagen vor dem Einreichen. Öffne die Übersicht in dieser
+  Zeit mindestens einmal (bei einem Stand älter als 6 Stunden fragt sie
+  Instagram).
+- Über Zernio verbundene Konten bleiben, wie sie sind.
+
 ## Manuell senden
 
 Die Seite *Kommentare* im Menü (nur für Inhaber und Admins) zeigt die

@@ -6,6 +6,11 @@
  * Aggregate reach/engagement across your recent posts, plus a per-post table.
  * Views / reach / saved / shares come from Instagram media insights (requires
  * the insights permission); likes and comments are always available.
+ *
+ * B13 (Meta submission plan, part B, S1c): insights cover the 12 newest
+ * posts only, kept for 6 hours; the whole answer is kept for 10 minutes
+ * (app/api/instagram/overview/route.ts). Larger ranges say so above the
+ * totals, and "As of" tells when the numbers were read.
  */
 
 import type { Locale } from "@/lib/i18n";
@@ -28,7 +33,12 @@ function formatDate(iso: string, locale: Locale): string {
   return d.toLocaleDateString(locale, { month: "short", day: "numeric" });
 }
 
+function formatClock(iso: string, locale: Locale): string {
+  return new Date(iso).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" });
+}
+
 const COUNT_OPTIONS = [
+  { value: "12", label: "Last 12" },
   { value: "25", label: "Last 25" },
   { value: "50", label: "Last 50" },
   { value: "100", label: "Last 100" },
@@ -41,7 +51,7 @@ export default function OverviewPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedAccountId, setSelectedAccountId] = useState("all");
-  const [count, setCount] = useState("50");
+  const [count, setCount] = useState("12");
 
   useEffect(() => {
     const params = new URLSearchParams();
@@ -107,6 +117,9 @@ export default function OverviewPage() {
 
   const { totals, posts, accounts, insightsAvailable, followers, followerHistory } =
     data;
+  // Larger ranges: likes and comments for every post, the insight numbers
+  // only for the newest ones.
+  const insightsCoverFewer = insightsAvailable && totals.posts > data.insightPosts;
 
   return (
     <div className="space-y-8">
@@ -127,6 +140,9 @@ export default function OverviewPage() {
               {followers.toLocaleString(locale)} {t("followers")}
             </p>
           )}
+          <p className="mt-1 text-xs text-muted">
+            {t("As of {time}", { time: formatClock(data.cachedAt, locale) })}
+          </p>
         </div>
         <div className="flex flex-wrap items-end gap-x-4 gap-y-3">
           <label className="flex flex-col gap-2 text-sm">
@@ -177,13 +193,22 @@ export default function OverviewPage() {
       )}
 
       {/* Aggregate totals */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 sm:gap-4">
-        <StatCard label={t("Views")} value={formatNumber(totals.views, locale)} />
-        <StatCard label={t("Reach")} value={formatNumber(totals.reach, locale)} />
-        <StatCard label={t("Likes")} value={formatNumber(totals.likes, locale)} />
-        <StatCard label={t("Comments")} value={formatNumber(totals.comments, locale)} />
-        <StatCard label={t("Saved")} value={formatNumber(totals.saved, locale)} />
-        <StatCard label={t("Shares")} value={formatNumber(totals.shares, locale)} />
+      <div className="space-y-3">
+        {insightsCoverFewer && (
+          <p className="text-sm text-muted">
+            {t("Views, reach, saves and shares cover the {count} newest posts.", {
+              count: data.insightPosts,
+            })}
+          </p>
+        )}
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 sm:gap-4">
+          <StatCard label={t("Views")} value={formatNumber(totals.views, locale)} />
+          <StatCard label={t("Reach")} value={formatNumber(totals.reach, locale)} />
+          <StatCard label={t("Likes")} value={formatNumber(totals.likes, locale)} />
+          <StatCard label={t("Comments")} value={formatNumber(totals.comments, locale)} />
+          <StatCard label={t("Saved")} value={formatNumber(totals.saved, locale)} />
+          <StatCard label={t("Shares")} value={formatNumber(totals.shares, locale)} />
+        </div>
       </div>
 
       {/* Follower trend — account-level, independent of the post range */}

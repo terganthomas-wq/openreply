@@ -48,3 +48,40 @@ seconds, up to 600 reads an hour for one open tab. Now
 An Inbox that is open and used reads the list about 30 times an hour, plus
 one thread read per new message in the open conversation, and never more
 than 40 times an hour per account. A hidden or idle Inbox reads nothing.
+
+## Overview
+
+The Overview shows views, reach, saves and shares per post, which takes one
+insights read per post (`instagram_manage_insights`): up to 500 reads on
+every open of "All time". Now (`app/api/instagram/overview/route.ts`,
+`lib/instagram/overview-cache.ts`):
+
+- It opens with "Last 12". Insights are read for the 12 newest posts only
+  (`INSIGHT_POSTS`), three at a time.
+- Larger ranges (25, 50, 100 and all time, still at most 500 posts) show
+  likes and comments for every post and insights only for the newest 12; no
+  insights call goes beyond them. The page says so above the totals, and the
+  totals of views, reach, saves and shares sum only those posts
+  (`insightPosts` in the answer).
+- Each post's insights are kept in Redis for 6 hours
+  (`insights:v1:<account row>:<media id>`), the whole answer for 10 minutes
+  (`overview:v1:<account row>:<range>`). Opening the page again within 10
+  minutes makes no Instagram call (`fromCache: true`); the page shows when the
+  answer was read ("As of", `cachedAt`). Only business metrics and the
+  account's own captions are stored; the list of the workspace's accounts is
+  always read fresh.
+- Followers come from today's snapshot (the daily cron at 07:00 UTC) once it
+  exists; otherwise one profile read as before, with the 30-day backfill on a
+  new account's first open.
+- After a request limit or an expired token the remaining posts are not
+  asked in that request. A failed insights read is not stored, so it is
+  retried with the next answer after the 10 minutes.
+- A Redis that fails or does not answer within 3 seconds is skipped for the
+  rest of the request, and the page reads Instagram as before.
+- Accounts connected through Zernio are reported as before: no cache, and
+  insights for every listed post.
+
+With nothing new posted, the Overview of one account makes at most 12
+insights calls every 6 hours, plus one media read per open after the 10
+minutes. Meta's App Review looks for calls of each requested permission in the
+30 days before a submission: open the Overview at least once in that time.

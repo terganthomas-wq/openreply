@@ -179,6 +179,23 @@ export async function getFollowerHistory(
 }
 
 /**
+ * Today's observed follower total of an account: the row the daily cron
+ * (07:00 UTC) or an earlier open of the Overview wrote today, or null. Lets
+ * the Overview skip the profile read when today's count is already known.
+ */
+export async function getTodaysFollowerCount(
+  instagramAccountId: string
+): Promise<number | null> {
+  const row = await prisma.followerSnapshot.findUnique({
+    where: {
+      instagramAccountId_date: { instagramAccountId, date: toUtcDay(new Date()) },
+    },
+    select: { followersCount: true, backfilled: true },
+  });
+  return row && !row.backfilled ? row.followersCount : null;
+}
+
+/**
  * Ensure an account has a current snapshot and, the first time we ever see it,
  * a backfilled history. Called from the overview endpoint so the chart fills in
  * without waiting for the next cron run.

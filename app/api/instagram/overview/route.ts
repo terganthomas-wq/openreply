@@ -3,27 +3,48 @@ import { getCurrentWorkspaceId } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
 import { getWorkspaceInstagramAccount } from "@/lib/instagram-accounts";
 import {
+  INSIGHTS_CACHE_TTL_MS,
+  OVERVIEW_CACHE_TTL_MS,
+  insightsCacheKey,
+  overviewCache,
+  overviewCacheKey,
+} from "@/lib/instagram/overview-cache";
+import {
   getAllUserMedia,
   getMediaInsights,
   PermissionError,
+  RateLimitError,
+  TokenExpiredError,
   type InstagramMedia,
+  type InstagramMediaInsights,
 } from "@/lib/instagram/provider";
 import { createInstagramContext } from "@/lib/instagram/provider";
 import {
   ensureFollowerHistory,
   getFollowerHistory,
+  getTodaysFollowerCount,
   type FollowerHistoryPoint,
 } from "@/lib/reports/follower-history";
 
 // Allow time for paginated media + per-post insight calls on larger accounts.
 export const maxDuration = 60;
 
-// Safety ceiling for "all time": bounds pagination and the number of
-// per-media insight requests so we can't hammer the API or time out.
+// Safety ceiling for "all time": bounds pagination so we can't hammer the
+// API or time out.
 const MAX_POSTS = 500;
 
-// How many insight requests to run at once.
-const INSIGHTS_CONCURRENCY = 8;
+// B13 (Meta submission plan, part B, S1c): views, reach, saves and shares
+// come from one insights read per post. Only the newest INSIGHT_POSTS posts
+// get one, from the 6-hour cache or with a call; larger ranges show likes and
+// comments for every post and make no insights call beyond them. A Zernio
+// account keeps its own reporting as before.
+const INSIGHT_POSTS = 12;
+
+// How many insight requests run at once.
+const INSIGHTS_CONCURRENCY = 3;
+
+// The range when none (or no valid one) is asked for.
+const DEFAULT_COUNT = 12;
 
 /** Map over items with a bounded number of in-flight async operations. */
 async function mapWithConcurrency<T, R>(
@@ -69,6 +90,16 @@ export interface OverviewResponse {
   requestedCount: "all" | number;
   truncated: boolean;
   insightsAvailable: boolean;
+  /**
+   * How many of the newest posts views, reach, saves and shares cover (at
+   * most 12 for an account connected through Meta). The totals of those four
+   * sum only these posts.
+   */
+  insightPosts: number;
+  /** When this answer was put together from Instagram (ISO time). */
+  cachedAt: string;
+  /** The answer came from the 10-minute cache, without a call to Instagram. */
+  fromCache: boolean;
   /** Current follower total, or null if Instagram did not return it. */
   followers: number | null;
   /**
@@ -91,8 +122,19 @@ export interface OverviewResponse {
   limitations?: string[];
 }
 
+/** What the 10-minute cache keeps: the answer without the workspace's accounts. */
+type CachedOverview = Omit<OverviewResponse, "accounts" | "fromCache">;
+
 function isVideoLike(media: InstagramMedia): boolean {
   return media.media_product_type === "REELS" || media.media_type === "VIDEO";
+}
+
+function workspaceAccounts(workspaceId: string) {
+  return prisma.instagramAccount.findMany({
+    where: { workspaceId },
+    orderBy: { connectedAt: "desc" },
+    select: { id: true, username: true },
+  });
 }
 
 export async function GET(request: NextRequest) {
@@ -120,22 +162,40 @@ export async function GET(request: NextRequest) {
     );
   }
 
+  // `count` is either "all" or a positive integer (last N posts).
+  const countParam = request.nextUrl.searchParams.get("count");
+  const isAll = countParam === "all";
+  const parsedCount = countParam ? Number.parseInt(countParam, 10) : NaN;
+  const requestedCount: "all" | number = isAll
+    ? "all"
+    : Number.isFinite(parsedCount)
+      ? Math.max(parsedCount, 1)
+      : DEFAULT_COUNT;
+
+  const target = isAll
+    ? MAX_POSTS
+    : Math.min(requestedCount as number, MAX_POSTS);
+
+  // Accounts connected through Meta read from and write to the cache; a
+  // Zernio account is reported as before.
+  const isMeta = account.provider !== "ZERNIO";
+  const cache = overviewCache();
+  const cacheKey = overviewCacheKey(account.id, isAll ? "all" : target);
+
   try {
+    if (isMeta) {
+      const cached = await cache.get<CachedOverview>(cacheKey);
+      if (cached) {
+        const data: OverviewResponse = {
+          ...cached,
+          accounts: await workspaceAccounts(workspaceId),
+          fromCache: true,
+        };
+        return NextResponse.json({ success: true, data });
+      }
+    }
+
     const accessToken = await createInstagramContext(account);
-
-    // `count` is either "all" or a positive integer (last N posts).
-    const countParam = request.nextUrl.searchParams.get("count");
-    const isAll = countParam === "all";
-    const parsedCount = countParam ? Number.parseInt(countParam, 10) : NaN;
-    const requestedCount: "all" | number = isAll
-      ? "all"
-      : Number.isFinite(parsedCount)
-        ? Math.max(parsedCount, 1)
-        : 50;
-
-    const target = isAll
-      ? MAX_POSTS
-      : Math.min(requestedCount as number, MAX_POSTS);
 
     const media = await getAllUserMedia({ context: accessToken, max: target });
     const truncated =
@@ -144,15 +204,27 @@ export async function GET(request: NextRequest) {
 
     // Likes and comments come free with basic media fields. Views / reach /
     // saved / shares require the insights permission, so fetch them per media
-    // (bounded concurrency) and degrade gracefully if the token was granted
-    // before that scope.
+    // (bounded concurrency, the newest INSIGHT_POSTS only) and degrade
+    // gracefully if the token was granted before that scope. After a request
+    // limit or a dead token the remaining posts are not asked.
     let insightsAvailable = false;
     let permissionDenied = false;
+    let stopAsking = false;
+    const insightMedia = isMeta ? media.slice(0, INSIGHT_POSTS) : media;
 
     const insights = await mapWithConcurrency(
-      media,
+      insightMedia,
       INSIGHTS_CONCURRENCY,
-      async (m) => {
+      async (m): Promise<InstagramMediaInsights | null> => {
+        const key = insightsCacheKey(account.id, m.id);
+        if (isMeta) {
+          const stored = await cache.get<InstagramMediaInsights>(key);
+          if (stored) {
+            insightsAvailable = true;
+            return stored;
+          }
+        }
+        if (stopAsking) return null;
         const metrics = isVideoLike(m)
           ? ["views", "reach", "saved", "shares", "total_interactions"]
           : ["reach", "saved", "shares", "total_interactions"];
@@ -163,16 +235,20 @@ export async function GET(request: NextRequest) {
             metrics: metrics,
           });
           insightsAvailable = true;
+          if (isMeta) await cache.set(key, data, INSIGHTS_CACHE_TTL_MS);
           return data;
         } catch (err) {
           if (err instanceof PermissionError) permissionDenied = true;
+          if (err instanceof RateLimitError || err instanceof TokenExpiredError) {
+            stopAsking = true;
+          }
           return null;
         }
       }
     );
 
     const posts: OverviewPost[] = media.map((m, i) => {
-      const ins = insights[i];
+      const ins = insights[i] ?? null;
       const likes = m.like_count ?? 0;
       const comments = m.comments_count ?? 0;
       return {
@@ -191,6 +267,8 @@ export async function GET(request: NextRequest) {
       };
     });
 
+    // Views, reach, saved and shares are null for posts without insights, so
+    // their totals sum only the posts that have them.
     const totals = posts.reduce(
       (acc, p) => {
         acc.posts += 1;
@@ -216,22 +294,21 @@ export async function GET(request: NextRequest) {
       }
     );
 
-    const accounts = await prisma.instagramAccount.findMany({
-      where: { workspaceId },
-      orderBy: { connectedAt: "desc" },
-      select: { id: true, username: true },
-    });
+    const accounts = await workspaceAccounts(workspaceId);
 
     // Followers is a point-in-time figure and deliberately not part of
     // `totals`, which sums over the selected posts. A failure here must not
-    // take down the rest of the overview.
+    // take down the rest of the overview. Today's count, once the daily cron
+    // or an earlier open recorded it, needs no profile read.
     let followers: number | null = null;
     let followerHistory: FollowerHistoryPoint[] = [];
     try {
-      followers = await ensureFollowerHistory(
-        { id: account.id, instagramId: account.instagramId },
-        accessToken
-      );
+      followers =
+        (isMeta ? await getTodaysFollowerCount(account.id) : null) ??
+        (await ensureFollowerHistory(
+          { id: account.id, instagramId: account.instagramId },
+          accessToken
+        ));
       followerHistory = await getFollowerHistory(account.id);
     } catch (err) {
       console.warn(
@@ -240,9 +317,8 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const data: OverviewResponse = {
+    const answer: CachedOverview = {
       account: { id: account.id, username: account.username },
-      accounts,
       requestedCount,
       provider: account.provider,
       limitations:
@@ -254,12 +330,16 @@ export async function GET(request: NextRequest) {
           : [],
       truncated,
       insightsAvailable: insightsAvailable && !permissionDenied,
+      insightPosts: insightMedia.length,
+      cachedAt: new Date().toISOString(),
       followers,
       followerHistory,
       totals,
       posts,
     };
+    if (isMeta) await cache.set(cacheKey, answer, OVERVIEW_CACHE_TTL_MS);
 
+    const data: OverviewResponse = { ...answer, accounts, fromCache: false };
     return NextResponse.json({ success: true, data });
   } catch (err) {
     console.error("[Instagram Overview] Error:", err);
