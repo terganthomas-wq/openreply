@@ -75,12 +75,12 @@ neu verbinden.
   offen ist: Die Person hat in den 24 Stunden davor selbst geschrieben oder
   einen Button getippt (mit 5 Minuten Sicherheitsabstand). Als Schreiben
   zählt jede DM, auch eine ohne Text: ein Foto, eine Sprachnachricht, ein
-  Sticker oder das Herz. Eine bloße Reaktion auf eine Nachricht zählt nicht,
-  die bekommt das Tool nicht. Bei einer Kampagne
-  mit Follow-Gate prüft es dann wie bisher, ob die Person folgt. Sonst fragt
-  das Tool Instagram gar nicht erst, auch nicht nach Name oder Folgen: Lesen
-  öffnet das Fenster nicht, und Meta lehnt solche Nachrichten ab. Im
-  Worker-Log (`pm2 logs`) steht dann „Read fallback skipped: no open
+  Sticker oder das Herz. Eine bloße Reaktion auf eine Nachricht zählt nicht
+  als Schreiben: Für das Tool öffnet sie das Fenster nicht. Bei einer
+  Kampagne mit Follow-Gate prüft es dann wie bisher, ob die Person folgt.
+  Sonst fragt das Tool Instagram gar nicht erst, auch nicht nach Name oder
+  Folgen: Lesen öffnet das Fenster nicht, und Meta lehnt solche Nachrichten
+  ab. Im Worker-Log (`pm2 logs`) steht dann „Read fallback skipped: no open
   messaging window“, im DM-Protokoll nichts. Lesebestätigungen werden weiter
   gespeichert und zählen weiter für „Nachrichten kommen nicht an“.
 - Die Folgenachricht einer Kampagne prüft dasselbe Fenster direkt vor dem

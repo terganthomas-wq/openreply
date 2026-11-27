@@ -11,8 +11,12 @@ import {
   parseMessageEvents,
   parseMessageSenderEvents,
   parseReadEvents,
+  inboundMessagingAccountIds,
+  inboundMessagingKind,
 } from "../lib/meta/webhook";
 import { createHmac } from "crypto";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 
 // Mock the environment variable
 beforeEach(() => {
@@ -601,5 +605,39 @@ describe("parseReadEvents", () => {
     };
 
     expect(parseReadEvents(payload)).toHaveLength(0);
+  });
+});
+
+describe("a bare reaction to a message", () => {
+  // The handbook's read-fallback line (deploy/README.de.md, "Testen und
+  // Eigenheiten") says a reaction does not count as writing. The webhook does
+  // take one in: it counts for the messaging silence check (A2).
+  const reaction = {
+    sender: { id: "user_999" },
+    recipient: { id: "ig_456" },
+    reaction: { mid: "mid_abc", action: "react", emoji: "❤️" },
+  };
+  const payload = {
+    object: "instagram",
+    entry: [{ id: "ig_456", time: 1234567890, messaging: [reaction] }],
+  } as Parameters<typeof parseMessageEvents>[0];
+
+  it("arrives, but no DM job comes of it, so it stamps no messaging window", () => {
+    expect(inboundMessagingKind(reaction, "ig_456")).toBe("reaction");
+    expect(inboundMessagingAccountIds(payload)).toEqual(["ig_456"]);
+    expect(parseMessageEvents(payload)).toEqual([]);
+    expect(parseMessageSenderEvents(payload)).toEqual([]);
+  });
+
+  it("is described that way in the handbook, which does not claim the tool never gets one", () => {
+    const handbook = readFileSync(path.join(__dirname, "..", "deploy", "README.de.md"), "utf8");
+    const start = handbook.indexOf("- Liest jemand die erste DM nur");
+    expect(start).toBeGreaterThan(-1);
+    const fallbackLine = handbook.slice(start, handbook.indexOf("\n- ", start)).replace(/\s+/g, " ");
+    expect(fallbackLine).toContain(
+      "Eine bloße Reaktion auf eine Nachricht zählt nicht als Schreiben: Für das Tool öffnet sie das Fenster nicht."
+    );
+    const neverGetsOne = /Reaktion[^.]*bekommt das Tool nicht/.test(handbook.replace(/\s+/g, " "));
+    expect(neverGetsOne, "the handbook says the tool never gets a reaction").toBe(false);
   });
 });
