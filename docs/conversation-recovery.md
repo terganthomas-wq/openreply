@@ -48,7 +48,8 @@ every request after the first, and stops with the rows read so far once the
 budget is used up (with none read yet, the code-1 failure stands). The
 Inbox's timer reads make exactly one request (`maxPages: 1`, no retry): a
 refused page fails that read and the shown list stays. Opening the Inbox and
-"Refresh" read the whole list as described above. See
+"Refresh" read the whole list as described above, and so does the read that
+replaces a list copy the Inbox painted on opening. See
 [Instagram reads of the dashboard](instagram-reads.md).
 
 ## Verification

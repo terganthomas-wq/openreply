@@ -1,10 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { usePathname } from "next/navigation";
 import Sidebar from "@/components/sidebar";
 import TopBar from "@/components/top-bar";
 import { ConnectionIncidentBanner } from "@/components/connection-incident";
 import { MessagingSilenceBanner } from "@/components/messaging-silence";
+import { pruneInboxCopies } from "@/lib/inbox/copies";
 import type { ConnectionIncident } from "@/lib/instagram/connection-incident";
 import type { MessagingSilenceIncident } from "@/lib/instagram/messaging-silence-incident";
 
@@ -31,6 +33,15 @@ export default function DashboardShell({
   messagingSilences = [],
 }: DashboardShellProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const pathname = usePathname();
+
+  // Every dashboard page, when it opens (the layout keeps this shell mounted
+  // and it renders again with the new path): the Inbox's browser copies older
+  // than a minute go, so DM texts read there do not stay in the tab after the
+  // Inbox is left (lib/inbox/copies.ts).
+  useEffect(() => {
+    pruneInboxCopies();
+  }, [pathname]);
 
   return (
     // h-dvh, not h-screen: on mobile browsers the URL bar eats into 100vh, which

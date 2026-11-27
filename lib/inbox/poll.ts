@@ -13,11 +13,19 @@
  *   an own send, when a list read shows that it changed
  *   (conversationChanged), and on "Refresh";
  * - a stored copy of the list or a thread is painted only while it is
- *   younger than CACHE_MAX_AGE_MS, and a list copy painted on opening stands
- *   in for a read only until it is that old (firstListReadIn); the thread is
- *   read when it opens anyway. So a message unsent meanwhile shows from the
- *   browser's copy at most a minute after the copy was stored. Stale copies
- *   are removed from the browser's storage (pruneCache);
+ *   younger than CACHE_MAX_AGE_MS; the thread is read when it opens anyway.
+ *   A list copy painted on opening stands in for a read only until it is
+ *   that old (firstListReadIn). Then the list is read as an open without a
+ *   copy reads it: the whole list, a page Meta refuses narrowed down, and an
+ *   error shown in the list's place, so the copy goes either way. A tab
+ *   hidden at that moment makes this read when it is shown again; while the
+ *   server pauses reads, the copy stays, as anything shown does, and the
+ *   first turn of the timer or return to the tab after the pause makes it.
+ *   A list read that replaced the copy before stands for it. So a message
+ *   unsent meanwhile shows from a list copy until that read has answered,
+ *   during a pause until the read after it. Copies older than
+ *   CACHE_MAX_AGE_MS are removed from the browser's storage
+ *   (lib/inbox/copies.ts);
  * - the server allows both reads together at most 40 requests to Meta an
  *   hour per account (lib/inbox/read-budget.ts) and answers 429 inbox_budget
  *   beyond that and while the worker has paused the account for a Meta
@@ -60,9 +68,10 @@ export function readIsStale(readAt: number, now: number): boolean {
 
 /**
  * How long (ms) a list copy stored at `copyAt` and painted on opening stands
- * in for the first read: until it is CACHE_MAX_AGE_MS old. Then the list is
- * read, so a reload does not keep an unsent message's preview until the
- * timer's next turn.
+ * in for the first read: until it is CACHE_MAX_AGE_MS old. Then the whole
+ * list is read, as on an open without a copy, so a reload does not keep an
+ * unsent message's preview until the timer's next turn, nor while Meta
+ * refuses the newest page that a timer read asks for.
  */
 export function firstListReadIn(copyAt: number, now: number): number {
   return Math.max(0, CACHE_MAX_AGE_MS - (now - copyAt));

@@ -194,24 +194,42 @@ eine offene Seite alle 12 Sekunden nach Liste und Unterhaltung, bis zu
   gesendet hast, wenn die Liste darin eine neue Nachricht zeigt, und bei
   *Aktualisieren*. Einen eigenen Zeitgeber hat sie nicht mehr.
 - Eine im Browser gespeicherte Kopie zeigt die Seite nur, solange sie jünger
-  als eine Minute ist; die Liste liest sie dann neu, sobald die Kopie eine
-  Minute alt ist. Eine ältere Kopie zeigt sie gar nicht, du siehst kurz
-  „Wird geladen …“, und alte Kopien löscht sie aus dem Speicher des Browsers.
-  So zeigt eine Kopie eine zurückgezogene Nachricht höchstens bis eine Minute
-  nach dem Speichern.
+  als eine Minute ist. Eine ältere zeigt sie gar nicht, du siehst kurz
+  „Wird geladen …“. Eine Unterhaltung liest die Seite beim Öffnen ohnehin
+  sofort neu. Eine Kopie der Liste zeigt sie beim Öffnen, bis die Kopie eine
+  Minute alt ist. Dann liest sie die Liste wie beim Öffnen ohne Kopie: die
+  ganze Liste, auch wenn Instagram eine Unterhaltung nicht vollständig
+  liefert, und bei einem Fehler steht die Fehlermeldung an ihrer Stelle. Ist
+  der Tab in dem Moment im Hintergrund, liest sie, sobald du zurückkommst.
+  Pausiert das Postfach gerade (siehe unten), bleibt die Kopie stehen wie
+  alles, was die Seite zeigt, und der erste Durchgang oder deine Rückkehr
+  zum Tab nach der Pause liest die ganze Liste. Hat schon vorher ein Abruf
+  die Kopie ersetzt (Rückkehr zum Tab, *Aktualisieren*, nach dem Senden),
+  liest sie nicht noch einmal. Eine zurückgezogene Nachricht zeigt eine Kopie
+  der Liste also nur, bis dieser Abruf da ist.
+- Kopien, die älter als eine Minute sind, löscht die Seite aus dem Speicher
+  des Browsers: beim Öffnen, nach jedem erfolgreichen Abruf und wenn du das
+  Postfach verlässt. Ebenso jede andere Seite des Dashboards, wenn du sie
+  öffnest.
+  Eine Kopie, die beim Verlassen des Postfachs jünger als eine Minute ist,
+  bleibt, bis du nach dieser Minute eine Seite des Dashboards öffnest oder
+  den Tab schließt. Welches Konto du im Postfach zuletzt gewählt hast, bleibt
+  gespeichert.
 - Der Server erlaubt dem Postfach höchstens 40 Abrufe pro Stunde und
   Instagram-Konto, Liste und Unterhaltungen zusammen; die Stunde läuft ab dem
   ersten Abruf. Jede einzelne Anfrage an Instagram zählt: Braucht die Liste
   mehrere Seiten, oder kreist die Seite eine Unterhaltung ein, die Instagram
   nicht vollständig liefert („Details nicht verfügbar“), zählt jede dieser
-  Anfragen. Ein Durchgang alle 2 Minuten fragt genau einmal; lehnt Instagram
-  diese eine Anfrage ab, bleibt die Liste, wie sie ist, bis zum nächsten
-  Öffnen oder *Aktualisieren*. Sind die 40 verbraucht, zeigt die Seite „Das
-  Postfach pausiert bis HH:MM, damit Instagrams Anfrage-Limit nicht erreicht
-  wird.“, behält, was sie zeigt, und liest erst ab dieser Uhrzeit wieder
-  (frühestens nach 30 Sekunden, gezählt mit der Uhr deines Geräts). Die 40
-  stehen fest im Code (`lib/inbox/read-budget.ts`), es gibt keine
-  Einstellung dafür.
+  Anfragen. Die ganze Liste liest die Seite beim Öffnen ohne Kopie, anstelle
+  einer Kopie (siehe oben) und bei *Aktualisieren*. Jeder andere Durchgang
+  alle 2 Minuten fragt genau einmal, nach den neuesten Unterhaltungen; lehnt
+  Instagram diese eine Anfrage ab, bleibt die Liste, wie sie ist, bis die
+  Seite wieder die ganze Liste liest. Sind die 40 verbraucht, zeigt die
+  Seite „Das Postfach pausiert bis HH:MM, damit Instagrams Anfrage-Limit
+  nicht erreicht wird.“, behält, was sie zeigt, und liest erst ab dieser
+  Uhrzeit wieder (frühestens nach 30 Sekunden, gezählt mit der Uhr deines
+  Geräts). Die 40 stehen fest im Code (`lib/inbox/read-budget.ts`), es gibt
+  keine Einstellung dafür.
 - Solange der Worker das Senden für das Konto wegen eines Meta-Limits
   pausiert (siehe oben), liest das Postfach gar nicht bei Instagram und
   zeigt dieselbe Meldung mit dem Ende der Pause.

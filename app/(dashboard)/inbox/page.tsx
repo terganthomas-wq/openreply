@@ -23,7 +23,8 @@ import type { Locale } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
 import { useCallback, useEffect, useEffectEvent, useRef, useState } from "react";
 import AccountSelect, { type AccountOption } from "@/components/account-select";
-import { pruneCache, readCache, writeCache } from "@/lib/client-cache";
+import { readCache, writeCache } from "@/lib/client-cache";
+import { pruneInboxCopies } from "@/lib/inbox/copies";
 import {
   CACHE_MAX_AGE_MS,
   LIST_POLL_MS,
@@ -70,14 +71,6 @@ function freshCache<T>(key: string): { data: T; ts: number } | null {
     : null;
 }
 
-/**
- * The stored copies of lists and threads are painted only while fresh, so
- * the stale ones go: they can hold a message unsent since.
- */
-function pruneInboxCopies() {
-  pruneCache(["inbox:convs:", "inbox:msgs:"], CACHE_MAX_AGE_MS);
-}
-
 export default function InboxPage() {
   const { t, locale } = useI18n();
   const [accounts, setAccounts] = useState<AccountOption[]>([]);
@@ -109,11 +102,15 @@ export default function InboxPage() {
   const conversationRequests = useRef(new Set<string>());
   // What the callbacks below need as it is now, not as it was when they
   // were made: the account and conversation on screen, the list shown (the
-  // base for telling whether the open thread changed), the last input and
-  // list read, the end of a read pause, and the newest thread request.
+  // base for telling whether the open thread changed) and whether it is
+  // still the copy painted on opening, the last input and list read, the end
+  // of a read pause, and the newest thread request.
   const accountRef = useRef("");
   const activeIdRef = useRef<string | null>(null);
   const conversationsRef = useRef<ConversationListItem[]>([]);
+  // The list shown is the copy painted on opening, and no list read has
+  // answered in its place yet: no list, and no error shown.
+  const listIsCopyRef = useRef(false);
   const lastInputAtRef = useRef(0);
   const lastListReadAtRef = useRef(0);
   const budgetUntilRef = useRef(0);
@@ -206,8 +203,9 @@ export default function InboxPage() {
 
   // One read of the list. When the open conversation shows a change, its
   // thread is read too (unless the caller reads it anyway). Errors are shown
-  // only where nothing is shown yet (`showErrors`, the first read); the
-  // caller sets the loading state.
+  // only by the first read, where nothing is shown yet or only the copy
+  // painted on opening (`showErrors`): the error then stands in the list's
+  // place. The caller sets the loading state.
   const loadConversations = useCallback(
     async (
       read: ListRead,
@@ -239,6 +237,7 @@ export default function InboxPage() {
           const fresh: ConversationListItem[] = data.data.conversations;
           const next = read === "page" ? mergeConversationPage(previous, fresh) : fresh;
           conversationsRef.current = next;
+          listIsCopyRef.current = false;
           lastListReadAtRef.current = Date.now();
           setConversations(next);
           writeCache(convCacheKey(accountId), next);
@@ -260,10 +259,12 @@ export default function InboxPage() {
             void loadMessages(open);
           }
         } else if (showErrors) {
+          listIsCopyRef.current = false;
           setConvError(data.error ?? "Failed to load conversations");
         }
       } catch {
         if (showErrors && accountRef.current === accountId) {
+          listIsCopyRef.current = false;
           setConvError("Failed to load conversations");
         }
       } finally {
@@ -276,8 +277,9 @@ export default function InboxPage() {
   );
 
   // Opening the Inbox or another account. A list stored less than a minute
-  // ago is shown as it is and read once it is a minute old; an older one is
-  // not shown at all, so a message unsent since cannot come back from it.
+  // ago is shown as it is until it is a minute old, then read as on an open
+  // without a copy; an older one is not shown at all, so a message unsent
+  // since cannot come back from it.
   useEffect(() => {
     if (!selectedAccountId) return;
     // Reset the open thread when switching accounts. This is an intentional
@@ -288,6 +290,7 @@ export default function InboxPage() {
     accountRef.current = selectedAccountId;
     lastInputAtRef.current = Date.now();
     lastListReadAtRef.current = 0;
+    listIsCopyRef.current = false;
     // The read budget is per account: another account starts unpaused.
     budgetUntilRef.current = 0;
     setBudgetUntil(null);
@@ -298,19 +301,23 @@ export default function InboxPage() {
     const cached = freshCache<ConversationListItem[]>(convCacheKey(selectedAccountId));
     if (cached) {
       conversationsRef.current = cached.data;
+      listIsCopyRef.current = true;
       setConversations(cached.data);
       setConvLoading(false);
       // The copy stands in for a read only until it is a minute old. Then
-      // the newest page is read, unless a read came since, the tab is
-      // hidden (coming back reads) or the server pauses reads.
+      // the list is read as an open without a copy reads it: the whole list,
+      // a page Meta refuses narrowed down, and an error shown in the list's
+      // place; a one-page timer read would fail on such a page and leave the
+      // copy. Not again if a read answered since. While the tab is hidden the
+      // return makes this read, while the server pauses reads the first turn
+      // after the pause (onReturn, onTick).
       const timer = window.setTimeout(() => {
-        const now = Date.now();
         if (
+          listIsCopyRef.current &&
           document.visibilityState === "visible" &&
-          now >= budgetUntilRef.current &&
-          readIsStale(lastListReadAtRef.current, now)
+          Date.now() >= budgetUntilRef.current
         ) {
-          void loadConversations("page");
+          void loadConversations("full", { showErrors: true });
         }
       }, firstListReadIn(cached.ts, Date.now()));
       return () => window.clearTimeout(timer);
@@ -322,6 +329,11 @@ export default function InboxPage() {
     if (document.visibilityState === "hidden") return;
     void loadConversations("full", { showErrors: true });
   }, [selectedAccountId, loadConversations]);
+
+  // Leaving the Inbox: its copies older than a minute go now, the younger
+  // ones with the first dashboard page opened once they are a minute old
+  // (components/dashboard-shell.tsx).
+  useEffect(() => () => pruneInboxCopies(), []);
 
   // The timer's turn: read while the tab is visible and used; stop after 10
   // idle minutes; nothing while hidden or while the server pauses reads.
@@ -340,7 +352,10 @@ export default function InboxPage() {
       return;
     }
     if (now < budgetUntilRef.current) return;
-    void loadConversations("page");
+    // Still the copy painted on opening (its minute fell into a read pause):
+    // this turn reads as an open without a copy does.
+    if (listIsCopyRef.current) void loadConversations("full", { showErrors: true });
+    else void loadConversations("page");
   });
 
   useEffect(() => {
@@ -350,16 +365,18 @@ export default function InboxPage() {
   }, [selectedAccountId, idle]);
 
   // Back on the tab: that is input, it ends an idle stop, and the list is
-  // read once if its last read is older than a minute (the whole list when
-  // nothing is shown yet, as in a tab opened in the background).
+  // read once if its last read is older than a minute. When nothing is shown
+  // yet (a tab opened in the background) or only the copy painted on
+  // opening, that is the whole list with its error shown, as an open without
+  // a copy reads it; otherwise the newest page.
   const onReturn = useEffectEvent(() => {
     const now = Date.now();
     lastInputAtRef.current = now;
     setIdle(false);
     if (now < budgetUntilRef.current) return;
     if (!readIsStale(lastListReadAtRef.current, now)) return;
-    const nothingShown = conversationsRef.current.length === 0;
-    void loadConversations(nothingShown ? "full" : "page", { showErrors: nothingShown });
+    const firstRead = conversationsRef.current.length === 0 || listIsCopyRef.current;
+    void loadConversations(firstRead ? "full" : "page", { showErrors: firstRead });
   });
 
   useEffect(() => {

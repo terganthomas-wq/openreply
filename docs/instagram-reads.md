@@ -29,14 +29,31 @@ seconds, up to 600 reads an hour for one open tab. Now
   read fails and the list stays as it is; it does not narrow the page down.
   Opening the Inbox, another account or "Refresh" read the whole list (at
   most 50 conversations), narrowing such a page down as
-  [conversation recovery](conversation-recovery.md) describes.
+  [conversation recovery](conversation-recovery.md) describes, and so does
+  the read that replaces a list copy painted on opening (next point), also
+  when a turn of the timer makes it.
 - A copy stored in the browser (sessionStorage) is painted only while it is
-  younger than a minute (`CACHE_MAX_AGE_MS`). A list copy painted on opening
-  stands in for the first read only until it is a minute old; then the
-  newest page is read (`firstListReadIn`). An older copy is never painted,
-  and stale copies of lists and threads are removed from the tab's storage
-  on opening and after every read (`pruneCache`). So a message unsent in the
-  meantime shows from a copy at most a minute after the copy was stored.
+  younger than a minute (`CACHE_MAX_AGE_MS`); an older one is never painted.
+  A thread copy is painted when the thread opens, which reads it at once. A
+  list copy painted on opening stands in for the first read until it is a
+  minute old (`firstListReadIn`). Then the list is read as an opening
+  without a copy reads it: the whole list, a refused page narrowed down, and
+  an error shown in the list's place, so the copy goes either way. In a tab
+  hidden at that moment, the read comes with the return to the tab. While
+  reads are paused (below), the copy stays, as anything shown does, and the
+  first turn of the timer or return to the tab after the pause makes the
+  read. A list read that replaced the copy before (a return to the tab,
+  "Refresh", the page read after an own send) stands for it, so there is
+  one such read per opening. A message unsent in the meantime therefore
+  shows from a list copy until that read has answered.
+- Copies older than a minute are removed from the tab's storage
+  (`pruneInboxCopies`, `lib/inbox/copies.ts`): when an account opens in the
+  Inbox, after every successful read, when the Inbox is left, and whenever a
+  dashboard page opens (`components/dashboard-shell.tsx`, on every change of
+  the path). Every other key stays, the account the Inbox remembers
+  (`inbox:selectedAccount`) too. A copy that is younger than a minute when
+  the Inbox is left stays until a dashboard page opens after that minute,
+  or until the tab is closed.
 - The server allows both GET routes together at most 40 requests to Meta
   an hour per connected account (`INBOX_READS_PER_HOUR` in
   `lib/inbox/read-budget.ts`), in a window of an hour from its first read.
