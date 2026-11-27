@@ -50,6 +50,9 @@ const PAGE_CAP = 5;
 // Conversations whose expanded fields make Meta refuse the whole page with
 // code 1 (upstream #60), by their index in the list.
 let broken: number[];
+// A Meta error code every read gets instead of an answer (a request limit, a
+// dead token), or null.
+let refusal: number | null;
 
 function graph() {
   return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -59,6 +62,12 @@ function graph() {
     graphCalls.push({ method, path: url.pathname, params: url.searchParams });
     if (method === "POST" && url.pathname.endsWith("/ig_owner/messages")) {
       return Response.json({ recipient_id: "ig_person", message_id: "mid_sent" });
+    }
+    if (refusal !== null) {
+      return Response.json(
+        { error: { code: refusal, type: "OAuthException", message: "Refused here", fbtrace_id: "trace" } },
+        { status: 400 }
+      );
     }
     if (url.pathname.endsWith("/ig_owner/conversations")) {
       const start = Number(url.searchParams.get("after")?.replace("cursor-", "") ?? 0);
@@ -117,6 +126,7 @@ beforeEach(() => {
   state.redis = redis;
   graphCalls = [];
   broken = [];
+  refusal = null;
   vi.stubGlobal("fetch", graph());
   mockWorkspaceId.mockResolvedValue("workspace_1");
   mockPrisma.instagramAccount.findFirst.mockResolvedValue(ACCOUNT);
@@ -135,6 +145,9 @@ describe("GET /api/instagram/conversations", () => {
     expect(response.status).toBe(200);
     expect(body.data.conversations).toHaveLength(TOTAL);
     expect(graphCalls).toHaveLength(3);
+    // Complete: nothing for the page to pause for.
+    expect(body.partial).toBeUndefined();
+    expect(response.headers.get("Retry-After")).toBeNull();
   });
 
   it("reads one page for a timer read (silent=1)", async () => {
@@ -184,9 +197,14 @@ describe("GET /api/instagram/conversations", () => {
 
     const response = await list();
     expect(response.status).toBe(200);
+    const body = await response.json();
     // Two of the three pages fit into the hour's 40.
-    expect((await response.json()).data.conversations).toHaveLength(2 * PAGE_CAP);
+    expect(body.data.conversations).toHaveLength(2 * PAGE_CAP);
     expect(graphCalls).toHaveLength(2);
+    // Marked as cut short, with the window's end, so the page keeps what it
+    // shows and pauses until then.
+    expect(body.partial).toEqual({ retryAt: new Date(NOW + 60 * 60_000).toISOString() });
+    expect(response.headers.get("Retry-After")).toBe(String(60 * 60));
 
     expect((await list("&silent=1")).status).toBe(429);
     expect(graphCalls).toHaveLength(2);
@@ -283,6 +301,81 @@ describe("while the worker has paused the account for a Meta request limit", () 
     vi.setSystemTime(RESUME + 1);
     expect((await list("&silent=1")).status).toBe(200);
     expect(graphCalls).toHaveLength(1);
+  });
+});
+
+describe("while the account's connection is lost (A1)", () => {
+  const LOST_AT = new Date(NOW - 60 * 60_000);
+
+  beforeEach(() => {
+    // The connection check found Meta refusing the account's token.
+    mockPrisma.instagramAccount.findFirst.mockResolvedValue({ ...ACCOUNT, connectionLostAt: LOST_AT });
+    refusal = 190;
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("reads neither the list nor a thread: no Meta call and none of the hour's reads", async () => {
+    for (const response of [await list(), await list("&silent=1"), await thread()]) {
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({
+        success: false,
+        code: "connection_lost",
+        connectionLostAt: LOST_AT.toISOString(),
+        error: "The connection to Instagram is lost. Reconnect first.",
+      });
+    }
+    expect(graphCalls).toEqual([]);
+    expect(redis.commands).toEqual([]);
+  });
+
+  it("reads again after a reconnect", async () => {
+    mockPrisma.instagramAccount.findFirst.mockResolvedValue(ACCOUNT);
+    refusal = null;
+    expect((await list("&silent=1")).status).toBe(200);
+    expect(graphCalls).toHaveLength(1);
+  });
+});
+
+describe("when Meta refuses the Inbox's own read for a request limit", () => {
+  beforeEach(() => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("pauses the reads for the worker's throttle pause instead of failing", async () => {
+    refusal = 4;
+    for (const response of [await list("&silent=1"), await list(), await thread()]) {
+      expect(response.status).toBe(429);
+      expect(response.headers.get("Retry-After")).toBe(String(20 * 60));
+      expect(await response.json()).toMatchObject({
+        success: false,
+        code: "inbox_budget",
+        retryAt: new Date(NOW + 20 * 60_000).toISOString(),
+      });
+    }
+    // One request each; the worker's pause is the worker's to set.
+    expect(graphCalls).toHaveLength(3);
+    expect(redis.strings.has(accountPauseKey("ig_owner"))).toBe(false);
+  });
+
+  it("pauses an hour for a block (368)", async () => {
+    refusal = 368;
+    const response = await list();
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Retry-After")).toBe(String(60 * 60));
+  });
+
+  it("still answers any other Meta error with a 500", async () => {
+    refusal = 190;
+    expect((await list("&silent=1")).status).toBe(500);
+    expect((await thread()).status).toBe(500);
   });
 });
 

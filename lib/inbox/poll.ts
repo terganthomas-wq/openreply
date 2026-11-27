@@ -28,9 +28,12 @@
  *   (lib/inbox/copies.ts);
  * - the server allows both reads together at most 40 requests to Meta an
  *   hour per account (lib/inbox/read-budget.ts) and answers 429 inbox_budget
- *   beyond that and while the worker has paused the account for a Meta
- *   limit; the page then pauses until the answer's Retry-After
- *   (inboxBudgetRetryAt).
+ *   beyond that, while the worker has paused the account for a Meta limit,
+ *   and when Meta refused the read for a limit; the page then pauses until
+ *   the answer's Retry-After (inboxBudgetRetryAt). A whole list read that
+ *   the budget stopped before its end answers with what it read, marked
+ *   `partial`: the page puts that on top of what it shows and pauses the
+ *   same way (inboxPartialUntil).
  *
  * Pure and client-safe: no imports, no clock of its own.
  */
@@ -143,6 +146,31 @@ export function inboxBudgetRetryAt(
   if (status !== 429 || !body || typeof body !== "object") return null;
   const { code, retryAt } = body as { code?: unknown; retryAt?: unknown };
   if (code !== "inbox_budget") return null;
+  return pauseEnd(retryAfter, retryAt, now);
+}
+
+/**
+ * The end of the read pause (ms, on this browser's clock `now`) when a whole
+ * list read answered with only what it read before the account's hourly
+ * budget ran out (`partial`); otherwise null. Counted as for a refused read
+ * (inboxBudgetRetryAt). The page puts those conversations on top of what it
+ * shows, as for a page read (mergeConversationPage), instead of replacing
+ * the list with them.
+ */
+export function inboxPartialUntil(
+  body: unknown,
+  retryAfter: string | null,
+  now: number
+): number | null {
+  if (!body || typeof body !== "object") return null;
+  const { partial } = body as { partial?: unknown };
+  if (!partial || typeof partial !== "object") return null;
+  return pauseEnd(retryAfter, (partial as { retryAt?: unknown }).retryAt, now);
+}
+
+// Retry-After seconds counted from `now`, else the server's retryAt, and
+// never sooner than BUDGET_PAUSE_MIN_MS from `now`.
+function pauseEnd(retryAfter: string | null, retryAt: unknown, now: number): number | null {
   const seconds = retryAfter !== null && /^\d+$/.test(retryAfter.trim()) ? Number(retryAfter) : NaN;
   const at = Number.isFinite(seconds)
     ? now + seconds * 1000

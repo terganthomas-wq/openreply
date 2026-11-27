@@ -2,10 +2,13 @@ import { NextRequest, NextResponse } from "next/server";
 import { getCurrentWorkspaceId } from "@/lib/auth";
 import {
   inboxBudgetResponse,
+  inboxConnectionLostResponse,
   inboxPausedUntil,
+  inboxRetryAfter,
   reserveInboxRead,
 } from "@/lib/inbox/read-budget";
 import { getWorkspaceInstagramAccount } from "@/lib/instagram-accounts";
+import { isMetaThrottle, throttlePauseMs } from "@/lib/instagram/delivery-errors";
 import {
   getConversations,
   sendDirectMessage,
@@ -35,8 +38,14 @@ export interface ConversationsResponse {
 // a list of several pages, or a conversation Meta cannot expand being
 // narrowed down, takes one per request. Beyond them, and while the worker
 // has paused the account for a Meta request limit, the answer is 429
-// inbox_budget. The Inbox's timer reads (`?silent=1`) make exactly one
-// request: the newest page, and a page Meta refuses fails the read.
+// inbox_budget; so it is when Meta refuses the read itself for a limit,
+// with the pause the worker would take. A full read the budget stops before
+// its end answers with the conversations read so far and `partial` (the
+// window's end, also as Retry-After), so the page keeps what it shows. The
+// Inbox's timer reads (`?silent=1`) make exactly one request: the newest
+// page, and a page Meta refuses fails the read. While the account's
+// connection is lost (A1) the answer is 409 connection_lost, without a Meta
+// call.
 export async function GET(request: NextRequest) {
   const workspaceId = await getCurrentWorkspaceId();
   if (!workspaceId) {
@@ -57,6 +66,10 @@ export async function GET(request: NextRequest) {
     );
   }
 
+  // Meta refuses the account until it is reconnected: no request, no read.
+  if (account.connectionLostAt) {
+    return inboxConnectionLostResponse(account.connectionLostAt);
+  }
   const pausedUntil = await inboxPausedUntil(account.instagramId);
   if (pausedUntil) return inboxBudgetResponse(pausedUntil);
   const budget = await reserveInboxRead(account.id);
@@ -114,10 +127,25 @@ export async function GET(request: NextRequest) {
         instagramId: account.instagramId,
       },
     };
+    // The budget stopped the read before its end: what it read, marked, so
+    // the page puts it on top of what it shows and pauses until then.
+    if (refused.until) {
+      return NextResponse.json(
+        { success: true, data, partial: { retryAt: refused.until.toISOString() } },
+        { headers: { "Retry-After": inboxRetryAfter(refused.until) } }
+      );
+    }
     return NextResponse.json({ success: true, data });
   } catch (err) {
     // The budget ran out before a single conversation could be read.
     if (refused.until) return inboxBudgetResponse(refused.until);
+    // Meta refused the read for a request limit: the Inbox stops asking for
+    // the pause the worker takes after such a refusal (throttlePauseMs: 20
+    // minutes, an hour for a block, unless configured), instead of asking
+    // again every 2 minutes.
+    if (isMetaThrottle(err)) {
+      return inboxBudgetResponse(new Date(Date.now() + throttlePauseMs(err)));
+    }
     console.error("[Conversations] Error:", err);
     const message =
       err instanceof MetaApiError

@@ -60,7 +60,12 @@ seconds, up to 600 reads an hour for one open tab. Now
   Every request counts, not every call of a route: a list of several pages,
   or a page narrowed down around a conversation Meta cannot expand, takes
   one read per request (`getConversations`' `beforeRequest`). When the
-  budget ends in the middle of a list, the answer is the part read so far.
+  budget ends in the middle of a list, the answer is the part read so far,
+  marked `"partial": { "retryAt": "<ISO time>" }` with a `Retry-After`
+  header: the page puts those conversations on top of what it shows, as for
+  a timer read (`mergeConversationPage`), so the list does not shrink, and
+  it pauses as below. A list copy painted
+  on opening is still read whole after the pause.
   Beyond the budget the routes answer `429` with
   `{ "success": false, "code": "inbox_budget", "retryAt": "<ISO time>" }`
   and a `Retry-After` header, without calling Meta. The page keeps what it
@@ -71,7 +76,22 @@ seconds, up to 600 reads an hour for one open tab. Now
 - While the worker has paused the account for a Meta request limit
   (`meta:pause:<instagram id>`, see [delivery retries](delivery-retries.md)),
   both GET routes answer the same `429` with the pause's end and do not call
-  Meta; the budget is left alone.
+  Meta; the budget is left alone. When Meta refuses an Inbox read itself for
+  a request limit, the route answers the same `429` for the pause the worker
+  takes after such a refusal (20 minutes, an hour for a block, or
+  `META_THROTTLE_PAUSE_MINUTES` and `META_BLOCK_PAUSE_MINUTES` where they are
+  set), so the page stops asking during the block. It does not pause the
+  worker.
+- While the account's connection is lost (A1, see
+  [connection alert](connection-alert.md)), both GET routes answer `409`
+  with `{ "success": false, "code": "connection_lost", "connectionLostAt":
+  "<ISO time>" }` without calling Meta or taking a read, as the Kommentare
+  page reads nothing then. On opening the page says so in the list's place,
+  later in its header above the list it keeps. A reconnect ends it.
+- A "Refresh" that fails keeps the list, and the header says the
+  conversations could not be loaded until a list read answers again. A
+  timer read that fails stays silent, as it fails on every turn while Meta
+  refuses the newest page.
 - Sending by hand (`POST /api/instagram/conversations`) is never capped and
   does not count.
 - When Redis fails or does not answer within 3 seconds, the read is allowed

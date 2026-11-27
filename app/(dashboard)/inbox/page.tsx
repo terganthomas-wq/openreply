@@ -14,9 +14,14 @@
  * after 10 idle minutes; the open thread when it opens, after an own send,
  * when the list shows it changed, and on "Refresh". The server allows 40
  * requests to Meta an hour per account and answers 429 inbox_budget beyond
- * that and while the worker has paused the account for a Meta limit; the
- * page then keeps what it shows and pauses for the answer's Retry-After (at
- * least 30 seconds). Sending by hand is never blocked.
+ * that, while the worker has paused the account for a Meta limit and when
+ * Meta refused the read for one; the page then keeps what it shows and
+ * pauses for the answer's Retry-After (at least 30 seconds). A whole list
+ * read the budget stopped before its end (`partial`) goes on top of what is
+ * shown and pauses the same way. While the account's connection is lost the
+ * server reads nothing (409 connection_lost), and a "Refresh" that fails
+ * keeps the list: the header says so in both cases. Sending by hand is never
+ * blocked.
  */
 
 import type { Locale } from "@/lib/i18n";
@@ -31,6 +36,7 @@ import {
   conversationChanged,
   firstListReadIn,
   inboxBudgetRetryAt,
+  inboxPartialUntil,
   mergeConversationPage,
   pollState,
   readIsStale,
@@ -47,6 +53,16 @@ const msgCacheKey = (conversationId: string) => `inbox:msgs:${conversationId}`;
  * what is shown (the timer, a return to the tab, after a send).
  */
 type ListRead = "full" | "page";
+
+/**
+ * Why the list shown is not up to date, for the header: the connection to
+ * Instagram is lost (the server reads nothing then), or "Refresh" failed.
+ */
+type ReadNote = "connection_lost" | "failed";
+
+// The server's error while the connection is lost (409 connection_lost),
+// shown translated in the list's place on the first read.
+const CONNECTION_LOST_ERROR = "The connection to Instagram is lost. Reconnect first.";
 
 function formatTime(iso: string | null, locale: Locale): string {
   if (!iso) return "";
@@ -97,6 +113,9 @@ export default function InboxPage() {
   const [idle, setIdle] = useState(false);
   // Until when the server refuses reads (its hourly budget is used up).
   const [budgetUntil, setBudgetUntil] = useState<number | null>(null);
+  // Why the list shown is not up to date; the next list read that answers
+  // clears it.
+  const [readNote, setReadNote] = useState<ReadNote | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const conversationRequests = useRef(new Set<string>());
@@ -190,6 +209,9 @@ export default function InboxPage() {
           pruneInboxCopies();
           if (activeIdRef.current === conversationId) setMessages(data.data.messages);
           endPause();
+        } else if (data.code === "connection_lost") {
+          // Keep whatever is shown; the header says why nothing is read.
+          setReadNote("connection_lost");
         }
       } catch {
         // keep whatever is shown
@@ -205,11 +227,17 @@ export default function InboxPage() {
   // thread is read too (unless the caller reads it anyway). Errors are shown
   // only by the first read, where nothing is shown yet or only the copy
   // painted on opening (`showErrors`): the error then stands in the list's
-  // place. The caller sets the loading state.
+  // place. Any other read keeps the list; a lost connection and a failed
+  // "Refresh" (`noteFailure`) are said in the header. The caller sets the
+  // loading state.
   const loadConversations = useCallback(
     async (
       read: ListRead,
-      { showErrors = false, checkThread = true }: { showErrors?: boolean; checkThread?: boolean } = {}
+      {
+        showErrors = false,
+        checkThread = true,
+        noteFailure = false,
+      }: { showErrors?: boolean; checkThread?: boolean; noteFailure?: boolean } = {}
     ) => {
       const accountId = selectedAccountId;
       if (!accountId || conversationRequests.current.has(accountId)) return;
@@ -235,15 +263,30 @@ export default function InboxPage() {
         if (data.success) {
           const previous = conversationsRef.current;
           const fresh: ConversationListItem[] = data.data.conversations;
-          const next = read === "page" ? mergeConversationPage(previous, fresh) : fresh;
+          // A whole list read that the server's hourly budget stopped before
+          // its end: what it read goes on top of what is shown, as a page
+          // read's conversations do, and reads pause until the budget allows
+          // them again.
+          const partialUntil =
+            read === "full"
+              ? inboxPartialUntil(data, res.headers.get("Retry-After"), Date.now())
+              : null;
+          const next =
+            read === "page" || partialUntil !== null
+              ? mergeConversationPage(previous, fresh)
+              : fresh;
           conversationsRef.current = next;
-          listIsCopyRef.current = false;
+          // A read cut short does not stand in for the copy painted on
+          // opening: the first whole read after the pause still does.
+          if (partialUntil === null) listIsCopyRef.current = false;
           lastListReadAtRef.current = Date.now();
           setConversations(next);
           writeCache(convCacheKey(accountId), next);
           pruneInboxCopies();
           setConvError(null);
-          endPause();
+          setReadNote(null);
+          if (partialUntil !== null) pauseReads(partialUntil);
+          else endPause();
           const open = activeIdRef.current;
           const openEntry = next.find((c) => c.id === open);
           const detailsBack = Boolean(
@@ -251,6 +294,7 @@ export default function InboxPage() {
           );
           if (
             checkThread &&
+            partialUntil === null &&
             open &&
             openEntry &&
             !openEntry.detailsUnavailable &&
@@ -260,12 +304,24 @@ export default function InboxPage() {
           }
         } else if (showErrors) {
           listIsCopyRef.current = false;
-          setConvError(data.error ?? "Failed to load conversations");
+          setConvError(
+            data.code === "connection_lost"
+              ? CONNECTION_LOST_ERROR
+              : (data.error ?? "Failed to load conversations")
+          );
+        } else if (data.code === "connection_lost") {
+          setReadNote("connection_lost");
+        } else if (noteFailure) {
+          setReadNote("failed");
         }
       } catch {
-        if (showErrors && accountRef.current === accountId) {
-          listIsCopyRef.current = false;
-          setConvError("Failed to load conversations");
+        if (accountRef.current === accountId) {
+          if (showErrors) {
+            listIsCopyRef.current = false;
+            setConvError("Failed to load conversations");
+          } else if (noteFailure) {
+            setReadNote("failed");
+          }
         }
       } finally {
         conversationRequests.current.delete(accountId);
@@ -297,6 +353,7 @@ export default function InboxPage() {
     setMessages([]);
     setIdle(false);
     setConvError(null);
+    setReadNote(null);
     pruneInboxCopies();
     const cached = freshCache<ConversationListItem[]>(convCacheKey(selectedAccountId));
     if (cached) {
@@ -440,7 +497,8 @@ export default function InboxPage() {
   function handleRefresh() {
     lastInputAtRef.current = Date.now();
     setIdle(false);
-    void loadConversations("full", { checkThread: false });
+    // A failure keeps the list, and the header says the refresh failed.
+    void loadConversations("full", { checkThread: false, noteFailure: true });
     const open = activeIdRef.current;
     if (open && !active?.detailsUnavailable) void loadMessages(open);
   }
@@ -505,7 +563,14 @@ export default function InboxPage() {
           time: formatClock(budgetUntil, locale),
         })
       : null;
-  const statusNote = pauseNote ?? (idle ? t("Paused after 10 minutes without activity.") : null);
+  const readNoteText =
+    readNote === "connection_lost"
+      ? t("The connection to Instagram is lost. Reconnect first.")
+      : readNote === "failed"
+        ? t("Failed to load conversations")
+        : null;
+  const statusNote =
+    pauseNote ?? readNoteText ?? (idle ? t("Paused after 10 minutes without activity.") : null);
 
   return (
     <div className="space-y-4">
@@ -553,7 +618,13 @@ export default function InboxPage() {
             {convLoading ? (
               <p className="px-4 py-6 text-sm text-muted">{t("Loading…")}</p>
             ) : convError ? (
-              <p className="px-4 py-6 text-sm text-error">{convError === "Failed to load conversations" ? t("Failed to load conversations") : convError}</p>
+              <p className="px-4 py-6 text-sm text-error">
+                {convError === "Failed to load conversations"
+                  ? t("Failed to load conversations")
+                  : convError === CONNECTION_LOST_ERROR
+                    ? t("The connection to Instagram is lost. Reconnect first.")
+                    : convError}
+              </p>
             ) : conversations.length === 0 ? (
               <p className="px-4 py-6 text-sm text-muted">{pauseNote ?? t("No conversations yet.")}</p>
             ) : (
@@ -625,7 +696,11 @@ export default function InboxPage() {
                 ) : threadLoading && messages.length === 0 ? (
                   <p className="text-sm text-muted">{t("Loading…")}</p>
                 ) : messages.length === 0 ? (
-                  <p className="text-sm text-muted">{pauseNote ?? t("No messages.")}</p>
+                  <p className="text-sm text-muted">
+                    {pauseNote ??
+                      (readNote === "connection_lost" ? readNoteText : null) ??
+                      t("No messages.")}
+                  </p>
                 ) : (
                   messages.map((m) => (
                     <div

@@ -105,7 +105,10 @@ the claim, and Diagnostics shows why.
   after: how many comments get their DM, and the comments answered by hand.
 - The Comments page reads nothing from Instagram while the connection is
   lost and refuses "Send DM" (`connection_lost`) until the account is
-  reconnected ([manual send](manual-send.md)).
+  reconnected ([manual send](manual-send.md)). Nor does the Inbox read its
+  conversations then: it says the connection is lost and keeps what it
+  shows ([Instagram reads of the dashboard](instagram-reads.md)). Sending
+  by hand from the Inbox is not blocked.
 - `/api/health` reports `checks.instagram` with `"status": "degraded"` and
   the accounts. The HTTP status and the top-level `status` stay as before,
   so an external monitor does not flap with every incident.

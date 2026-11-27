@@ -233,11 +233,24 @@ eine offene Seite alle 12 Sekunden nach Liste und Unterhaltung, bis zu
   Seite „Das Postfach pausiert bis HH:MM, damit Instagrams Anfrage-Limit
   nicht erreicht wird.“, behält, was sie zeigt, und liest erst ab dieser
   Uhrzeit wieder (frühestens nach 30 Sekunden, gezählt mit der Uhr deines
-  Geräts). Die 40 stehen fest im Code (`lib/inbox/read-budget.ts`), es gibt
-  keine Einstellung dafür.
+  Geräts). Gehen die 40 mitten im Lesen der ganzen Liste zu Ende, setzt die
+  Seite das schon Gelesene oben auf das, was sie zeigt (die Liste wird
+  dadurch nicht kürzer), und pausiert genauso. Die 40 stehen fest im Code
+  (`lib/inbox/read-budget.ts`), es gibt keine Einstellung dafür.
 - Solange der Worker das Senden für das Konto wegen eines Meta-Limits
   pausiert (siehe oben), liest das Postfach gar nicht bei Instagram und
-  zeigt dieselbe Meldung mit dem Ende der Pause.
+  zeigt dieselbe Meldung mit dem Ende der Pause. Lehnt Instagram einen
+  Abruf des Postfachs selbst wegen eines Limits ab, pausiert es ebenso, so
+  lange, wie der Worker nach so einer Ablehnung pausiert (20 Minuten, bei
+  einer Sperre eine Stunde), statt alle 2 Minuten wieder zu fragen.
+- Ist die Verbindung zu Instagram unterbrochen (siehe *Verbindung
+  verloren*), liest das Postfach nichts bei Instagram und zählt nichts mit.
+  Beim Öffnen steht „Die Verbindung zu Instagram ist unterbrochen. Verbinde
+  zuerst neu.“ an Stelle der Liste, später oben über der Liste, die stehen
+  bleibt. Nach dem Neu-Verbinden liest es wieder.
+- Scheitert *Aktualisieren*, bleibt die Liste stehen, und oben steht
+  „Unterhaltungen konnten nicht geladen werden“, bis ein Abruf wieder
+  klappt. Ein Durchgang alle 2 Minuten, der scheitert, bleibt still.
 - Senden von Hand ist nie gesperrt und zählt nicht mit.
 - Ein offenes, benutztes Postfach liest etwa 30-mal in der Stunde die Liste,
   dazu einmal je neue Nachricht in der offenen Unterhaltung. Wer viele
@@ -413,7 +426,8 @@ Was dann passiert:
   In den *Einstellungen* steht beim Konto „Verbindung unterbrochen seit …“
   statt „Verbunden“, mit dem Grund. Die *Diagnose* listet die Unterbrechung oben auf, mit Grund,
   Meta-Code und ob die E-Mail raus ist. Auf der Seite *Kommentare* ist
-  „DM senden“ gesperrt, bis du neu verbunden hast.
+  „DM senden“ gesperrt, bis du neu verbunden hast. Das *Postfach* liest
+  dann nichts bei Instagram und sagt, dass die Verbindung unterbrochen ist.
 - `GET /api/health` meldet sie unter `checks.instagram` mit
   `"status": "degraded"` und der Liste der Konten. Der HTTP-Status und der
   oberste `status` bleiben, wie sie sind: Ein externer Monitor schlägt

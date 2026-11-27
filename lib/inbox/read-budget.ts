@@ -14,7 +14,9 @@
  * and 50 conversation reads in an hour blocked every call for an hour), and
  * whoever opens the Inbox, a reviewer included, must not spend it on reads.
  * For the same reason the Inbox reads nothing while the worker has paused
- * the account for a Meta request limit (inboxPausedUntil).
+ * the account for a Meta request limit (inboxPausedUntil), pauses its reads
+ * after Meta refused one of them for a limit, and reads nothing while the
+ * account's connection is lost (inboxConnectionLostResponse).
  *
  * The counter is the one of the manual sends (lib/comments/server.ts):
  * INCR first, the expiry set by the first read. It is a safety net, not an
@@ -104,9 +106,13 @@ export async function inboxPausedUntil(instagramId: string): Promise<Date | null
   }
 }
 
+/** The Retry-After of an answer whose reads pause until `retryAt`: seconds, at least 1. */
+export function inboxRetryAfter(retryAt: Date): string {
+  return String(Math.max(1, Math.ceil((retryAt.getTime() - Date.now()) / 1000)));
+}
+
 /** The answer to a refused read: 429 with code inbox_budget and retryAt. */
 export function inboxBudgetResponse(retryAt: Date): Response {
-  const seconds = Math.max(1, Math.ceil((retryAt.getTime() - Date.now()) / 1000));
   return Response.json(
     {
       success: false,
@@ -114,6 +120,25 @@ export function inboxBudgetResponse(retryAt: Date): Response {
       retryAt: retryAt.toISOString(),
       error: "The Inbox pauses its Instagram reads to stay within the request limit.",
     },
-    { status: 429, headers: { "Retry-After": String(seconds) } }
+    { status: 429, headers: { "Retry-After": inboxRetryAfter(retryAt) } }
+  );
+}
+
+/**
+ * The answer while the account's connection is lost (A1: the worker's
+ * connection check saw Meta refuse the account, lib/instagram/connection-check.ts):
+ * 409 with code connection_lost, without a Meta call and without taking one
+ * of the hour's reads, as the Kommentare page reads nothing then
+ * (lib/comments/server.ts). A reconnect, or a check that gets through, ends it.
+ */
+export function inboxConnectionLostResponse(lostAt: Date): Response {
+  return Response.json(
+    {
+      success: false,
+      code: "connection_lost",
+      connectionLostAt: lostAt.toISOString(),
+      error: "The connection to Instagram is lost. Reconnect first.",
+    },
+    { status: 409 }
   );
 }

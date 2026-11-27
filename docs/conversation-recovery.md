@@ -45,7 +45,9 @@ recover. Warning logs contain only code/subcode/trace, not credentials or chats.
 Each narrower retry is a request of its own, so the Inbox counts it against
 its hourly read budget: `getConversations` asks its `beforeRequest` before
 every request after the first, and stops with the rows read so far once the
-budget is used up (with none read yet, the code-1 failure stands). The
+budget is used up (with none read yet, the code-1 failure stands). The list
+route marks such an answer `partial`, so the Inbox puts it on top of the list
+it shows instead of replacing that list with it. The
 Inbox's timer reads make exactly one request (`maxPages: 1`, no retry): a
 refused page fails that read and the shown list stays. Opening the Inbox and
 "Refresh" read the whole list as described above, and so does the read that

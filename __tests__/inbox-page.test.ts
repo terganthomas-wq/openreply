@@ -12,7 +12,11 @@
  * their values as in a browser. A re-render that React would make after a
  * state change does not happen here: where the page's next step depends on
  * one (the timer that ends a read pause), the next turn of the list timer
- * stands in for it.
+ * stands in for it. To see what the page shows after its updates, a test can
+ * keep the state (keepState) and render it again (shownMarkup); only the first
+ * render's effects and handlers run, as they are the ones a browser would
+ * still hold here. A click runs the handler that render gave the element
+ * (the "Refresh" button's onClick).
  */
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -24,18 +28,66 @@ interface RecordedEffect {
   deps: readonly unknown[] | undefined;
 }
 
-const hooks = vi.hoisted(() => ({ effects: [] as RecordedEffect[] }));
+const hooks = vi.hoisted(() => ({
+  effects: [] as RecordedEffect[],
+  // With keepState: useState's values by call order, kept across renders, so
+  // a second render shows what the first one's updates changed. Without it,
+  // React's own useState, whose updates after the render go nowhere.
+  keepState: false,
+  states: [] as unknown[],
+  cursor: 0,
+}));
+// The elements of the renders, with their props.
+const ui = vi.hoisted(() => ({
+  elements: [] as { type: unknown; props: Record<string, unknown> }[],
+}));
 const nav = vi.hoisted(() => ({ pathname: "/contacts" }));
 
 vi.mock("react", async (importOriginal) => {
   const actual = await importOriginal<typeof import("react")>();
+  const reactUseState = actual.useState as (initial: unknown) => [unknown, (next: unknown) => void];
   return {
     ...actual,
     useEffect: (effect: EffectCallback, deps?: readonly unknown[]) => {
       hooks.effects.push({ effect, deps });
     },
     useEffectEvent: <T>(callback: T) => callback,
+    useState: (initial: unknown) => {
+      if (!hooks.keepState) return reactUseState(initial);
+      const index = hooks.cursor++;
+      if (!(index in hooks.states)) {
+        hooks.states[index] = typeof initial === "function" ? (initial as () => unknown)() : initial;
+      }
+      const set = (next: unknown) => {
+        hooks.states[index] =
+          typeof next === "function" ? (next as (previous: unknown) => unknown)(hooks.states[index]) : next;
+      };
+      return [hooks.states[index], set];
+    },
   };
+});
+// JSX compiles to these: every element is noted with its props.
+vi.mock("react/jsx-dev-runtime", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("react/jsx-dev-runtime")>();
+  const make = actual.jsxDEV as (type: unknown, props: Record<string, unknown>, ...rest: unknown[]) => unknown;
+  return {
+    ...actual,
+    jsxDEV: (type: unknown, props: Record<string, unknown>, ...rest: unknown[]) => {
+      ui.elements.push({ type, props });
+      return make(type, props, ...rest);
+    },
+  };
+});
+vi.mock("react/jsx-runtime", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("react/jsx-runtime")>();
+  type Make = (type: unknown, props: Record<string, unknown>, ...rest: unknown[]) => unknown;
+  const noted =
+    (make: Make): Make =>
+    (type, props, ...rest) => {
+      ui.elements.push({ type, props });
+      return make(type, props, ...rest);
+    };
+  return { ...actual, jsx: noted(actual.jsx as Make), jsxs: noted(actual.jsxs as Make) };
 });
 vi.mock("next/navigation", () => ({ usePathname: () => nav.pathname }));
 
@@ -138,6 +190,9 @@ async function advance(ms: number) {
  */
 function mount(element: ReturnType<typeof createElement>): () => void {
   hooks.effects.length = 0;
+  hooks.states = [];
+  hooks.cursor = 0;
+  ui.elements.length = 0;
   renderToStaticMarkup(element);
   const cleanups: (() => void)[] = [];
   for (const { effect } of hooks.effects.splice(0)) {
@@ -155,6 +210,31 @@ function openInbox(): () => void {
   return mount(createElement(InboxPage));
 }
 
+/** What a click on "Refresh" runs: the handler the first render gave it. */
+function refreshButton(): () => void {
+  const button = ui.elements.find(
+    (element) => element.type === "button" && element.props.children === "Refresh"
+  );
+  if (!button) throw new Error("no Refresh button was rendered");
+  return button.props.onClick as () => void;
+}
+
+/**
+ * The Inbox as it shows now (keepState): rendered again with the state its
+ * updates left. That render's effects are dropped.
+ */
+function shownMarkup(): string {
+  hooks.cursor = 0;
+  const html = renderToStaticMarkup(createElement(InboxPage));
+  hooks.effects.length = 0;
+  return html;
+}
+
+/** The header's status line, or null. */
+function statusLine(html: string): string | null {
+  return /<p role="status"[^>]*>([^<]*)<\/p>/.exec(html)?.[1] ?? null;
+}
+
 function returnToTab() {
   documentStub.visibilityState = "visible";
   documentListeners.get("visibilitychange")?.();
@@ -163,6 +243,7 @@ function returnToTab() {
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
   vi.setSystemTime(NOW);
+  hooks.keepState = false;
   storage = new MemoryStorage();
   documentListeners = new Map();
   documentStub = {
@@ -296,6 +377,127 @@ describe("a list copy painted on opening the Inbox", () => {
     expect(listReads()).toEqual([FULL]);
     await advance(120 * SECOND - 55 * SECOND);
     expect(listReads()).toEqual([FULL, PAGE]);
+  });
+});
+
+describe("a whole list read that the hour's budget cut short", () => {
+  const ACCOUNT_INFO = { id: ACCOUNT, username: "studio", instagramId: "ig_owner" };
+  // 50 conversations shown; the budget had room for 9 of the newest.
+  const SHOWN = Array.from({ length: 50 }, (_, i) => conversation(`shown_${i}`, "Shown"));
+  const READ = Array.from({ length: 9 }, (_, i) => conversation(`read_${i}`, "New"));
+  const ids = (list: unknown) => (list as { id: string }[]).map((c) => c.id);
+  /** The server's answer: what it read, and until when the budget is used up. */
+  const cutShort = (retryAfterSeconds: number) =>
+    answer(
+      {
+        success: true,
+        data: { conversations: READ, account: ACCOUNT_INFO },
+        partial: { retryAt: new Date(Date.now() + retryAfterSeconds * SECOND).toISOString() },
+      },
+      200,
+      String(retryAfterSeconds)
+    );
+
+  it("at the copy's minute: goes on top of the copy, pauses, and the first read after the pause is the whole list", async () => {
+    storage.setItem("inbox:selectedAccount", ACCOUNT);
+    store(`inbox:convs:${ACCOUNT}`, SHOWN, NOW - 40 * SECOND);
+    listAnswers.push(cutShort(200));
+    openInbox();
+
+    await advance(20 * SECOND);
+    expect(listReads()).toEqual([FULL]);
+    // Nothing shown is lost: the 9 on top, then the copy's newest 41.
+    const kept = storedList()?.data;
+    expect(ids(kept)).toEqual([...ids(READ), ...ids(SHOWN).slice(0, 41)]);
+
+    // The reads pause until the budget allows them again.
+    await advance(100 * SECOND);
+    expect(listReads()).toEqual([FULL]);
+
+    // The first turn after the pause reads the whole list, as for the copy.
+    await advance(120 * SECOND);
+    expect(listReads()).toEqual([FULL, FULL]);
+    expect(storedList()?.data).toEqual(FRESH_LIST);
+  });
+
+  it("after Refresh: keeps the list shown with what it read on top, and pauses", async () => {
+    storage.setItem("inbox:selectedAccount", ACCOUNT);
+    listAnswers.push(answer({ success: true, data: { conversations: SHOWN, account: ACCOUNT_INFO } }));
+    openInbox();
+    const refresh = refreshButton();
+    await settle();
+    expect(ids(storedList()?.data)).toEqual(ids(SHOWN));
+
+    listAnswers.push(cutShort(200));
+    refresh();
+    await settle();
+    expect(listReads()).toEqual([FULL, FULL]);
+    expect(ids(storedList()?.data)).toEqual([...ids(READ), ...ids(SHOWN).slice(0, 41)]);
+
+    // Paused at the timer's turn; after the pause the newest page, as usual.
+    await advance(120 * SECOND);
+    expect(listReads()).toEqual([FULL, FULL]);
+    await advance(120 * SECOND);
+    expect(listReads()).toEqual([FULL, FULL, PAGE]);
+  });
+});
+
+describe("what the header says while the list is not up to date", () => {
+  const LOST = answer(
+    {
+      success: false,
+      code: "connection_lost",
+      connectionLostAt: new Date(NOW - 60 * MINUTE).toISOString(),
+      error: "The connection to Instagram is lost. Reconnect first.",
+    },
+    409
+  );
+
+  beforeEach(() => {
+    hooks.keepState = true;
+    storage.setItem("inbox:selectedAccount", ACCOUNT);
+  });
+
+  it("a failed Refresh keeps the list and says the conversations could not be loaded, until a read answers", async () => {
+    openInbox();
+    const refresh = refreshButton();
+    await settle();
+    expect(statusLine(shownMarkup())).toBeNull();
+
+    listAnswers.push(answer({ success: false, error: "Instagram could not be reached" }, 500));
+    refresh();
+    await settle();
+    const html = shownMarkup();
+    expect(statusLine(html)).toBe("Failed to load conversations");
+    expect(html).toContain("@user_c1");
+    expect(storedList()?.data).toEqual(FRESH_LIST);
+
+    refresh();
+    await settle();
+    expect(statusLine(shownMarkup())).toBeNull();
+  });
+
+  it("a lost connection on a later read: the list stays and the header says why", async () => {
+    openInbox();
+    await settle();
+    listAnswers.push(LOST);
+
+    // The timer's read.
+    await advance(120 * SECOND);
+    expect(listReads()).toEqual([FULL, PAGE]);
+    const html = shownMarkup();
+    expect(statusLine(html)).toBe("The connection to Instagram is lost. Reconnect first.");
+    expect(html).toContain("@user_c1");
+  });
+
+  it("a lost connection on opening: said in the list's place", async () => {
+    listAnswers.push(LOST);
+    openInbox();
+    await settle();
+
+    expect(shownMarkup()).toContain(
+      '<p class="px-4 py-6 text-sm text-error">The connection to Instagram is lost. Reconnect first.</p>'
+    );
   });
 });
 
