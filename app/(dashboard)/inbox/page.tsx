@@ -3,28 +3,47 @@
 /**
  * Inbox
  *
- * Instagram DM conversations for the selected account, with live message
- * history and a reply composer. Messages are read from the Conversations API
- * (Meta only exposes the 20 most recent per thread) and refreshed by polling.
- * Sending is subject to Instagram's 24-hour messaging window — Meta's error is
- * surfaced verbatim when it applies.
+ * Instagram DM conversations for the selected account, with message history
+ * and a reply composer. Messages are read from the Conversations API (Meta
+ * only exposes the 20 most recent per thread). Sending is subject to
+ * Instagram's 24-hour messaging window — Meta's error is surfaced verbatim
+ * when it applies.
+ *
+ * Reads are budgeted (lib/inbox/poll.ts; Meta submission plan, part B,
+ * S1b): the list every 2 minutes while the tab is visible and used, stopped
+ * after 10 idle minutes; the open thread when it opens, after an own send,
+ * when the list shows it changed, and on "Refresh". The server allows 40
+ * reads an hour per account and answers 429 inbox_budget beyond that; the
+ * page then keeps what it shows and pauses until the given time. Sending by
+ * hand is never blocked.
  */
 
 import type { Locale } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useEffectEvent, useRef, useState } from "react";
 import AccountSelect, { type AccountOption } from "@/components/account-select";
 import { readCache, writeCache } from "@/lib/client-cache";
+import {
+  CACHE_MAX_AGE_MS,
+  LIST_POLL_MS,
+  conversationChanged,
+  inboxBudgetRetryAt,
+  mergeConversationPage,
+  pollState,
+  readIsStale,
+} from "@/lib/inbox/poll";
 import type { ConversationListItem } from "@/app/api/instagram/conversations/route";
 import type { ThreadMessage } from "@/app/api/instagram/conversations/[id]/route";
 
-const POLL_MS = 12_000;
-// Cached list/threads are shown instantly on revisit, then revalidated in the
-// background. The Instagram Conversations API is slow (often several seconds),
-// so this is what makes the inbox feel fast after the first load.
-const CACHE_MAX_AGE_MS = 60_000;
 const convCacheKey = (accountId: string) => `inbox:convs:${accountId}`;
 const msgCacheKey = (conversationId: string) => `inbox:msgs:${conversationId}`;
+
+/**
+ * "full" reads the whole list and replaces it (opening the Inbox, another
+ * account, "Refresh"); "page" reads the newest page and puts it on top of
+ * what is shown (the timer, a return to the tab, after a send).
+ */
+type ListRead = "full" | "page";
 
 function formatTime(iso: string | null, locale: Locale): string {
   if (!iso) return "";
@@ -35,6 +54,16 @@ function formatTime(iso: string | null, locale: Locale): string {
   return sameDay
     ? d.toLocaleTimeString(locale, { hour: "numeric", minute: "2-digit" })
     : d.toLocaleDateString(locale, { month: "short", day: "numeric" });
+}
+
+function formatClock(ms: number, locale: Locale): string {
+  return new Date(ms).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" });
+}
+
+/** A stored copy, but only while it is younger than CACHE_MAX_AGE_MS. */
+function freshCache<T>(key: string): T | null {
+  const cached = readCache<T>(key, CACHE_MAX_AGE_MS);
+  return cached.data !== null && !cached.stale ? cached.data : null;
 }
 
 export default function InboxPage() {
@@ -59,8 +88,24 @@ export default function InboxPage() {
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
 
+  // The list timer stopped after 10 minutes without input.
+  const [idle, setIdle] = useState(false);
+  // Until when the server refuses reads (its hourly budget is used up).
+  const [budgetUntil, setBudgetUntil] = useState<number | null>(null);
+
   const scrollRef = useRef<HTMLDivElement>(null);
   const conversationRequests = useRef(new Set<string>());
+  // What the callbacks below need as it is now, not as it was when they
+  // were made: the account and conversation on screen, the list shown (the
+  // base for telling whether the open thread changed), the last input and
+  // list read, the end of a read pause, and the newest thread request.
+  const accountRef = useRef("");
+  const activeIdRef = useRef<string | null>(null);
+  const conversationsRef = useRef<ConversationListItem[]>([]);
+  const lastInputAtRef = useRef(0);
+  const lastListReadAtRef = useRef(0);
+  const budgetUntilRef = useRef(0);
+  const threadRequestRef = useRef(0);
 
   const active = conversations.find((c) => c.id === activeId) ?? null;
 
@@ -92,106 +137,227 @@ export default function InboxPage() {
     window.sessionStorage.setItem("inbox:selectedAccount", selectedAccountId);
   }, [selectedAccountId]);
 
-  const loadConversations = useCallback(
-    async (silent: boolean) => {
-      if (!selectedAccountId || conversationRequests.current.has(selectedAccountId)) return;
-      conversationRequests.current.add(selectedAccountId);
-      if (!silent) setConvLoading(true);
-      try {
-        const res = await fetch(
-          `/api/instagram/conversations?instagramAccountId=${selectedAccountId}`,
-          { cache: "no-store" }
-        );
-        const data = await res.json();
-        if (data.success) {
-          setConversations(data.data.conversations);
-          writeCache(convCacheKey(selectedAccountId), data.data.conversations);
-          setConvError(null);
-        } else if (!silent) {
-          setConvError(data.error ?? "Failed to load conversations");
-        }
-      } catch {
-        if (!silent) setConvError("Failed to load conversations");
-      } finally {
-        conversationRequests.current.delete(selectedAccountId);
-        if (!silent) setConvLoading(false);
-      }
-    },
-    [selectedAccountId]
-  );
+  const pauseReads = useCallback((until: number) => {
+    budgetUntilRef.current = until;
+    setBudgetUntil(until);
+  }, []);
 
-  // Load + poll conversations for the selected account. A cached list is shown
-  // immediately (so revisits are instant) while a fresh copy loads silently.
-  useEffect(() => {
-    if (!selectedAccountId) return;
-    // Reset the open thread when switching accounts. This is an intentional
-    // synchronous reset on a dependency change, not derived render state.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setActiveId(null);
-    setMessages([]);
-    const cached = readCache<ConversationListItem[]>(
-      convCacheKey(selectedAccountId),
-      CACHE_MAX_AGE_MS
-    );
-    if (cached.data) {
-      setConversations(cached.data);
-      setConvLoading(false);
-    } else {
-      setConversations([]);
-      setConvLoading(true);
-    }
-    void loadConversations(Boolean(cached.data));
-    const timer = window.setInterval(() => void loadConversations(true), POLL_MS);
-    return () => window.clearInterval(timer);
-  }, [selectedAccountId, loadConversations]);
+  const endPause = useCallback(() => {
+    if (!budgetUntilRef.current) return;
+    budgetUntilRef.current = 0;
+    setBudgetUntil(null);
+  }, []);
 
+  const selectConversation = useCallback((id: string | null) => {
+    activeIdRef.current = id;
+    setActiveId(id);
+  }, []);
+
+  // One read of a thread. Only the newest request paints, and only while its
+  // conversation is still open. Opening one sets the loading state itself.
   const loadMessages = useCallback(
-    async (conversationId: string, silent: boolean) => {
+    async (conversationId: string) => {
       if (!selectedAccountId) return;
-      if (!silent) setThreadLoading(true);
+      const request = ++threadRequestRef.current;
       try {
         const res = await fetch(
           `/api/instagram/conversations/${conversationId}?instagramAccountId=${selectedAccountId}`,
           { cache: "no-store" }
         );
         const data = await res.json();
-        if (data.success) {
-          setMessages(data.data.messages);
+        const pauseUntil = inboxBudgetRetryAt(res.status, data);
+        if (pauseUntil !== null) {
+          // Keep whatever is shown.
+          pauseReads(pauseUntil);
+          return;
+        }
+        if (data.success && request === threadRequestRef.current) {
           writeCache(msgCacheKey(conversationId), data.data.messages);
+          if (activeIdRef.current === conversationId) setMessages(data.data.messages);
+          endPause();
         }
       } catch {
         // keep whatever is shown
       } finally {
-        if (!silent) setThreadLoading(false);
+        // The newest read is done: whatever it found is shown now.
+        if (request === threadRequestRef.current) setThreadLoading(false);
       }
     },
-    [selectedAccountId]
+    [selectedAccountId, pauseReads, endPause]
   );
 
-  // Load + poll the open thread. Cached messages render instantly while a fresh
-  // copy loads silently; opening a thread never shows a blank pane on revisit.
+  // One read of the list. When the open conversation shows a change, its
+  // thread is read too (unless the caller reads it anyway). Errors are shown
+  // only where nothing is shown yet (`showErrors`, the first read); the
+  // caller sets the loading state.
+  const loadConversations = useCallback(
+    async (
+      read: ListRead,
+      { showErrors = false, checkThread = true }: { showErrors?: boolean; checkThread?: boolean } = {}
+    ) => {
+      const accountId = selectedAccountId;
+      if (!accountId || conversationRequests.current.has(accountId)) return;
+      conversationRequests.current.add(accountId);
+      try {
+        const res = await fetch(
+          `/api/instagram/conversations?instagramAccountId=${accountId}${read === "page" ? "&silent=1" : ""}`,
+          { cache: "no-store" }
+        );
+        const data = await res.json();
+        if (accountRef.current !== accountId) return;
+        const pauseUntil = inboxBudgetRetryAt(res.status, data);
+        if (pauseUntil !== null) {
+          // Keep whatever is shown.
+          pauseReads(pauseUntil);
+          return;
+        }
+        if (data.success) {
+          const previous = conversationsRef.current;
+          const fresh: ConversationListItem[] = data.data.conversations;
+          const next = read === "page" ? mergeConversationPage(previous, fresh) : fresh;
+          conversationsRef.current = next;
+          lastListReadAtRef.current = Date.now();
+          setConversations(next);
+          writeCache(convCacheKey(accountId), next);
+          setConvError(null);
+          endPause();
+          const open = activeIdRef.current;
+          const openEntry = next.find((c) => c.id === open);
+          const detailsBack = Boolean(
+            previous.find((c) => c.id === open)?.detailsUnavailable
+          );
+          if (
+            checkThread &&
+            open &&
+            openEntry &&
+            !openEntry.detailsUnavailable &&
+            (detailsBack || conversationChanged(previous, next, open))
+          ) {
+            void loadMessages(open);
+          }
+        } else if (showErrors) {
+          setConvError(data.error ?? "Failed to load conversations");
+        }
+      } catch {
+        if (showErrors && accountRef.current === accountId) {
+          setConvError("Failed to load conversations");
+        }
+      } finally {
+        conversationRequests.current.delete(accountId);
+        // Any finished read of the account on screen ends its loading state.
+        if (accountRef.current === accountId) setConvLoading(false);
+      }
+    },
+    [selectedAccountId, loadMessages, pauseReads, endPause]
+  );
+
+  // Opening the Inbox or another account. A list stored less than a minute
+  // ago is shown as it is (the timer reads next); an older one is not shown
+  // at all, so a message unsent since cannot come back from it.
   useEffect(() => {
-    if (!activeId || active?.detailsUnavailable) return;
-    const cached = readCache<ThreadMessage[]>(
-      msgCacheKey(activeId),
-      CACHE_MAX_AGE_MS
-    );
-    if (cached.data) {
-      // Paint cached messages instantly on thread change; intentional reset.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setMessages(cached.data);
-      setThreadLoading(false);
-    } else {
-      setMessages([]);
-      setThreadLoading(true);
+    if (!selectedAccountId) return;
+    // Reset the open thread when switching accounts. This is an intentional
+    // synchronous reset on a dependency change, not derived render state.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setActiveId(null);
+    activeIdRef.current = null;
+    accountRef.current = selectedAccountId;
+    lastInputAtRef.current = Date.now();
+    lastListReadAtRef.current = 0;
+    // The read budget is per account: another account starts unpaused.
+    budgetUntilRef.current = 0;
+    setBudgetUntil(null);
+    setMessages([]);
+    setIdle(false);
+    setConvError(null);
+    const cached = freshCache<ConversationListItem[]>(convCacheKey(selectedAccountId));
+    if (cached) {
+      conversationsRef.current = cached;
+      setConversations(cached);
+      setConvLoading(false);
+      return;
     }
-    void loadMessages(activeId, Boolean(cached.data));
-    const timer = window.setInterval(
-      () => void loadMessages(activeId, true),
-      POLL_MS
-    );
+    conversationsRef.current = [];
+    setConversations([]);
+    setConvLoading(true);
+    // Opened in a background tab: the first read waits until it is shown.
+    if (document.visibilityState === "hidden") return;
+    void loadConversations("full", { showErrors: true });
+  }, [selectedAccountId, loadConversations]);
+
+  // The timer's turn: read while the tab is visible and used; stop after 10
+  // idle minutes; nothing while hidden or while the server pauses reads.
+  const onTick = useEffectEvent(() => {
+    // Stopped for idleness: only "Refresh" or a return to the tab resumes.
+    if (idle) return;
+    const now = Date.now();
+    const state = pollState({
+      visible: document.visibilityState === "visible",
+      lastInputAt: lastInputAtRef.current,
+      now,
+    });
+    if (state === "hidden") return;
+    if (state === "idle") {
+      setIdle(true);
+      return;
+    }
+    if (now < budgetUntilRef.current) return;
+    void loadConversations("page");
+  });
+
+  useEffect(() => {
+    if (!selectedAccountId || idle) return;
+    const timer = window.setInterval(() => onTick(), LIST_POLL_MS);
     return () => window.clearInterval(timer);
-  }, [activeId, active?.detailsUnavailable, loadMessages]);
+  }, [selectedAccountId, idle]);
+
+  // Back on the tab: that is input, it ends an idle stop, and the list is
+  // read once if its last read is older than a minute (the whole list when
+  // nothing is shown yet, as in a tab opened in the background).
+  const onReturn = useEffectEvent(() => {
+    const now = Date.now();
+    lastInputAtRef.current = now;
+    setIdle(false);
+    if (now < budgetUntilRef.current) return;
+    if (!readIsStale(lastListReadAtRef.current, now)) return;
+    const nothingShown = conversationsRef.current.length === 0;
+    void loadConversations(nothingShown ? "full" : "page", { showErrors: nothingShown });
+  });
+
+  useEffect(() => {
+    lastInputAtRef.current = Date.now();
+    const noteInput = () => {
+      lastInputAtRef.current = Date.now();
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") onReturn();
+    };
+    const inputs = ["pointerdown", "pointermove", "keydown", "focus", "focusin"] as const;
+    for (const name of inputs) window.addEventListener(name, noteInput, { passive: true });
+    // Scrolling the list or the thread: scroll events do not bubble.
+    window.addEventListener("scroll", noteInput, { passive: true, capture: true });
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      for (const name of inputs) window.removeEventListener(name, noteInput);
+      window.removeEventListener("scroll", noteInput, { capture: true });
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, []);
+
+  // A read pause ends by itself at its time; the timer's rules decide then.
+  const onPauseOver = useEffectEvent(() => {
+    budgetUntilRef.current = 0;
+    setBudgetUntil(null);
+  });
+
+  useEffect(() => {
+    if (budgetUntil === null) return;
+    const timer = window.setTimeout(() => {
+      onPauseOver();
+      onTick();
+    }, Math.max(0, budgetUntil - Date.now()));
+    return () => window.clearTimeout(timer);
+  }, [budgetUntil]);
 
   // Keep the thread pinned to the latest message.
   useEffect(() => {
@@ -199,14 +365,29 @@ export default function InboxPage() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages]);
 
+  // The open thread is read when it opens; there is no thread timer (a list
+  // read reads it again when it shows a change).
   function openConversation(id: string) {
-    setActiveId(id);
+    selectConversation(id);
     setSendError(null);
-    // Paint any cached thread synchronously so the pane never flashes empty
-    // or shows the previously open conversation while the fetch runs.
-    const cached = readCache<ThreadMessage[]>(msgCacheKey(id), CACHE_MAX_AGE_MS);
-    setMessages(cached.data ?? []);
-    setThreadLoading(!cached.data);
+    // Paint a recent stored thread synchronously so the pane never flashes
+    // empty or shows the previously open conversation while the read runs.
+    const cached = freshCache<ThreadMessage[]>(msgCacheKey(id));
+    setMessages(cached ?? []);
+    if (conversations.find((c) => c.id === id)?.detailsUnavailable) {
+      setThreadLoading(false);
+      return;
+    }
+    setThreadLoading(!cached);
+    void loadMessages(id);
+  }
+
+  function handleRefresh() {
+    lastInputAtRef.current = Date.now();
+    setIdle(false);
+    void loadConversations("full", { checkThread: false });
+    const open = activeIdRef.current;
+    if (open && !active?.detailsUnavailable) void loadMessages(open);
   }
 
   async function handleSend() {
@@ -238,8 +419,9 @@ export default function InboxPage() {
       });
       const data = await res.json();
       if (data.success) {
-        await loadMessages(active.id, true);
-        void loadConversations(true);
+        await loadMessages(active.id);
+        // The thread was just read: the list's change is this send.
+        void loadConversations("page", { checkThread: false });
       } else {
         // Roll the optimistic message back and restore the draft so it's not lost.
         setMessages((prev) => prev.filter((m) => m.id !== optimistic.id));
@@ -262,18 +444,43 @@ export default function InboxPage() {
     }
   }
 
+  const pauseNote =
+    budgetUntil !== null
+      ? t("The Inbox pauses until {time} so that Instagram's request limit is not reached.", {
+          time: formatClock(budgetUntil, locale),
+        })
+      : null;
+  const statusNote = pauseNote ?? (idle ? t("Paused after 10 minutes without activity.") : null);
+
   return (
     <div className="space-y-4">
-      <div className="flex items-end justify-between gap-4">
-        <h1 className="text-lg font-semibold text-foreground">{t("Inbox")}</h1>
-        {accounts.length > 1 && (
-          <AccountSelect
-            accounts={accounts}
-            value={selectedAccountId}
-            onChange={setSelectedAccountId}
-            includeAll={false}
-          />
-        )}
+      <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-2">
+        <div className="min-w-0">
+          <h1 className="text-lg font-semibold text-foreground">{t("Inbox")}</h1>
+          {statusNote && (
+            <p role="status" className="mt-1 text-sm text-muted">
+              {statusNote}
+            </p>
+          )}
+        </div>
+        <div className="flex flex-wrap items-end gap-3">
+          {accounts.length > 1 && (
+            <AccountSelect
+              accounts={accounts}
+              value={selectedAccountId}
+              onChange={setSelectedAccountId}
+              includeAll={false}
+            />
+          )}
+          <button
+            type="button"
+            onClick={handleRefresh}
+            disabled={!selectedAccountId}
+            className="rounded border border-border bg-surface px-3 py-2 text-sm font-semibold text-foreground transition hover:border-border-hover disabled:opacity-50"
+          >
+            {t("Refresh")}
+          </button>
+        </div>
       </div>
 
       <div className="grid h-[calc(100dvh-11rem)] grid-cols-1 overflow-hidden rounded border border-border sm:grid-cols-[300px_1fr]">
@@ -293,7 +500,7 @@ export default function InboxPage() {
             ) : convError ? (
               <p className="px-4 py-6 text-sm text-error">{convError === "Failed to load conversations" ? t("Failed to load conversations") : convError}</p>
             ) : conversations.length === 0 ? (
-              <p className="px-4 py-6 text-sm text-muted">{t("No conversations yet.")}</p>
+              <p className="px-4 py-6 text-sm text-muted">{pauseNote ?? t("No conversations yet.")}</p>
             ) : (
               conversations.map((c) => {
                 const isActive = c.id === activeId;
@@ -344,7 +551,7 @@ export default function InboxPage() {
               <div className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-3 text-sm font-semibold text-foreground">
                 <button
                   type="button"
-                  onClick={() => setActiveId(null)}
+                  onClick={() => selectConversation(null)}
                   className="-ml-1 rounded px-2 py-1 text-muted hover:text-foreground sm:hidden"
                   aria-label={t("Back to conversations")}
                 >
@@ -363,7 +570,7 @@ export default function InboxPage() {
                 ) : threadLoading && messages.length === 0 ? (
                   <p className="text-sm text-muted">{t("Loading…")}</p>
                 ) : messages.length === 0 ? (
-                  <p className="text-sm text-muted">{t("No messages.")}</p>
+                  <p className="text-sm text-muted">{pauseNote ?? t("No messages.")}</p>
                 ) : (
                   messages.map((m) => (
                     <div

@@ -5,12 +5,15 @@ import type { InstagramContext } from "./context";
 export async function getConversations({
   context,
   igUserId,
+  maxPages,
 }: {
   context: InstagramContext;
   igUserId: string;
+  /** Meta only: stop after this many list pages (the Inbox's timer reads). */
+  maxPages?: number;
 }): Promise<meta.InstagramConversation[]> {
   if (context.provider === "META")
-    return meta.getConversations(context, igUserId);
+    return meta.getConversations(context, igUserId, { maxPages });
   const result = await zernioRequest<{
     data: {
       id: string;

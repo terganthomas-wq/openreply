@@ -866,6 +866,9 @@ export interface InstagramConversation {
   messages?: { data: InstagramMessage[] };
 }
 
+// The safety bound on list pages in one read.
+const CONVERSATION_PAGE_LIMIT = 100;
+
 /**
  * Load up to 50 recent conversations. A single broken field expansion can make
  * Meta reject the entire page with code 1 (upstream issue #60). Halve only those
@@ -874,10 +877,16 @@ export interface InstagramConversation {
  *
  * Healthy accounts still need just one request. Auth, permission, rate-limit,
  * transport and minimal-list failures remain visible rather than looking empty.
+ *
+ * `maxPages` stops after that many pages of the list and returns what they
+ * held (the Inbox's timer reads ask for one, lib/inbox/poll.ts); a failing
+ * page is still halved within it. Without it, the list is read to its end or
+ * to 50 entries.
  */
 export async function getConversations(
   auth: MetaAuth,
-  igUserId: string
+  igUserId: string,
+  { maxPages }: { maxPages?: number } = {}
 ): Promise<InstagramConversation[]> {
   const accessToken = tokenOf(auth);
   const fields =
@@ -909,7 +918,11 @@ export async function getConversations(
   }
 
   // Also bound cursor traversal in case Meta repeats data with changing cursors.
-  for (let pages = 0; pages < 100 && results.length < 50; pages++) {
+  const pageLimit =
+    maxPages === undefined || !Number.isFinite(maxPages)
+      ? CONVERSATION_PAGE_LIMIT
+      : Math.min(CONVERSATION_PAGE_LIMIT, Math.max(1, Math.floor(maxPages)));
+  for (let pages = 0; pages < pageLimit && results.length < 50; pages++) {
     let limit = Math.min(pageSize, 50 - results.length);
     let page: Page;
     let unavailable = false;
@@ -954,6 +967,8 @@ export async function getConversations(
     // successful expansions. Consecutive bad entries cost two reads each.
     pageSize = unavailable ? 1 : Math.min(50, limit * 2);
   }
+  // The caller asked for fewer pages: what they held is the answer.
+  if (pageLimit < CONVERSATION_PAGE_LIMIT) return results;
   throw new Error("Instagram conversation pagination exceeded its safety limit");
 }
 

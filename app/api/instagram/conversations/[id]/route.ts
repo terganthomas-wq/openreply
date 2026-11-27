@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCurrentWorkspaceId } from "@/lib/auth";
+import { inboxBudgetResponse, reserveInboxRead } from "@/lib/inbox/read-budget";
 import { getWorkspaceInstagramAccount } from "@/lib/instagram-accounts";
 import {
   getConversationMessages,
@@ -22,6 +23,8 @@ export interface ThreadResponse {
 type RouteProps = { params: Promise<{ id: string }> };
 
 // Message history for a single conversation (20 most recent, chronological).
+// Takes one of the account's hourly Inbox reads (lib/inbox/read-budget.ts),
+// like the list; beyond them the answer is 429 inbox_budget.
 export async function GET(request: NextRequest, { params }: RouteProps) {
   const workspaceId = await getCurrentWorkspaceId();
   if (!workspaceId) {
@@ -43,6 +46,9 @@ export async function GET(request: NextRequest, { params }: RouteProps) {
       { status: 400 }
     );
   }
+
+  const budget = await reserveInboxRead(account.id);
+  if (!budget.allowed) return inboxBudgetResponse(budget.retryAt);
 
   try {
     const accessToken = await createInstagramContext(account);

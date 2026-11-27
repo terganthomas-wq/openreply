@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCurrentWorkspaceId } from "@/lib/auth";
+import { inboxBudgetResponse, reserveInboxRead } from "@/lib/inbox/read-budget";
 import { getWorkspaceInstagramAccount } from "@/lib/instagram-accounts";
 import {
   getConversations,
@@ -25,7 +26,10 @@ export interface ConversationsResponse {
   account: { id: string; username: string; instagramId: string };
 }
 
-// List the account's DM conversations for the inbox.
+// List the account's DM conversations for the inbox. Every read of Meta
+// takes one of the account's hourly Inbox reads (lib/inbox/read-budget.ts);
+// beyond them the answer is 429 inbox_budget. The Inbox's timer reads
+// (`?silent=1`) ask for the newest page only.
 export async function GET(request: NextRequest) {
   const workspaceId = await getCurrentWorkspaceId();
   if (!workspaceId) {
@@ -46,11 +50,15 @@ export async function GET(request: NextRequest) {
     );
   }
 
+  const budget = await reserveInboxRead(account.id);
+  if (!budget.allowed) return inboxBudgetResponse(budget.retryAt);
+
   try {
     const accessToken = await createInstagramContext(account);
     const raw = await getConversations({
       context: accessToken,
       igUserId: account.instagramId,
+      ...(request.nextUrl.searchParams.get("silent") === "1" ? { maxPages: 1 } : {}),
     });
 
     const conversations: ConversationListItem[] = raw.map((c) => {

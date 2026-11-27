@@ -42,6 +42,11 @@ This is not a global cache or a guarantee against account-level rate limits.
 The next refresh retries unavailable details, allowing transient failures to
 recover. Warning logs contain only code/subcode/trace, not credentials or chats.
 
+The Inbox's timer reads pass `maxPages: 1`: they stop after the first page of
+the list and return what it held, and a failing page is still halved within
+it. Opening the Inbox and "Refresh" read the whole list as described above.
+See [Instagram reads of the dashboard](instagram-reads.md).
+
 ## Verification
 
 The identical application code and regression tests passed TypeScript, lint,

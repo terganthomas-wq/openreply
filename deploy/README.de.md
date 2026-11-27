@@ -157,6 +157,42 @@ Damit es gar nicht so weit kommt: Bei Tests nicht Dutzende Kommentare in
 wenigen Minuten schreiben, und große Abrufe (etwa viele Unterhaltungen auf
 einmal) nicht direkt vor einem Test.
 
+#### Postfach: höchstens 40 Abrufe pro Stunde
+
+Das *Postfach* (der Posteingang für DMs) liest die Unterhaltungen bei
+Instagram, und diese Abrufe zählen zum selben Limit wie die DMs. Früher fragte
+eine offene Seite alle 12 Sekunden nach Liste und Unterhaltung, bis zu
+600-mal in der Stunde. Jetzt gilt:
+
+- Die Liste der Unterhaltungen wird alle 2 Minuten gelesen, aber nur, solange
+  der Tab sichtbar ist und du ihn benutzt (Maus, Tastatur, Scrollen). Im
+  Hintergrund fragt die Seite nichts ab. Kommst du zurück und ist die Liste
+  älter als eine Minute, liest sie sie einmal neu.
+- Nach 10 Minuten ohne Eingabe hält die Seite an und zeigt „Nach 10 Minuten
+  ohne Aktivität angehalten.“ *Aktualisieren* (oben rechts, immer da) liest
+  sofort und startet die 2 Minuten neu; zum Tab zurückkehren auch.
+- Eine offene Unterhaltung wird gelesen, wenn du sie öffnest, nachdem du
+  gesendet hast, wenn die Liste darin eine neue Nachricht zeigt, und bei
+  *Aktualisieren*. Einen eigenen Zeitgeber hat sie nicht mehr.
+- Eine im Browser gespeicherte Kopie zeigt die Seite nur, solange sie jünger
+  als eine Minute ist; dann liest sie auch nicht sofort neu (das macht der
+  nächste Durchgang). Eine ältere Kopie zeigt sie gar nicht, du siehst kurz
+  „Wird geladen …“. So kommt auch eine zurückgezogene Nachricht nicht aus der
+  Kopie zurück.
+- Der Server erlaubt dem Postfach höchstens 40 Abrufe pro Stunde und
+  Instagram-Konto, Liste und Unterhaltungen zusammen; die Stunde läuft ab dem
+  ersten Abruf. Danach zeigt die Seite „Das Postfach pausiert bis HH:MM,
+  damit Instagrams Anfrage-Limit nicht erreicht wird.“, behält, was sie
+  zeigt, und liest erst ab dieser Uhrzeit wieder. Die 40 stehen fest im Code
+  (`lib/inbox/read-budget.ts`), es gibt keine Einstellung dafür.
+- Senden von Hand ist nie gesperrt und zählt nicht mit.
+- Ein offenes, benutztes Postfach liest etwa 30-mal in der Stunde die Liste,
+  dazu einmal je neue Nachricht in der offenen Unterhaltung. Wer viele
+  Unterhaltungen nacheinander öffnet, kommt schneller an die 40.
+- Fällt Redis aus oder antwortet nicht innerhalb von 3 Sekunden, ist der
+  Abruf erlaubt (mit einer Warnung im Log): Die Grenze ist ein
+  Sicherheitsnetz, keine Zugangssperre.
+
 ## Manuell senden
 
 Die Seite *Kommentare* im Menü (nur für Inhaber und Admins) zeigt die

@@ -404,6 +404,8 @@
   "No contacts match these filters.": "Nenhum contato corresponde a esses filtros.",
   "No contacts yet": "Nenhum contato ainda",
   "No conversations yet.": "Nenhuma conversa ainda.",
+  "Paused after 10 minutes without activity.": "Pausado após 10 minutos sem atividade.",
+  "The Inbox pauses until {time} so that Instagram's request limit is not reached.": "A caixa de entrada fica em pausa até {time} para não atingir o limite de solicitações do Instagram.",
   "No failed webhook events.": "Nenhum evento de webhook com falha.",
   "No heartbeat found": "Nenhum sinal encontrado",
   "No image": "Sem imagem",

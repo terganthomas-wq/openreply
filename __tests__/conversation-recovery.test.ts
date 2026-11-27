@@ -101,6 +101,25 @@ describe("Instagram conversation recovery (upstream #60)", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
+  it("reads only the newest page when asked for one (the Inbox's timer reads)", async () => {
+    const fetchMock = installGraph([], 13, 5);
+    const result = await getConversations(token, "owner", { maxPages: 1 });
+    expect(result.map((row) => row.id)).toEqual(
+      Array.from({ length: 5 }, (_, i) => "conversation-" + i)
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("still halves a failing page within one page, and returns what it held", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetchMock = installGraph([41]);
+    const result = await getConversations(token, "owner", { maxPages: 1 });
+    expect(result.map((row) => row.id)).toEqual(
+      Array.from({ length: 25 }, (_, i) => "conversation-" + i)
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("returns an actually empty inbox without manufacturing placeholders", async () => {
     installGraph([], 0);
     expect(await getConversations(token, "owner")).toEqual([]);

@@ -389,6 +389,8 @@
   "No contacts match these filters.": "沒有符合這些篩選條件的聯絡人。",
   "No contacts yet": "尚無聯絡人",
   "No conversations yet.": "尚無對話。",
+  "Paused after 10 minutes without activity.": "閒置 10 分鐘後已暫停。",
+  "The Inbox pauses until {time} so that Instagram's request limit is not reached.": "收件匣暫停至 {time}，以免達到 Instagram 的請求上限。",
   "No failed webhook events.": "目前沒有 Webhook 接收錯誤。",
   "No heartbeat found": "尚未收到背景處理器的狀態回報",
   "No image": "無圖片",

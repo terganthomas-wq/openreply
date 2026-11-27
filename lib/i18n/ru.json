@@ -404,6 +404,8 @@
   "No contacts match these filters.": "Нет контактов, подходящих под эти фильтры.",
   "No contacts yet": "Контактов пока нет",
   "No conversations yet.": "Диалогов пока нет.",
+  "Paused after 10 minutes without activity.": "Приостановлено после 10 минут без активности.",
+  "The Inbox pauses until {time} so that Instagram's request limit is not reached.": "Директ приостановлен до {time}, чтобы не превысить лимит запросов Instagram.",
   "No failed webhook events.": "Ошибок вебхуков нет.",
   "No heartbeat found": "Сигнал не найден",
   "No image": "Нет изображения",
