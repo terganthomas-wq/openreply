@@ -1,14 +1,18 @@
 /**
  * When the Inbox reads Instagram (lib/inbox/poll.ts; Meta submission plan,
  * part B, S1b): never while the tab is hidden, a stop after 10 minutes
- * without input, and a thread read only when the list shows a change.
+ * without input, a thread read only when the list shows a change, a list
+ * copy that stands in for a read only until it is a minute old, and a
+ * refused read that pauses by its Retry-After on this browser's clock.
  */
 import { describe, expect, it } from "vitest";
 import {
+  BUDGET_PAUSE_MIN_MS,
   CACHE_MAX_AGE_MS,
   IDLE_STOP_MS,
   LIST_POLL_MS,
   conversationChanged,
+  firstListReadIn,
   inboxBudgetRetryAt,
   mergeConversationPage,
   pollState,
@@ -72,6 +76,17 @@ describe("the list timer's rules", () => {
     expect(readIsStale(0, CACHE_MAX_AGE_MS + 1)).toBe(true);
     // Never read yet.
     expect(readIsStale(0, Date.UTC(2026, 10, 27))).toBe(true);
+  });
+
+  it("lets a list copy painted on opening stand in for a read only until it is a minute old", () => {
+    const storedAt = Date.UTC(2026, 10, 27, 10, 0, 0);
+    // Reloaded 40 seconds after the copy was stored: the list is read 20
+    // seconds later, not at the timer's turn two minutes later.
+    expect(firstListReadIn(storedAt, storedAt + 40_000)).toBe(20_000);
+    expect(firstListReadIn(storedAt, storedAt)).toBe(CACHE_MAX_AGE_MS);
+    expect(firstListReadIn(storedAt, storedAt + CACHE_MAX_AGE_MS)).toBe(0);
+    expect(firstListReadIn(storedAt, storedAt + 5 * MINUTE)).toBe(0);
+    expect(firstListReadIn(storedAt, storedAt + 40_000)).toBeLessThan(LIST_POLL_MS);
   });
 });
 
@@ -150,18 +165,45 @@ describe("mergeConversationPage", () => {
 
 describe("inboxBudgetRetryAt", () => {
   const retryAt = "2026-11-27T11:00:00.000Z";
+  // The browser's clock, 20 minutes before the server's window ends.
+  const now = Date.parse("2026-11-27T10:40:00.000Z");
 
-  it("reads the end of the pause from a refused read", () => {
+  it("counts the pause from this browser's clock by the answer's Retry-After", () => {
     expect(
-      inboxBudgetRetryAt(429, { success: false, code: "inbox_budget", retryAt })
-    ).toBe(Date.parse(retryAt));
+      inboxBudgetRetryAt(429, { success: false, code: "inbox_budget", retryAt }, "1200", now)
+    ).toBe(now + 20 * MINUTE);
+  });
+
+  it("does not end the pause at once when the browser's clock is ahead of the server's", () => {
+    // The server's window end is two minutes in this browser's past.
+    const ahead = Date.parse(retryAt) + 2 * MINUTE;
+    expect(
+      inboxBudgetRetryAt(429, { success: false, code: "inbox_budget", retryAt }, "60", ahead)
+    ).toBe(ahead + MINUTE);
+    // Without the header the server's time stands in, but never less than 30 seconds.
+    expect(BUDGET_PAUSE_MIN_MS).toBe(30_000);
+    expect(
+      inboxBudgetRetryAt(429, { success: false, code: "inbox_budget", retryAt }, null, ahead)
+    ).toBe(ahead + BUDGET_PAUSE_MIN_MS);
+    expect(
+      inboxBudgetRetryAt(429, { success: false, code: "inbox_budget", retryAt }, "1", now)
+    ).toBe(now + BUDGET_PAUSE_MIN_MS);
+  });
+
+  it("takes the server's time when there is no usable Retry-After", () => {
+    for (const header of [null, "", "soon", "Fri, 27 Nov 2026 11:00:00 GMT"]) {
+      expect(
+        inboxBudgetRetryAt(429, { success: false, code: "inbox_budget", retryAt }, header, now),
+        String(header)
+      ).toBe(Date.parse(retryAt));
+    }
   });
 
   it("is null for every other answer", () => {
-    expect(inboxBudgetRetryAt(200, { success: true, data: {} })).toBeNull();
-    expect(inboxBudgetRetryAt(500, { success: false, code: "inbox_budget", retryAt })).toBeNull();
-    expect(inboxBudgetRetryAt(429, { success: false, error: "Too many" })).toBeNull();
-    expect(inboxBudgetRetryAt(429, { code: "inbox_budget", retryAt: "later" })).toBeNull();
-    expect(inboxBudgetRetryAt(429, null)).toBeNull();
+    expect(inboxBudgetRetryAt(200, { success: true, data: {} }, null, now)).toBeNull();
+    expect(inboxBudgetRetryAt(500, { success: false, code: "inbox_budget", retryAt }, "60", now)).toBeNull();
+    expect(inboxBudgetRetryAt(429, { success: false, error: "Too many" }, "60", now)).toBeNull();
+    expect(inboxBudgetRetryAt(429, { code: "inbox_budget", retryAt: "later" }, null, now)).toBeNull();
+    expect(inboxBudgetRetryAt(429, null, "60", now)).toBeNull();
   });
 });

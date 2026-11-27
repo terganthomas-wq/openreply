@@ -869,6 +869,9 @@ export interface InstagramConversation {
 // The safety bound on list pages in one read.
 const CONVERSATION_PAGE_LIMIT = 100;
 
+// getConversations' beforeRequest said no to a further request.
+class ConversationReadStopped extends Error {}
+
 /**
  * Load up to 50 recent conversations. A single broken field expansion can make
  * Meta reject the entire page with code 1 (upstream issue #60). Halve only those
@@ -879,14 +882,22 @@ const CONVERSATION_PAGE_LIMIT = 100;
  * transport and minimal-list failures remain visible rather than looking empty.
  *
  * `maxPages` stops after that many pages of the list and returns what they
- * held (the Inbox's timer reads ask for one, lib/inbox/poll.ts); a failing
- * page is still halved within it. Without it, the list is read to its end or
- * to 50 entries.
+ * held (the Inbox's timer reads ask for one, lib/inbox/poll.ts). Without it,
+ * the list is read to its end or to 50 entries.
+ *
+ * `beforeRequest` is awaited before every request after the first: a further
+ * page, and each narrower retry of a failing page. When it answers false the
+ * read stops there and returns the rows read so far; when there are none
+ * because the first page kept failing, that page's error is thrown. The
+ * Inbox counts every request to Meta this way (lib/inbox/read-budget.ts).
  */
 export async function getConversations(
   auth: MetaAuth,
   igUserId: string,
-  { maxPages }: { maxPages?: number } = {}
+  {
+    maxPages,
+    beforeRequest,
+  }: { maxPages?: number; beforeRequest?: () => Promise<boolean> } = {}
 ): Promise<InstagramConversation[]> {
   const accessToken = tokenOf(auth);
   const fields =
@@ -900,8 +911,15 @@ export async function getConversations(
   const seenCursors = new Set<string>();
   let after: string | undefined;
   let pageSize = 50;
+  let requests = 0;
+  // The code 1 of the page being narrowed down, while it is.
+  let failing: MetaApiError | null = null;
 
   async function readPage(limit: number, requestedFields: string): Promise<Page> {
+    if (requests > 0 && beforeRequest && !(await beforeRequest())) {
+      throw new ConversationReadStopped();
+    }
+    requests++;
     // Never follow Meta's next URL: rebuild on our trusted host and carry the
     // token separately. A messages.paging cursor must never advance this list.
     const url = new URL(`${instagramGraphBase(auth)}/${igUserId}/conversations`);
@@ -922,50 +940,60 @@ export async function getConversations(
     maxPages === undefined || !Number.isFinite(maxPages)
       ? CONVERSATION_PAGE_LIMIT
       : Math.min(CONVERSATION_PAGE_LIMIT, Math.max(1, Math.floor(maxPages)));
-  for (let pages = 0; pages < pageLimit && results.length < 50; pages++) {
-    let limit = Math.min(pageSize, 50 - results.length);
-    let page: Page;
-    let unavailable = false;
-    while (true) {
-      try {
-        page = await readPage(limit, fields);
-        break;
-      } catch (error) {
-        if (!(error instanceof MetaApiError) || error.code !== 1) throw error;
-        if (limit > 1) {
-          limit = Math.max(1, Math.floor(limit / 2));
-          continue;
+  try {
+    for (let pages = 0; pages < pageLimit && results.length < 50; pages++) {
+      let limit = Math.min(pageSize, 50 - results.length);
+      let page: Page;
+      let unavailable = false;
+      while (true) {
+        try {
+          page = await readPage(limit, fields);
+          break;
+        } catch (error) {
+          if (!(error instanceof MetaApiError) || error.code !== 1) throw error;
+          failing = error;
+          if (limit > 1) {
+            limit = Math.max(1, Math.floor(limit / 2));
+            continue;
+          }
+          // This exact cursor succeeds with id,updated_time in the reported case.
+          // If even that fails, propagate the failure; do not skip unknown data.
+          page = await readPage(1, "id,updated_time");
+          unavailable = true;
+          console.warn("[Conversations] Detail expansion unavailable", {
+            code: error.code,
+            subcode: error.subcode,
+            trace: error.fbTraceId,
+          });
+          break;
         }
-        // This exact cursor succeeds with id,updated_time in the reported case.
-        // If even that fails, propagate the failure; do not skip unknown data.
-        page = await readPage(1, "id,updated_time");
-        unavailable = true;
-        console.warn("[Conversations] Detail expansion unavailable", {
-          code: error.code,
-          subcode: error.subcode,
-          trace: error.fbTraceId,
-        });
-        break;
       }
-    }
+      failing = null;
 
-    const rows = page.data ?? [];
-    for (const row of rows) {
-      if (seenIds.has(row.id)) continue;
-      seenIds.add(row.id);
-      results.push(unavailable ? { ...row, detailsUnavailable: true } : row);
-      if (results.length === 50) return results;
+      const rows = page.data ?? [];
+      for (const row of rows) {
+        if (seenIds.has(row.id)) continue;
+        seenIds.add(row.id);
+        results.push(unavailable ? { ...row, detailsUnavailable: true } : row);
+        if (results.length === 50) return results;
+      }
+      if (!page.paging?.next || rows.length === 0) return results;
+      const nextAfter = page.paging.cursors?.after;
+      if (!nextAfter || seenCursors.has(nextAfter)) {
+        throw new Error("Instagram conversation pagination did not advance");
+      }
+      seenCursors.add(nextAfter);
+      after = nextAfter;
+      // Stay small around failures; grow back towards the normal page size after
+      // successful expansions. Consecutive bad entries cost two reads each.
+      pageSize = unavailable ? 1 : Math.min(50, limit * 2);
     }
-    if (!page.paging?.next || rows.length === 0) return results;
-    const nextAfter = page.paging.cursors?.after;
-    if (!nextAfter || seenCursors.has(nextAfter)) {
-      throw new Error("Instagram conversation pagination did not advance");
-    }
-    seenCursors.add(nextAfter);
-    after = nextAfter;
-    // Stay small around failures; grow back towards the normal page size after
-    // successful expansions. Consecutive bad entries cost two reads each.
-    pageSize = unavailable ? 1 : Math.min(50, limit * 2);
+  } catch (error) {
+    if (!(error instanceof ConversationReadStopped)) throw error;
+    // No further request: what was read so far is the answer. Nothing read
+    // yet because the first page kept failing: its failure stands.
+    if (failing && results.length === 0) throw failing;
+    return results;
   }
   // The caller asked for fewer pages: what they held is the answer.
   if (pageLimit < CONVERSATION_PAGE_LIMIT) return results;

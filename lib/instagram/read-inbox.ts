@@ -6,14 +6,20 @@ export async function getConversations({
   context,
   igUserId,
   maxPages,
+  beforeRequest,
 }: {
   context: InstagramContext;
   igUserId: string;
   /** Meta only: stop after this many list pages (the Inbox's timer reads). */
   maxPages?: number;
+  /**
+   * Meta only: asked before every request after the first; false stops the
+   * read with what it has (the Inbox's read budget, lib/inbox/read-budget.ts).
+   */
+  beforeRequest?: () => Promise<boolean>;
 }): Promise<meta.InstagramConversation[]> {
   if (context.provider === "META")
-    return meta.getConversations(context, igUserId, { maxPages });
+    return meta.getConversations(context, igUserId, { maxPages, beforeRequest });
   const result = await zernioRequest<{
     data: {
       id: string;

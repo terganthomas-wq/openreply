@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCurrentWorkspaceId } from "@/lib/auth";
-import { inboxBudgetResponse, reserveInboxRead } from "@/lib/inbox/read-budget";
+import {
+  inboxBudgetResponse,
+  inboxPausedUntil,
+  reserveInboxRead,
+} from "@/lib/inbox/read-budget";
 import { getWorkspaceInstagramAccount } from "@/lib/instagram-accounts";
 import {
   getConversations,
@@ -26,10 +30,13 @@ export interface ConversationsResponse {
   account: { id: string; username: string; instagramId: string };
 }
 
-// List the account's DM conversations for the inbox. Every read of Meta
-// takes one of the account's hourly Inbox reads (lib/inbox/read-budget.ts);
-// beyond them the answer is 429 inbox_budget. The Inbox's timer reads
-// (`?silent=1`) ask for the newest page only.
+// List the account's DM conversations for the inbox. Every request to Meta
+// takes one of the account's hourly Inbox reads (lib/inbox/read-budget.ts):
+// a list of several pages, or a conversation Meta cannot expand being
+// narrowed down, takes one per request. Beyond them, and while the worker
+// has paused the account for a Meta request limit, the answer is 429
+// inbox_budget. The Inbox's timer reads (`?silent=1`) make exactly one
+// request: the newest page, and a page Meta refuses fails the read.
 export async function GET(request: NextRequest) {
   const workspaceId = await getCurrentWorkspaceId();
   if (!workspaceId) {
@@ -50,15 +57,29 @@ export async function GET(request: NextRequest) {
     );
   }
 
+  const pausedUntil = await inboxPausedUntil(account.instagramId);
+  if (pausedUntil) return inboxBudgetResponse(pausedUntil);
   const budget = await reserveInboxRead(account.id);
   if (!budget.allowed) return inboxBudgetResponse(budget.retryAt);
+
+  // The reservation above covers the first request; each further one takes
+  // another read, and a timer read makes none.
+  const silent = request.nextUrl.searchParams.get("silent") === "1";
+  const refused: { until: Date | null } = { until: null };
+  const beforeRequest = async (): Promise<boolean> => {
+    if (silent) return false;
+    const next = await reserveInboxRead(account.id);
+    if (!next.allowed) refused.until = next.retryAt;
+    return next.allowed;
+  };
 
   try {
     const accessToken = await createInstagramContext(account);
     const raw = await getConversations({
       context: accessToken,
       igUserId: account.instagramId,
-      ...(request.nextUrl.searchParams.get("silent") === "1" ? { maxPages: 1 } : {}),
+      beforeRequest,
+      ...(silent ? { maxPages: 1 } : {}),
     });
 
     const conversations: ConversationListItem[] = raw.map((c) => {
@@ -95,6 +116,8 @@ export async function GET(request: NextRequest) {
     };
     return NextResponse.json({ success: true, data });
   } catch (err) {
+    // The budget ran out before a single conversation could be read.
+    if (refused.until) return inboxBudgetResponse(refused.until);
     console.error("[Conversations] Error:", err);
     const message =
       err instanceof MetaApiError

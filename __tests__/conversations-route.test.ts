@@ -1,9 +1,10 @@
 /**
  * The Inbox's API under its read budget (Meta submission plan, part B,
- * S1b): GET /api/instagram/conversations and GET .../[id] share 40 reads of
- * Meta an hour per account and answer 429 inbox_budget beyond them, a timer
- * read (`?silent=1`) reads one page of the list, and sending by hand (POST)
- * is never capped.
+ * S1b): GET /api/instagram/conversations and GET .../[id] share 40 requests
+ * to Meta an hour per account and answer 429 inbox_budget beyond them and
+ * while the worker has paused the account for a Meta limit, a timer read
+ * (`?silent=1`) makes exactly one request, every further request of a full
+ * read takes one more, and sending by hand (POST) is never capped.
  *
  * The database and the session are mocks, Redis the in-memory stand-in, and
  * Meta is fetch answered here: every Graph call is counted, none leaves the
@@ -26,6 +27,7 @@ vi.mock("@/lib/meta/oauth", () => ({ decryptToken: () => "local-test-token" }));
 import { GET as listConversations, POST as sendReply } from "../app/api/instagram/conversations/route";
 import { GET as readThread } from "../app/api/instagram/conversations/[id]/route";
 import { inboxReadKey } from "../lib/inbox/read-budget";
+import { accountPauseKey } from "../lib/queue/account-pause";
 import { FakeRedis } from "./helpers/fake-redis";
 
 const NOW = Date.parse("2026-11-27T10:00:00.000Z");
@@ -45,6 +47,9 @@ let graphCalls: { method: string; path: string; params: URLSearchParams }[];
 // The list as Meta pages it: TOTAL conversations, PAGE_CAP per page.
 const TOTAL = 13;
 const PAGE_CAP = 5;
+// Conversations whose expanded fields make Meta refuse the whole page with
+// code 1 (upstream #60), by their index in the list.
+let broken: number[];
 
 function graph() {
   return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -58,6 +63,13 @@ function graph() {
     if (url.pathname.endsWith("/ig_owner/conversations")) {
       const start = Number(url.searchParams.get("after")?.replace("cursor-", "") ?? 0);
       const end = Math.min(TOTAL, start + Math.min(PAGE_CAP, Number(url.searchParams.get("limit"))));
+      const expanded = url.searchParams.get("fields") !== "id,updated_time";
+      if (expanded && broken.some((index) => index >= start && index < end)) {
+        return Response.json(
+          { error: { code: 1, type: "OAuthException", message: "An unknown error has occurred.", fbtrace_id: "trace" } },
+          { status: 400 }
+        );
+      }
       const data = Array.from({ length: end - start }, (_, offset) => ({
         id: `conversation-${start + offset}`,
         updated_time: "2026-11-27T09:00:00+0000",
@@ -104,6 +116,7 @@ beforeEach(() => {
   redis = new FakeRedis();
   state.redis = redis;
   graphCalls = [];
+  broken = [];
   vi.stubGlobal("fetch", graph());
   mockWorkspaceId.mockResolvedValue("workspace_1");
   mockPrisma.instagramAccount.findFirst.mockResolvedValue(ACCOUNT);
@@ -157,6 +170,119 @@ describe("GET /api/instagram/conversations", () => {
     expect((await list()).status).toBe(400);
     expect(redis.commands).toEqual([]);
     expect(graphCalls).toEqual([]);
+  });
+
+  it("counts every request to Meta: a list of three pages takes three reads", async () => {
+    expect((await list()).status).toBe(200);
+    expect(graphCalls).toHaveLength(3);
+    expect(redis.strings.get(inboxReadKey("account_1"))?.value).toBe("3");
+  });
+
+  it("stops a full read where the budget ends and answers with what it read", async () => {
+    for (let i = 0; i < 38; i++) await list("&silent=1");
+    graphCalls = [];
+
+    const response = await list();
+    expect(response.status).toBe(200);
+    // Two of the three pages fit into the hour's 40.
+    expect((await response.json()).data.conversations).toHaveLength(2 * PAGE_CAP);
+    expect(graphCalls).toHaveLength(2);
+
+    expect((await list("&silent=1")).status).toBe(429);
+    expect(graphCalls).toHaveLength(2);
+  });
+
+  describe("with a conversation Meta cannot expand (upstream #60)", () => {
+    beforeEach(() => {
+      // The newest one: every page that holds it is refused with code 1.
+      broken = [0];
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("makes exactly one request for a timer read, which then fails", async () => {
+      const response = await list("&silent=1");
+      expect(response.status).toBe(500);
+      expect(graphCalls).toHaveLength(1);
+      expect(redis.strings.get(inboxReadKey("account_1"))?.value).toBe("1");
+    });
+
+    it("narrows it down on a full read, taking one read per request", async () => {
+      const response = await list();
+      expect(response.status).toBe(200);
+      const { conversations } = (await response.json()).data;
+      expect(conversations).toHaveLength(TOTAL);
+      expect(conversations[0]).toMatchObject({ id: "conversation-0", detailsUnavailable: true });
+      expect(graphCalls.length).toBeGreaterThan(3);
+      expect(redis.strings.get(inboxReadKey("account_1"))?.value).toBe(String(graphCalls.length));
+    });
+
+    it("never asks Meta more than 40 times an hour, whatever the mix of reads", async () => {
+      let refused = false;
+      for (let i = 0; i < 100 && !refused; i++) {
+        refused = (await list(i % 3 === 0 ? "" : "&silent=1")).status === 429;
+      }
+      expect(refused).toBe(true);
+      expect(graphCalls).toHaveLength(40);
+
+      expect((await list()).status).toBe(429);
+      expect((await list("&silent=1")).status).toBe(429);
+      expect((await thread()).status).toBe(429);
+      expect(graphCalls).toHaveLength(40);
+    });
+
+    it("answers 429 when the budget ends before a single conversation was read", async () => {
+      for (let i = 0; i < 39; i++) await list("&silent=1");
+      graphCalls = [];
+
+      const response = await list();
+      expect(response.status).toBe(429);
+      expect(await response.json()).toMatchObject({
+        code: "inbox_budget",
+        retryAt: new Date(NOW + 60 * 60_000).toISOString(),
+      });
+      // The 40th read is the first page, which Meta refuses; narrowing it
+      // down would take a 41st.
+      expect(graphCalls).toHaveLength(1);
+    });
+  });
+});
+
+describe("while the worker has paused the account for a Meta request limit", () => {
+  const RESUME = NOW + 20 * 60_000;
+
+  beforeEach(async () => {
+    await redis.set(accountPauseKey("ig_owner"), String(RESUME), "PX", String(20 * 60_000));
+  });
+
+  it("reads neither the list nor a thread, and says until when", async () => {
+    for (const response of [await list(), await list("&silent=1"), await thread()]) {
+      expect(response.status).toBe(429);
+      expect(response.headers.get("Retry-After")).toBe(String(20 * 60));
+      expect(await response.json()).toMatchObject({
+        success: false,
+        code: "inbox_budget",
+        retryAt: new Date(RESUME).toISOString(),
+      });
+    }
+    expect(graphCalls).toEqual([]);
+    // The hour's budget is left alone.
+    expect(redis.strings.has(inboxReadKey("account_1"))).toBe(false);
+  });
+
+  it("still sends by hand", async () => {
+    expect((await send()).status).toBe(200);
+    expect(graphCalls.map((call) => call.method)).toEqual(["POST"]);
+  });
+
+  it("reads again once the pause is over", async () => {
+    vi.setSystemTime(RESUME + 1);
+    expect((await list("&silent=1")).status).toBe(200);
+    expect(graphCalls).toHaveLength(1);
   });
 });
 

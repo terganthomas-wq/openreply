@@ -13,20 +13,22 @@
  * S1b): the list every 2 minutes while the tab is visible and used, stopped
  * after 10 idle minutes; the open thread when it opens, after an own send,
  * when the list shows it changed, and on "Refresh". The server allows 40
- * reads an hour per account and answers 429 inbox_budget beyond that; the
- * page then keeps what it shows and pauses until the given time. Sending by
- * hand is never blocked.
+ * requests to Meta an hour per account and answers 429 inbox_budget beyond
+ * that and while the worker has paused the account for a Meta limit; the
+ * page then keeps what it shows and pauses for the answer's Retry-After (at
+ * least 30 seconds). Sending by hand is never blocked.
  */
 
 import type { Locale } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
 import { useCallback, useEffect, useEffectEvent, useRef, useState } from "react";
 import AccountSelect, { type AccountOption } from "@/components/account-select";
-import { readCache, writeCache } from "@/lib/client-cache";
+import { pruneCache, readCache, writeCache } from "@/lib/client-cache";
 import {
   CACHE_MAX_AGE_MS,
   LIST_POLL_MS,
   conversationChanged,
+  firstListReadIn,
   inboxBudgetRetryAt,
   mergeConversationPage,
   pollState,
@@ -61,9 +63,19 @@ function formatClock(ms: number, locale: Locale): string {
 }
 
 /** A stored copy, but only while it is younger than CACHE_MAX_AGE_MS. */
-function freshCache<T>(key: string): T | null {
+function freshCache<T>(key: string): { data: T; ts: number } | null {
   const cached = readCache<T>(key, CACHE_MAX_AGE_MS);
-  return cached.data !== null && !cached.stale ? cached.data : null;
+  return cached.data !== null && cached.ts !== null && !cached.stale
+    ? { data: cached.data, ts: cached.ts }
+    : null;
+}
+
+/**
+ * The stored copies of lists and threads are painted only while fresh, so
+ * the stale ones go: they can hold a message unsent since.
+ */
+function pruneInboxCopies() {
+  pruneCache(["inbox:convs:", "inbox:msgs:"], CACHE_MAX_AGE_MS);
 }
 
 export default function InboxPage() {
@@ -165,7 +177,12 @@ export default function InboxPage() {
           { cache: "no-store" }
         );
         const data = await res.json();
-        const pauseUntil = inboxBudgetRetryAt(res.status, data);
+        const pauseUntil = inboxBudgetRetryAt(
+          res.status,
+          data,
+          res.headers.get("Retry-After"),
+          Date.now()
+        );
         if (pauseUntil !== null) {
           // Keep whatever is shown.
           pauseReads(pauseUntil);
@@ -173,6 +190,7 @@ export default function InboxPage() {
         }
         if (data.success && request === threadRequestRef.current) {
           writeCache(msgCacheKey(conversationId), data.data.messages);
+          pruneInboxCopies();
           if (activeIdRef.current === conversationId) setMessages(data.data.messages);
           endPause();
         }
@@ -205,7 +223,12 @@ export default function InboxPage() {
         );
         const data = await res.json();
         if (accountRef.current !== accountId) return;
-        const pauseUntil = inboxBudgetRetryAt(res.status, data);
+        const pauseUntil = inboxBudgetRetryAt(
+          res.status,
+          data,
+          res.headers.get("Retry-After"),
+          Date.now()
+        );
         if (pauseUntil !== null) {
           // Keep whatever is shown.
           pauseReads(pauseUntil);
@@ -219,6 +242,7 @@ export default function InboxPage() {
           lastListReadAtRef.current = Date.now();
           setConversations(next);
           writeCache(convCacheKey(accountId), next);
+          pruneInboxCopies();
           setConvError(null);
           endPause();
           const open = activeIdRef.current;
@@ -252,8 +276,8 @@ export default function InboxPage() {
   );
 
   // Opening the Inbox or another account. A list stored less than a minute
-  // ago is shown as it is (the timer reads next); an older one is not shown
-  // at all, so a message unsent since cannot come back from it.
+  // ago is shown as it is and read once it is a minute old; an older one is
+  // not shown at all, so a message unsent since cannot come back from it.
   useEffect(() => {
     if (!selectedAccountId) return;
     // Reset the open thread when switching accounts. This is an intentional
@@ -270,12 +294,26 @@ export default function InboxPage() {
     setMessages([]);
     setIdle(false);
     setConvError(null);
+    pruneInboxCopies();
     const cached = freshCache<ConversationListItem[]>(convCacheKey(selectedAccountId));
     if (cached) {
-      conversationsRef.current = cached;
-      setConversations(cached);
+      conversationsRef.current = cached.data;
+      setConversations(cached.data);
       setConvLoading(false);
-      return;
+      // The copy stands in for a read only until it is a minute old. Then
+      // the newest page is read, unless a read came since, the tab is
+      // hidden (coming back reads) or the server pauses reads.
+      const timer = window.setTimeout(() => {
+        const now = Date.now();
+        if (
+          document.visibilityState === "visible" &&
+          now >= budgetUntilRef.current &&
+          readIsStale(lastListReadAtRef.current, now)
+        ) {
+          void loadConversations("page");
+        }
+      }, firstListReadIn(cached.ts, Date.now()));
+      return () => window.clearTimeout(timer);
     }
     conversationsRef.current = [];
     setConversations([]);
@@ -372,7 +410,7 @@ export default function InboxPage() {
     setSendError(null);
     // Paint a recent stored thread synchronously so the pane never flashes
     // empty or shows the previously open conversation while the read runs.
-    const cached = freshCache<ThreadMessage[]>(msgCacheKey(id));
+    const cached = freshCache<ThreadMessage[]>(msgCacheKey(id))?.data ?? null;
     setMessages(cached ?? []);
     if (conversations.find((c) => c.id === id)?.detailsUnavailable) {
       setThreadLoading(false);

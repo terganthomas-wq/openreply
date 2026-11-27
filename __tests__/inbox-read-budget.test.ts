@@ -14,9 +14,11 @@ import {
   INBOX_READS_PER_HOUR,
   INBOX_READ_WINDOW_MS,
   inboxBudgetResponse,
+  inboxPausedUntil,
   inboxReadKey,
   reserveInboxRead,
 } from "../lib/inbox/read-budget";
+import { accountPauseKey } from "../lib/queue/account-pause";
 import { FakeRedis } from "./helpers/fake-redis";
 
 const NOW = Date.parse("2026-11-27T10:00:00.000Z");
@@ -101,6 +103,33 @@ describe("reserveInboxRead", () => {
     expect(result).toBe("pending");
     await vi.advanceTimersByTimeAsync(1);
     expect(result).toEqual({ allowed: true });
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("inboxPausedUntil", () => {
+  it("is the end of the worker's pause of the account for a Meta limit, and null without one", async () => {
+    expect(await inboxPausedUntil("ig_owner")).toBeNull();
+    await redis.set(accountPauseKey("ig_owner"), String(NOW + 20 * MINUTE), "PX", String(20 * MINUTE));
+    expect(await inboxPausedUntil("ig_owner")).toEqual(new Date(NOW + 20 * MINUTE));
+    expect(await inboxPausedUntil("ig_other")).toBeNull();
+    vi.setSystemTime(NOW + 20 * MINUTE);
+    expect(await inboxPausedUntil("ig_owner")).toBeNull();
+  });
+
+  it("counts a Redis that does not answer within 3 seconds as no pause", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    state.redis = { get: vi.fn(() => new Promise(() => {})) };
+    let result: unknown = "pending";
+    void inboxPausedUntil("ig_owner").then((value) => {
+      result = value;
+    });
+    await vi.advanceTimersByTimeAsync(2_999);
+    expect(result).toBe("pending");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(result).toBeNull();
     expect(warn).toHaveBeenCalledTimes(1);
   });
 });

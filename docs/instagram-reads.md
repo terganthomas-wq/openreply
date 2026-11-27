@@ -22,23 +22,39 @@ seconds, up to 600 reads an hour for one open tab. Now
 - There is no thread timer. The open thread is read when it opens, after an
   own send, when a list read shows that its update time or last message
   changed (`conversationChanged`), and on "Refresh".
-- A timer read asks for the newest page of the list only
+- A timer read makes exactly one request: the newest page of the list
   (`GET /api/instagram/conversations?silent=1`, `getConversations` with
-  `maxPages: 1`) and puts it on top of what is shown. Opening the Inbox,
-  another account or "Refresh" read the whole list (at most 50
-  conversations).
+  `maxPages: 1`), put on top of what is shown. When Meta refuses that page
+  (a conversation whose details it cannot expand, upstream #60), the timer
+  read fails and the list stays as it is; it does not narrow the page down.
+  Opening the Inbox, another account or "Refresh" read the whole list (at
+  most 50 conversations), narrowing such a page down as
+  [conversation recovery](conversation-recovery.md) describes.
 - A copy stored in the browser (sessionStorage) is painted only while it is
-  younger than a minute (`CACHE_MAX_AGE_MS`); such a copy stands in for the
-  first read. An older copy is never painted, so a message unsent in the
-  meantime does not come back from it.
-- The server allows both GET routes together at most 40 reads of Meta an
-  hour per connected account (`INBOX_READS_PER_HOUR` in
+  younger than a minute (`CACHE_MAX_AGE_MS`). A list copy painted on opening
+  stands in for the first read only until it is a minute old; then the
+  newest page is read (`firstListReadIn`). An older copy is never painted,
+  and stale copies of lists and threads are removed from the tab's storage
+  on opening and after every read (`pruneCache`). So a message unsent in the
+  meantime shows from a copy at most a minute after the copy was stored.
+- The server allows both GET routes together at most 40 requests to Meta
+  an hour per connected account (`INBOX_READS_PER_HOUR` in
   `lib/inbox/read-budget.ts`), in a window of an hour from its first read.
-  Beyond that they answer `429` with
+  Every request counts, not every call of a route: a list of several pages,
+  or a page narrowed down around a conversation Meta cannot expand, takes
+  one read per request (`getConversations`' `beforeRequest`). When the
+  budget ends in the middle of a list, the answer is the part read so far.
+  Beyond the budget the routes answer `429` with
   `{ "success": false, "code": "inbox_budget", "retryAt": "<ISO time>" }`
   and a `Retry-After` header, without calling Meta. The page keeps what it
-  shows, says until when it pauses, and reads again from then on. The cap is
-  a constant on purpose, not a setting.
+  shows, says until when it pauses, and reads again from then on; it counts
+  the pause from its own clock by `Retry-After`, and never less than 30
+  seconds, so a browser clock ahead of the server's cannot start the next
+  read at once. The cap is a constant on purpose, not a setting.
+- While the worker has paused the account for a Meta request limit
+  (`meta:pause:<instagram id>`, see [delivery retries](delivery-retries.md)),
+  both GET routes answer the same `429` with the pause's end and do not call
+  Meta; the budget is left alone.
 - Sending by hand (`POST /api/instagram/conversations`) is never capped and
   does not count.
 - When Redis fails or does not answer within 3 seconds, the read is allowed
@@ -46,8 +62,9 @@ seconds, up to 600 reads an hour for one open tab. Now
   access control.
 
 An Inbox that is open and used reads the list about 30 times an hour, plus
-one thread read per new message in the open conversation, and never more
-than 40 times an hour per account. A hidden or idle Inbox reads nothing.
+one thread read per new message in the open conversation, and never makes
+more than 40 requests to Meta an hour per account. A hidden or idle Inbox
+reads nothing.
 
 ## Overview
 

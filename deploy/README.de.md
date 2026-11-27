@@ -191,16 +191,27 @@ eine offene Seite alle 12 Sekunden nach Liste und Unterhaltung, bis zu
   gesendet hast, wenn die Liste darin eine neue Nachricht zeigt, und bei
   *Aktualisieren*. Einen eigenen Zeitgeber hat sie nicht mehr.
 - Eine im Browser gespeicherte Kopie zeigt die Seite nur, solange sie jünger
-  als eine Minute ist; dann liest sie auch nicht sofort neu (das macht der
-  nächste Durchgang). Eine ältere Kopie zeigt sie gar nicht, du siehst kurz
-  „Wird geladen …“. So kommt auch eine zurückgezogene Nachricht nicht aus der
-  Kopie zurück.
+  als eine Minute ist; die Liste liest sie dann neu, sobald die Kopie eine
+  Minute alt ist. Eine ältere Kopie zeigt sie gar nicht, du siehst kurz
+  „Wird geladen …“, und alte Kopien löscht sie aus dem Speicher des Browsers.
+  So zeigt eine Kopie eine zurückgezogene Nachricht höchstens bis eine Minute
+  nach dem Speichern.
 - Der Server erlaubt dem Postfach höchstens 40 Abrufe pro Stunde und
   Instagram-Konto, Liste und Unterhaltungen zusammen; die Stunde läuft ab dem
-  ersten Abruf. Danach zeigt die Seite „Das Postfach pausiert bis HH:MM,
-  damit Instagrams Anfrage-Limit nicht erreicht wird.“, behält, was sie
-  zeigt, und liest erst ab dieser Uhrzeit wieder. Die 40 stehen fest im Code
-  (`lib/inbox/read-budget.ts`), es gibt keine Einstellung dafür.
+  ersten Abruf. Jede einzelne Anfrage an Instagram zählt: Braucht die Liste
+  mehrere Seiten, oder kreist die Seite eine Unterhaltung ein, die Instagram
+  nicht vollständig liefert („Details nicht verfügbar“), zählt jede dieser
+  Anfragen. Ein Durchgang alle 2 Minuten fragt genau einmal; lehnt Instagram
+  diese eine Anfrage ab, bleibt die Liste, wie sie ist, bis zum nächsten
+  Öffnen oder *Aktualisieren*. Sind die 40 verbraucht, zeigt die Seite „Das
+  Postfach pausiert bis HH:MM, damit Instagrams Anfrage-Limit nicht erreicht
+  wird.“, behält, was sie zeigt, und liest erst ab dieser Uhrzeit wieder
+  (frühestens nach 30 Sekunden, gezählt mit der Uhr deines Geräts). Die 40
+  stehen fest im Code (`lib/inbox/read-budget.ts`), es gibt keine
+  Einstellung dafür.
+- Solange der Worker das Senden für das Konto wegen eines Meta-Limits
+  pausiert (siehe oben), liest das Postfach gar nicht bei Instagram und
+  zeigt dieselbe Meldung mit dem Ende der Pause.
 - Senden von Hand ist nie gesperrt und zählt nicht mit.
 - Ein offenes, benutztes Postfach liest etwa 30-mal in der Stunde die Liste,
   dazu einmal je neue Nachricht in der offenen Unterhaltung. Wer viele

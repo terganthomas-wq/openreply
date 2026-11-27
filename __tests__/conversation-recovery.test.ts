@@ -120,6 +120,46 @@ describe("Instagram conversation recovery (upstream #60)", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("asks beforeRequest before every request after the first", async () => {
+    const fetchMock = installGraph([], 13, 5);
+    const beforeRequest = vi.fn(async () => true);
+    const result = await getConversations(token, "owner", { beforeRequest });
+    expect(result).toHaveLength(13);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(beforeRequest).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops where beforeRequest says no, and returns what it read", async () => {
+    const fetchMock = installGraph([], 13, 5);
+    const beforeRequest = vi.fn().mockResolvedValueOnce(true).mockResolvedValue(false);
+    const result = await getConversations(token, "owner", { beforeRequest });
+    expect(result.map((row) => row.id)).toEqual(
+      Array.from({ length: 10 }, (_, i) => "conversation-" + i)
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("asks before every narrower retry of a failing page, and keeps the rows before it", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetchMock = installGraph([41]);
+    const beforeRequest = vi.fn(async () => false);
+    // The first page of 50 holds the broken entry: nothing can be read.
+    await expect(getConversations(token, "owner", { beforeRequest })).rejects.toMatchObject({
+      name: "MetaApiError",
+      code: 1,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Allowed to halve once: the 25 healthy rows before it are the answer.
+    fetchMock.mockClear();
+    const halveOnce = vi.fn().mockResolvedValueOnce(true).mockResolvedValue(false);
+    const result = await getConversations(token, "owner", { beforeRequest: halveOnce });
+    expect(result.map((row) => row.id)).toEqual(
+      Array.from({ length: 25 }, (_, i) => "conversation-" + i)
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("returns an actually empty inbox without manufacturing placeholders", async () => {
     installGraph([], 0);
     expect(await getConversations(token, "owner")).toEqual([]);

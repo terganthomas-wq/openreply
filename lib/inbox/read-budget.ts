@@ -1,21 +1,27 @@
 /**
  * The Inbox's Meta read budget (Meta submission plan, part B, S1b).
  *
- * At most INBOX_READS_PER_HOUR reads of the conversation list and of threads
- * per Instagram account row, in a window of one hour from the window's first
- * read. Both GET routes (/api/instagram/conversations and its [id]) reserve
- * one before they ask Meta; sending by hand (the POST) is never capped.
+ * At most INBOX_READS_PER_HOUR requests to Meta for the conversation list and
+ * for threads per Instagram account row, in a window of one hour from the
+ * window's first read. Both GET routes (/api/instagram/conversations and its
+ * [id]) reserve one before they ask Meta, and the list reserves one more for
+ * every further request it makes (a further page, or a conversation Meta
+ * cannot expand being narrowed down: lib/meta/client.ts getConversations).
+ * Sending by hand (the POST) is never capped.
  *
  * A constant on purpose, no env var: every Meta call of the app counts
  * against one shared request limit (on 2026-11-21 about 25 private replies
  * and 50 conversation reads in an hour blocked every call for an hour), and
  * whoever opens the Inbox, a reviewer included, must not spend it on reads.
+ * For the same reason the Inbox reads nothing while the worker has paused
+ * the account for a Meta request limit (inboxPausedUntil).
  *
  * The counter is the one of the manual sends (lib/comments/server.ts):
  * INCR first, the expiry set by the first read. It is a safety net, not an
  * access control: when Redis fails or does not answer within 3 seconds, the
  * read is allowed and a warning is logged.
  */
+import { checkAccountPause } from "@/lib/queue/account-pause";
 import { getRedisConnection } from "@/lib/queue/client";
 
 export const INBOX_READS_PER_HOUR = 40;
@@ -79,6 +85,23 @@ export async function reserveInboxRead(
     // Without the time left, wait the whole window.
   }
   return { allowed: false, retryAt: new Date(retryAt) };
+}
+
+/**
+ * When the worker's pause of the account for a Meta request limit ends
+ * (lib/queue/account-pause.ts, keyed by the Instagram business id), or null
+ * while there is none. Meta refuses every call meanwhile, so the Inbox does
+ * not ask it, as the Kommentare page does not. A Redis that fails or does not
+ * answer within 3 seconds counts as no pause, as for the budget.
+ */
+export async function inboxPausedUntil(instagramId: string): Promise<Date | null> {
+  try {
+    const resumeAt = await withTimeout(checkAccountPause(instagramId));
+    return resumeAt === null ? null : new Date(resumeAt);
+  } catch {
+    console.warn("[Inbox] Account pause not checked (Redis was slow); read allowed");
+    return null;
+  }
 }
 
 /** The answer to a refused read: 429 with code inbox_budget and retryAt. */

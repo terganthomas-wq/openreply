@@ -13,10 +13,16 @@
  *   an own send, when a list read shows that it changed
  *   (conversationChanged), and on "Refresh";
  * - a stored copy of the list or a thread is painted only while it is
- *   younger than CACHE_MAX_AGE_MS, so an unsent message does not come back
- *   from the browser;
- * - the server allows both reads at most 40 times an hour per account
- *   (lib/inbox/read-budget.ts) and answers 429 inbox_budget beyond that.
+ *   younger than CACHE_MAX_AGE_MS, and a list copy painted on opening stands
+ *   in for a read only until it is that old (firstListReadIn); the thread is
+ *   read when it opens anyway. So a message unsent meanwhile shows from the
+ *   browser's copy at most a minute after the copy was stored. Stale copies
+ *   are removed from the browser's storage (pruneCache);
+ * - the server allows both reads together at most 40 requests to Meta an
+ *   hour per account (lib/inbox/read-budget.ts) and answers 429 inbox_budget
+ *   beyond that and while the worker has paused the account for a Meta
+ *   limit; the page then pauses until the answer's Retry-After
+ *   (inboxBudgetRetryAt).
  *
  * Pure and client-safe: no imports, no clock of its own.
  */
@@ -50,6 +56,16 @@ export function pollState({
 /** Whether a read done at `readAt` is too old to stand for the list now. */
 export function readIsStale(readAt: number, now: number): boolean {
   return now - readAt > CACHE_MAX_AGE_MS;
+}
+
+/**
+ * How long (ms) a list copy stored at `copyAt` and painted on opening stands
+ * in for the first read: until it is CACHE_MAX_AGE_MS old. Then the list is
+ * read, so a reload does not keep an unsent message's preview until the
+ * timer's next turn.
+ */
+export function firstListReadIn(copyAt: number, now: number): number {
+  return Math.max(0, CACHE_MAX_AGE_MS - (now - copyAt));
 }
 
 /** The fields of a list entry that tell whether its thread changed. */
@@ -97,14 +113,32 @@ export function mergeConversationPage<T extends { id: string }>(
   );
 }
 
+/** A refused read pauses the Inbox's reads at least this long. */
+export const BUDGET_PAUSE_MIN_MS = 30_000;
+
 /**
- * The end of the read pause (ms) when the server refused a read for the
- * account's hourly budget (HTTP 429, code "inbox_budget"); otherwise null.
+ * The end of the read pause (ms, on this browser's clock `now`) when the
+ * server refused a read for the account's hourly budget (HTTP 429, code
+ * "inbox_budget"); otherwise null. It counts the answer's Retry-After
+ * seconds from `now`, so a browser clock ahead of the server's cannot end
+ * the pause at once; the server's own retryAt only stands in when the header
+ * is missing. Never sooner than BUDGET_PAUSE_MIN_MS from `now`, so a refused
+ * read never starts the next one right away.
  */
-export function inboxBudgetRetryAt(status: number, body: unknown): number | null {
+export function inboxBudgetRetryAt(
+  status: number,
+  body: unknown,
+  retryAfter: string | null,
+  now: number
+): number | null {
   if (status !== 429 || !body || typeof body !== "object") return null;
   const { code, retryAt } = body as { code?: unknown; retryAt?: unknown };
-  if (code !== "inbox_budget" || typeof retryAt !== "string") return null;
-  const at = Date.parse(retryAt);
-  return Number.isFinite(at) ? at : null;
+  if (code !== "inbox_budget") return null;
+  const seconds = retryAfter !== null && /^\d+$/.test(retryAfter.trim()) ? Number(retryAfter) : NaN;
+  const at = Number.isFinite(seconds)
+    ? now + seconds * 1000
+    : typeof retryAt === "string"
+      ? Date.parse(retryAt)
+      : NaN;
+  return Number.isFinite(at) ? Math.max(at, now + BUDGET_PAUSE_MIN_MS) : null;
 }
