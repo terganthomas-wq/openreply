@@ -805,12 +805,88 @@ bash deploy/oracle/upload-env.sh <server-ip> <ordner>/worker.env
 
 ## Updates
 
-1. Änderung nach `main` pushen. Vercel baut neu und führt dabei die
-   Datenbank-Migrationen aus.
-2. Erst danach auf dem Server: `bash ~/openreply/deploy/oracle/update-worker.sh`
+Gearbeitet wird auf dem Zweig `self-hosted`. Der lokale Zweig `main` folgt
+dem Originalprojekt und wird nie gepusht; ein bloßes `git push` scheitert
+deshalb absichtlich.
 
-Neuerungen des Originalprojekts holen: `git fetch upstream && git merge upstream/main`,
-dann testen (`npm run typecheck && npm test`) und wie oben ausrollen.
+1. Die Änderung auf `self-hosted` committen. Typecheck, Tests und Lint sind
+   grün.
+2. Genau diesen Commit ausrollen: `SHA=$(git rev-parse HEAD)`, dann
+   `git push -q origin "${SHA}:main"` (in zsh mit den geschweiften Klammern).
+   Vercel baut neu und führt dabei die Datenbank-Migrationen aus
+   (`prisma migrate deploy` in `vercel-build`).
+3. Warten, bis Vercel fertig ist:
+   `gh api repos/<konto>/openreply/commits/<SHA>/status --jq .state` muss
+   `success` liefern. Etwa einmal pro Minute nachsehen, nicht in einer
+   schnellen Schleife. Bei `failure` das Build-Log in Vercel lesen; der
+   Worker ist dann unberührt.
+4. Erst danach auf dem Server: `bash ~/openreply/deploy/oracle/update-worker.sh`.
+   Am Ende steht „Worker now at <sha> …“.
+
+Was `update-worker.sh` macht: `git pull --ff-only`, dann prüft
+`npx prisma migrate status`, ob die Datenbank jede Migration des neuen Stands
+hat. Nur dann folgen `npm ci`, `prisma generate` und der Neustart über pm2.
+
+- **„Stopped: the database lacks migrations of this commit. Wait until
+  Vercel shows success, then run this again. The worker keeps running at
+  <sha>.“** Der Datenbank fehlt noch eine Migration des neuen Stands, meist
+  weil Vercel noch baut. Ein neuer Worker würde dann jeden Kommentar, jeden
+  Tipp, jede DM, jede Folgenachricht und jedes Angebot mit „column does not
+  exist“ scheitern lassen (wiederholt nach 5 und 15 Minuten, dann verworfen;
+  für Tipps holt kein Durchlauf etwas nach). Das Skript setzt deshalb nur die
+  Kopie auf dem Server auf den alten Stand zurück (`origin/main` bleibt, wie
+  es ist; `npm ci` lief noch nicht, die Pakete passen also zum alten Stand)
+  und startet nichts neu. Der laufende Worker arbeitet mit dem alten Stand
+  weiter, auch wenn pm2 ihn nach einem Absturz neu startet. Warte, bis Vercel
+  `success` zeigt, und starte das Skript noch einmal. Ausgegeben werden nur
+  die Namen der Migrationen und Prismas Urteil, nie die Adresse der
+  Datenbank.
+- **„Stopped: prisma migrate status could not check the database …“** Prisma
+  konnte die Datenbank gar nicht fragen, etwa ohne Verbindung. Auch dann
+  bleibt alles beim alten Stand. Die Einzelheiten zeigt das Skript nicht, weil
+  sie die Adresse der Datenbank enthalten können. Von Hand nachsehen, nur
+  lesend: `cd ~/openreply && npx prisma migrate status >/dev/null 2>&1; echo $?`
+  (0 heißt: alles da).
+
+Neuerungen des Originalprojekts holen: auf `self-hosted`
+`git fetch upstream && git merge upstream/main`, dann testen
+(`npm run typecheck && npm test`) und wie oben ausrollen.
+
+## Zurückrollen
+
+Eine Down-Migration gibt es nicht: Das Datenbankschema bleibt immer.
+
+1. Auf `self-hosted`: `git revert --no-edit <sha>`, bei mehreren Commits den
+   neuesten zuerst.
+2. Typecheck und Tests.
+3. Ausrollen wie unter *Updates*: Push, auf `success` warten, dann
+   `update-worker.sh`. Auf dem Server ist das ein normaler Fast-Forward auf
+   den Revert.
+
+**Ein Commit mit Migration wird ohne seine Migration zurückgerollt.** Ein
+ausgerollter Migrationsordner wird nie geändert oder gelöscht. Ein bloßes
+`git revert` würde aber den Ordner löschen, den die Datenbank schon
+angewendet hat. Wie `prisma migrate status` (der Wächter in
+`update-worker.sh`) und `prisma migrate deploy` auf eine Migration reagieren,
+die nur noch die Datenbank kennt, ist nicht geprüft. Deshalb bleiben der
+Ordner und die Felder in `prisma/schema.prisma`:
+
+```bash
+git revert --no-commit <sha>
+git checkout HEAD -- prisma/schema.prisma prisma/migrations/<ordner>
+npx prisma generate && npm run typecheck && npx vitest run
+git commit -m "revert(<thema>): <titel> (schema and migration kept)"
+```
+
+Der zurückgerollte Code beachtet die neuen Spalten nicht; der erzeugte
+Prisma-Client kennt sie weiter, passend zur Datenbank. Kommt die Funktion
+später wieder, braucht sie keine zweite Migration für dieselben Spalten.
+
+- Ein älterer Worker läuft gegen das neuere Schema, solange dessen Spalten da
+  sind. Ein neuerer Worker vor seiner Migration scheitert mit „column does
+  not exist“; davor schützt `update-worker.sh`.
+- Nie `git reset` oder Force-Push auf `main`: `update-worker.sh` bricht dann
+  bei `git pull --ff-only` ab.
 
 ## Prüfen, ob alles läuft
 
