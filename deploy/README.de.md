@@ -935,17 +935,28 @@ deshalb absichtlich.
    `success` liefern. Etwa einmal pro Minute nachsehen, nicht in einer
    schnellen Schleife. Bei `failure` das Build-Log in Vercel lesen; der
    Worker ist dann unberührt.
-4. Erst danach auf dem Server: `bash ~/openreply/deploy/oracle/update-worker.sh`.
-   Am Ende steht „Worker now at <sha> …“.
+4. Erst danach auf dem Server, abgekoppelt und mit Protokoll:
+   `ssh ubuntu@<server-ip> 'nohup bash ~/openreply/deploy/oracle/update-worker.sh > ~/update-worker.log 2>&1; tail -n 30 ~/update-worker.log'`.
+   So läuft das Skript zu Ende, auch wenn die ssh-Verbindung abbricht
+   (Rechner im Ruhezustand, WLAN weg, Befehl abgebrochen). Ohne `nohup` und
+   Protokoll bräche es dann mitten im Update ab, etwa nach dem Fast-Forward
+   und vor `npm ci` oder vor dem Neustart. Es dauert einige Minuten; wer den
+   Befehl von einem Werkzeug starten lässt, gibt ihm 10 Minuten Zeit. Am Ende
+   steht „Worker now at <sha> …“. Fehlt die Zeile, auf dem Server
+   `tail -n 30 ~/update-worker.log` lesen: Findet
+   `pgrep -f 'update-worker|npm ci'` noch etwas, läuft es noch, dann
+   warten. Sonst die Meldung unten nachschlagen, oder das Skript noch einmal
+   starten.
 
-Was `update-worker.sh` macht: Es holt den neuen Stand (`git fetch`) und legt
-zuerst nur dessen Ordner `prisma/migrations` neben den Code, mit dem der
-Worker läuft. Dann prüft `npx prisma migrate status`, ob die Datenbank jede
-Migration des neuen Stands hat, und der Ordner geht wieder auf den alten
-Stand; sonst ändert das Skript dabei nichts an der Kopie. Startet pm2 den
-Worker in diesen Sekunden neu, läuft er also mit dem alten Code und den
-Paketen, die dazu passen. Nur wenn alles da ist, folgen der Fast-Forward auf
-den neuen Stand, `npm ci`, `prisma generate` und der Neustart über pm2.
+Was `update-worker.sh` macht: Es läuft nur einmal zur selben Zeit. Es holt
+den neuen Stand (`git fetch`) und legt zuerst nur dessen Ordner
+`prisma/migrations` neben den Code, mit dem der Worker läuft. Dann prüft
+`npx prisma migrate status`, ob die Datenbank jede Migration des neuen Stands
+hat, und der Ordner geht wieder auf den alten Stand; sonst ändert das Skript
+dabei nichts an der Kopie. Startet pm2 den Worker in diesen Sekunden neu,
+läuft er also mit dem alten Code und den Paketen, die dazu passen. Nur wenn
+alles da ist, folgen der Fast-Forward auf den neuen Stand, `npm ci`,
+`prisma generate` und der Neustart über pm2.
 
 - **„Stopped: the database lacks migrations of this commit. Wait until
   Vercel shows success, then run this again. The worker keeps running at
@@ -960,21 +971,60 @@ den neuen Stand, `npm ci`, `prisma generate` und der Neustart über pm2.
   Absturz neu startet. Warte, bis Vercel `success` zeigt, und starte das
   Skript noch einmal. Ausgegeben werden nur die Namen der Migrationen und
   Prismas Urteil, nie die Adresse der Datenbank.
-- **„Stopped: node_modules is incomplete (an earlier npm ci did not finish).
-  Nothing was changed or restarted. …“** Ein früheres `npm ci` ist nicht
-  fertig geworden (etwa Netz, Speicher oder eine abgebrochene Verbindung),
-  und `node_modules` ist leer oder unvollständig. Dann kann auch die Prüfung
-  nicht laufen; das Skript ändert nichts. Der laufende Worker arbeitet aus
-  dem Speicher weiter, ein Neustart durch pm2 (Absturz, Speichergrenze)
-  würde aber scheitern, also bald reparieren: Sobald Vercel `success` zeigt,
-  `cd ~/openreply && npm ci --no-fund --no-audit && npx prisma generate`,
-  dann das Skript noch einmal starten.
+- **`node_modules` unvollständig.** Ein früheres `npm ci` ist nicht fertig
+  geworden (etwa Netz, Speicher, eine abgebrochene Verbindung, oder es
+  scheitert am Stand selbst), und `node_modules` ist leer oder unvollständig.
+  Der laufende Worker arbeitet aus dem Speicher weiter, ein Neustart durch
+  pm2 (Absturz, Speichergrenze, `upload-env.sh`) würde aber scheitern. Ohne
+  `node_modules` kann die Prüfung nicht laufen. Das Skript unterscheidet:
+  - Bringt der neue Stand keinen neuen Migrationsordner mit, installiert es
+    ihn ohne die Prüfung und sagt das („node_modules is incomplete … The new
+    commit adds no migration, so it is installed without the database
+    check.“): Der jetzige Stand hat die Prüfung schon bestanden, bevor er
+    übernommen wurde, und Migrationen kommen immer nur hinzu. So kommt auch
+    ein Revert oder eine Korrektur auf den Server, wenn `npm ci` am jetzigen
+    Stand immer wieder scheitert. Ist nichts Neues da, wiederholt es einfach
+    `npm ci`, `prisma generate` und den Neustart.
+  - Bringt er eine neue Migration mit: **„Stopped: node_modules is
+    incomplete (an earlier npm ci did not finish), and the new commit adds a
+    migration, which cannot be checked without them. Nothing was changed or
+    restarted. …“** Das Skript ändert nichts. Sobald Vercel `success` zeigt,
+    `cd ~/openreply && npm ci --no-fund --no-audit && npx prisma generate`,
+    dann das Skript noch einmal starten. Scheitert dieses `npm ci` wieder,
+    liegt es am jetzigen Stand: Sobald Vercel für den neuen Stand `success`
+    zeigt (dann hat die Datenbank seine Migration),
+    `cd ~/openreply && git fetch -q && git merge --ff-only '@{upstream}' && npm ci --no-fund --no-audit && npx prisma generate`,
+    dann das Skript noch einmal starten.
 - **„Stopped: prisma migrate status could not check the database …“** Prisma
   konnte die Datenbank gar nicht fragen, etwa ohne Verbindung. Auch dann
   bleibt alles beim alten Stand. Die Einzelheiten zeigt das Skript nicht, weil
   sie die Adresse der Datenbank enthalten können. Von Hand nachsehen, nur
-  lesend: `cd ~/openreply && npx prisma migrate status >/dev/null 2>&1; echo $?`
-  (0 heißt: alles da).
+  lesend:
+  `cd ~/openreply && npx --yes=false prisma migrate status >/dev/null 2>&1; echo $?`.
+  0 heißt nur: Prisma erreicht die Datenbank jetzt. Verglichen wird dabei
+  mit den Migrationen des alten Stands, denn das Skript hat den Ordner schon
+  zurückgesetzt; ob die neue Migration da ist, prüft erst das Skript. Also
+  das Skript noch einmal starten. Bei einer anderen Zahl zeigt
+  `cd ~/openreply && npx --yes=false prisma migrate status 2>&1 | grep -oE 'P[0-9]{4}' | sort -u`
+  nur Prismas Fehlercode, ohne Adresse: P1001 oder P1002 heißt, die
+  Datenbank ist nicht erreichbar; in einer Minute noch einmal versuchen.
+  Zeigt es keinen Code, prüfen, ob `DATABASE_URL` in `~/openreply/.env`
+  steht: `grep -c '^DATABASE_URL=' ~/openreply/.env` zeigt nur die Anzahl,
+  nie den Wert.
+- **„Stopped: prisma/migrations could not be set back to <sha> (git says why
+  above). …“** git konnte den Ordner nach der Prüfung nicht auf den alten
+  Stand zurücksetzen, meist weil gerade ein anderer git-Befehl in
+  `~/openreply` lief (die Zeile von git darüber nennt den Grund). Der Worker
+  ist davon nicht betroffen: Code, `node_modules` und Prisma-Client sind
+  unverändert, ein Neustart durch pm2 schadet nicht. Das Skript noch einmal
+  starten. Klappt es immer wieder nicht:
+  `cd ~/openreply && git restore --source=HEAD --staged --worktree -- prisma/migrations`.
+- **„Stopped: another update-worker.sh is still running. Nothing was changed.
+  …“** Ein anderer Lauf des Skripts ist noch nicht fertig, etwa einer, dessen
+  Verbindung abbrach, oder dessen `npm ci` noch läuft. Das Skript ändert
+  nichts. Warten, bis `pgrep -f 'update-worker|npm ci'` nichts mehr findet, in
+  `tail -n 30 ~/update-worker.log` nachsehen, wie er endete, dann das Skript
+  noch einmal starten.
 
 Neuerungen des Originalprojekts holen: auf `self-hosted`
 `git fetch upstream && git merge upstream/main`, dann testen
@@ -989,7 +1039,10 @@ Eine Down-Migration gibt es nicht: Das Datenbankschema bleibt immer.
 2. Typecheck und Tests.
 3. Ausrollen wie unter *Updates*: Push, auf `success` warten, dann
    `update-worker.sh`. Auf dem Server ist das ein normaler Fast-Forward auf
-   den Revert.
+   den Revert. Das gilt auch, wenn `npm ci` am zurückgerollten Stand
+   gescheitert ist und `node_modules` unvollständig ist: Ein Revert bringt
+   keinen neuen Migrationsordner mit, das Skript installiert ihn dann ohne
+   die Prüfung (siehe *Updates*).
 
 **Ein Commit mit Migration wird ohne seine Migration zurückgerollt.** Ein
 ausgerollter Migrationsordner wird nie geändert oder gelöscht. Ein bloßes
