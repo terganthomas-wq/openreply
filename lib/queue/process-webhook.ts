@@ -1,6 +1,6 @@
 import { prisma } from '@/lib/db/client';
-import { COMMENT_JOB_NAME, getDMQueue, MESSAGE_JOB_NAME, POSTBACK_JOB_NAME } from '@/lib/queue/client';
-import { inboundMessagingAccountIds, parseCommentEvents, parseMessageEvents, parsePostbackEvents, parseReadEvents } from '@/lib/meta/webhook';
+import { COMMENT_JOB_NAME, DM_SENDER_JOB_NAME, getDMQueue, MESSAGE_JOB_NAME, POSTBACK_JOB_NAME } from '@/lib/queue/client';
+import { inboundMessagingAccountIds, parseCommentEvents, parseMessageEvents, parseMessageSenderEvents, parsePostbackEvents, parseReadEvents } from '@/lib/meta/webhook';
 import { Prisma, type InstagramProvider } from '@/app/generated/prisma/client';
 import { MANUAL_MATCHED_KEYWORD } from '@/lib/comments/manual';
 import { endMessagingSilencesFor } from '@/lib/instagram/messaging-silence-state';
@@ -24,10 +24,10 @@ export async function processInstagramWebhook({ payload: incoming, provider, wor
   // WebhookEvent insert and update, and wake the database for nothing. Nothing
   // reads such a row: Diagnostics shows failed events only, and the sweep
   // reads comment payloads. A payload with anything a person did in a DM is
-  // kept even when no job comes of it (a reaction, a DM without text, an
-  // event in `standby` while another app receives the conversation): the
-  // messaging silence check (A2, lib/instagram/messaging-silence-check.ts)
-  // reads these rows to tell whether Instagram still passes such events on.
+  // kept even when no job comes of it (a reaction, an event in `standby`
+  // while another app receives the conversation): the messaging silence
+  // check (A2, lib/instagram/messaging-silence-check.ts) reads these rows to
+  // tell whether Instagram still passes such events on.
   const hasWork =
     [parseCommentEvents, parsePostbackEvents, parseMessageEvents, parseReadEvents]
       .some((parse) => parse(incoming).length > 0) ||
@@ -158,6 +158,37 @@ export async function processInstagramWebhook({ payload: incoming, provider, wor
           data: { workspaceId: account.workspaceId },
         });
       }
+    }
+
+    // DMs without text (a photo, a voice note, a sticker, the heart, a shared
+    // reel): no campaign answers them, but they open Instagram's 24-hour
+    // messaging window like any DM. Their own job records the sender's time
+    // on the contact, so a read fallback, a follow-up or an offer that waits
+    // for the window sees it. Never the message job: an older worker would
+    // answer an empty DM for "any word" campaigns.
+    const senderEvents = parseMessageSenderEvents(
+      payload as Parameters<typeof parseMessageSenderEvents>[0]
+    );
+
+    for (const event of senderEvents) {
+      const account = accountMap.get(event.instagramAccountId);
+      if (!account) continue;
+
+      await queue.add(
+        DM_SENDER_JOB_NAME,
+        {
+          instagramAccountId: event.instagramAccountId,
+          accountConnectionId: account.id,
+          messageId: event.messageId,
+          senderId: event.senderId,
+        },
+        {
+          // Keyed on the message like the message job, in BullMQ's alphabet.
+          jobId: `dmsender_${event.instagramAccountId}_${Buffer.from(
+            event.messageId
+          ).toString("base64url")}`,
+        }
+      );
     }
 
     // If a user reads the opening DM and never taps the button, deliver the

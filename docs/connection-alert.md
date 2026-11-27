@@ -235,7 +235,7 @@ app, the worker reads:
   receipt or a reaction, in `messaging` or in `standby` (another app is the
   conversation's primary receiver). Echoes and comment changes never count.
   The webhook route keeps every payload with such an event, also one no job
-  comes of (a reaction, a DM without text, a `standby` event). The database
+  comes of (a reaction, a `standby` event). The database
   narrows the rows to the account's payloads with `messaging` or `standby`
   items (jsonb containment, index on `createdAt`); what counts is decided in
   one place, `inboundMessagingAccountIds` in `lib/meta/webhook.ts`, which the

@@ -53,7 +53,8 @@ typed the keyword instead of tapping. Both checks run when the job is queued
 and again when it runs, so a campaign with an opening DM and the DM trigger
 sends its link once. After them the job reads the person's contact: reading
 opens no messaging window, so unless the person tapped or wrote in the last
-23 hours and 55 minutes (Instagram's 24 hours less a five-minute margin), the
+23 hours and 55 minutes (Instagram's 24 hours less a five-minute margin; a DM
+without text, such as a photo or the heart, counts as writing), the
 fallback asks Instagram nothing, not even the name or the follow, reserves
 nothing and leaves no row; the worker log says "Read fallback skipped: no open
 messaging window". This is decided when the job runs, before the account's

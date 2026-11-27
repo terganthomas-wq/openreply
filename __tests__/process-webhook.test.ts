@@ -25,6 +25,7 @@ vi.mock("@/lib/queue/client", () => ({
   COMMENT_JOB_NAME: "process-comment",
   POSTBACK_JOB_NAME: "process-postback",
   MESSAGE_JOB_NAME: "process-message",
+  DM_SENDER_JOB_NAME: "process-dm-sender",
   LOST_TAP_SEARCH_JOB_NAME: "process-lost-taps",
 }));
 
@@ -251,6 +252,70 @@ describe("read receipts", () => {
 
 // A2: the messaging silence check reads the stored payloads, and one inbound
 // messaging event ends an account's silence right here.
+describe("DMs without text", () => {
+  // What a person sends instead of typing, as Instagram delivers it.
+  const textless = [
+    { label: "a photo", message: { mid: "mid:photo/1", attachments: [{ type: "image" }] } },
+    { label: "a voice note", message: { mid: "mid_audio", attachments: [{ type: "audio" }] } },
+    { label: "the heart", message: { mid: "mid_heart", attachments: [{ type: "like_heart" }] } },
+    { label: "a shared reel", message: { mid: "mid_reel", attachments: [{ type: "ig_reel" }] } },
+    { label: "content the API does not support", message: { mid: "mid_unsupported", is_unsupported: true } },
+  ];
+
+  it.each(textless)(
+    "queue a job that records the sender of $label for the messaging window, and nothing that answers",
+    async ({ message }) => {
+      await processInstagramWebhook({
+        payload: messagingPayload({ sender: { id: READER }, recipient: { id: ACCOUNT }, message }),
+        provider: "META",
+      });
+
+      expect(mockPrisma.webhookEvent.create).toHaveBeenCalledTimes(1);
+      expect(queueAdd).toHaveBeenCalledTimes(1);
+      expect(queueAdd).toHaveBeenCalledWith(
+        "process-dm-sender",
+        {
+          instagramAccountId: ACCOUNT,
+          accountConnectionId: "account_row_1",
+          messageId: message.mid,
+          senderId: READER,
+        },
+        { jobId: `dmsender_${ACCOUNT}_${Buffer.from(message.mid).toString("base64url")}` }
+      );
+    }
+  );
+
+  it("still queue a DM with text as a message job only", async () => {
+    await processInstagramWebhook({
+      payload: messagingPayload({
+        sender: { id: READER },
+        recipient: { id: ACCOUNT },
+        message: { mid: "mid_text", text: "ja" },
+      }),
+      provider: "META",
+    });
+
+    expect(queueAdd).toHaveBeenCalledTimes(1);
+    expect(queueAdd).toHaveBeenCalledWith(
+      "process-message",
+      expect.objectContaining({ messageText: "ja", senderId: READER }),
+      expect.anything()
+    );
+  });
+
+  it("record nothing for an echo, an unsent message or the account's own DM", async () => {
+    for (const event of [
+      { sender: { id: ACCOUNT }, recipient: { id: READER }, message: { mid: "mid_echo", attachments: [{ type: "image" }], is_echo: true } },
+      { sender: { id: READER }, recipient: { id: ACCOUNT }, message: { mid: "mid_deleted", is_deleted: true } },
+      { sender: { id: ACCOUNT }, recipient: { id: ACCOUNT }, message: { mid: "mid_self", attachments: [{ type: "image" }] } },
+    ]) {
+      queueAdd.mockClear();
+      await processInstagramWebhook({ payload: messagingPayload(event), provider: "META" });
+      expect(queueAdd, JSON.stringify(event)).not.toHaveBeenCalled();
+    }
+  });
+});
+
 describe("inbound messaging events and the messaging silence", () => {
   const SILENT_SINCE = new Date("2026-11-25T13:15:16.000Z");
   const ARRIVED = new Date("2026-11-26T10:30:57.000Z");
@@ -265,7 +330,6 @@ describe("inbound messaging events and the messaging silence", () => {
     for (const entry of [
       { id: ACCOUNT, time: 1, standby: [{ sender: { id: READER }, recipient: { id: ACCOUNT }, read: { mid: "m" } }] },
       { id: ACCOUNT, time: 1, messaging: [{ sender: { id: READER }, recipient: { id: ACCOUNT }, reaction: { mid: "m", action: "react", emoji: "❤️" } }] },
-      { id: ACCOUNT, time: 1, messaging: [{ sender: { id: READER }, recipient: { id: ACCOUNT }, message: { mid: "m", attachments: [{ type: "image" }] } }] },
     ]) {
       vi.clearAllMocks();
       mockPrisma.instagramAccount.findMany.mockResolvedValue([

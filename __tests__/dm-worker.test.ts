@@ -154,6 +154,7 @@ vi.mock("@/lib/queue/client", () => ({
   POSTBACK_JOB_NAME: "process-postback",
   FOLLOWUP_JOB_NAME: "process-followup",
   MESSAGE_JOB_NAME: "process-message",
+  DM_SENDER_JOB_NAME: "process-dm-sender",
   OFFER_JOB_NAME: "process-offer",
   CATCH_UP_JOB_NAME: "process-catch-up",
   LOST_TAP_SEARCH_JOB_NAME: "process-lost-taps",
@@ -3124,6 +3125,74 @@ describe("DM Worker — contacts", () => {
     expect(mockPrisma.contact.upsert).not.toHaveBeenCalled();
   });
 
+  // A photo, a voice note, a sticker or the heart instead of text: its own
+  // job (process-webhook), which only records the sender.
+  function textlessDmJob(data: Record<string, unknown> = {}) {
+    return {
+      name: "process-dm-sender",
+      data: {
+        instagramAccountId: "ig_456",
+        accountConnectionId: "ig_account_row_1",
+        messageId: "mid_heart",
+        senderId: "commenter_999",
+        ...data,
+      },
+      id: "dmsender_ig_456_bWlkX2hlYXJ0",
+      attemptsMade: 0,
+      timestamp: TAP_TIME,
+    };
+  }
+
+  it("records the sender of a DM without text, stamped with its time, and answers nothing", async () => {
+    mockPrisma.instagramAccount.findUnique.mockResolvedValue({
+      id: "ig_account_row_1",
+      workspaceId: "workspace_123",
+    });
+
+    await getProcessor()(textlessDmJob());
+
+    expect(mockPrisma.instagramAccount.findUnique).toHaveBeenCalledWith({
+      where: { instagramId: "ig_456" },
+      select: { id: true, workspaceId: true },
+    });
+    expect(mockPrisma.contact.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: CONTACT_KEY,
+        create: expect.objectContaining({
+          workspaceId: "workspace_123",
+          lastInteractionAt: new Date(TAP_TIME),
+        }),
+      })
+    );
+    // An existing contact's window moves forward to the DM.
+    expect(mockPrisma.contact.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: "contact_1",
+        OR: [{ lastInteractionAt: null }, { lastInteractionAt: { lt: new Date(TAP_TIME) } }],
+      },
+      data: { lastInteractionAt: new Date(TAP_TIME) },
+    });
+    // No campaign, no keyword, no Meta call, no DM log.
+    expect(mockPrisma.automation.findMany).not.toHaveBeenCalled();
+    expect(mockMatchKeywords).not.toHaveBeenCalled();
+    expect(mockDecryptToken).not.toHaveBeenCalled();
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
+    expect(mockSendDirectMessageWithLinkButton).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+
+  it("does not credit a DM without text to a connection that replaced the one it came in on", async () => {
+    mockPrisma.instagramAccount.findUnique.mockResolvedValue({
+      id: "ig_account_row_2",
+      workspaceId: "workspace_123",
+    });
+
+    await getProcessor()(textlessDmJob());
+
+    expect(mockPrisma.contact.upsert).not.toHaveBeenCalled();
+  });
+
   describe("when the contact cannot be recorded", () => {
     let consoleError: ReturnType<typeof vi.spyOn>;
     beforeEach(() => {
@@ -5968,6 +6037,59 @@ describe("DM Worker — read fallback and follow-up only inside the messaging wi
       expect(mockQueueAdd).not.toHaveBeenCalled();
       expect(redis.commands).not.toContain(`GET ${PAUSE_KEY}`);
       expect(mockPrisma.contact.upsert).not.toHaveBeenCalled();
+    });
+
+    it("sends the link to someone who answered the opening DM with only the heart", async () => {
+      // The contact as the comment left it, no tap or DM yet; the jobs below
+      // read and write it.
+      const stored = { id: "contact_1", lastInteractionAt: null as Date | null };
+      mockPrisma.contact.upsert.mockImplementation(async () => ({
+        id: stored.id,
+        username: "commenter_user",
+        lastInteractionAt: stored.lastInteractionAt,
+      }));
+      mockPrisma.contact.updateMany.mockImplementation(
+        async ({ data }: { data: { lastInteractionAt?: Date } }) => {
+          if (data.lastInteractionAt) stored.lastInteractionAt = data.lastInteractionAt;
+          return { count: 1 };
+        }
+      );
+      mockPrisma.contact.findUnique.mockImplementation(async () => ({ ...stored }));
+      mockPrisma.instagramAccount.findUnique.mockResolvedValue({
+        id: "ig_account_row_1",
+        workspaceId: "workspace_123",
+      });
+
+      // Four minutes after reading, the heart instead of a tap.
+      await getProcessor()({
+        name: "process-dm-sender",
+        data: {
+          instagramAccountId: "ig_456",
+          accountConnectionId: "ig_account_row_1",
+          messageId: "mid_heart",
+          senderId: "commenter_999",
+        },
+        id: "dmsender_ig_456_bWlkX2hlYXJ0",
+        attemptsMade: 0,
+        timestamp: NOW - MINUTE,
+      });
+      expect(stored.lastInteractionAt).toEqual(new Date(NOW - MINUTE));
+      expect(mockSendDirectMessage).not.toHaveBeenCalled();
+
+      // The read fallback, five minutes after the read.
+      await getProcessor()(fallback());
+
+      expect(log).not.toHaveBeenCalledWith(
+        "[DM Worker] Read fallback skipped: no open messaging window",
+        "postback_job_001"
+      );
+      expect(mockGetUserFollowStatus).toHaveBeenCalledTimes(1);
+      expect(mockSendDirectMessage).toHaveBeenCalledWith(
+        META_AUTH,
+        "ig_456",
+        "commenter_999",
+        "Hey live_handle! Here is the link: https://example.com"
+      );
     });
   });
 

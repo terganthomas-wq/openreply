@@ -129,6 +129,25 @@ export interface ProcessMessageJob {
   pauseRequeue?: number;
 }
 
+// An inbound DM from a person without text a campaign could match (a photo,
+// a voice note, a sticker, the heart, a shared post; lib/meta/webhook.ts
+// parseMessageSenderEvents). Nothing answers it, but it opens Instagram's
+// 24-hour messaging window, so the worker records the sender on their
+// contact with the DM's time, the job's own timestamp (queued on arrival).
+// No keyword is matched and Meta is not called.
+export interface ProcessDmSenderJob {
+  accountConnectionId?: string;
+  instagramAccountId: string;
+  messageId: string;
+  senderId: string;
+  // When the DM arrived (epoch ms), where that is not the job's own
+  // timestamp. The webhook queues the job on arrival and leaves it out.
+  receivedAt?: number;
+  // Not used: this job is never put back for a pause. Here because code that
+  // handles any job reads it.
+  pauseRequeue?: number;
+}
+
 // One step of a lead-magnet offer (lib/offers/worker.ts). "start" picks the
 // offer after a delivered link and creates its ContactOffer row; every later
 // phase sends one message for that row and queues the next one. "signup" is
@@ -207,6 +226,7 @@ export type DmQueueJob =
   | ProcessPostbackJob
   | ProcessFollowUpJob
   | ProcessMessageJob
+  | ProcessDmSenderJob
   | ProcessOfferJob
   | ProcessCatchUpJob
   | ProcessLostTapSearchJob;
@@ -217,6 +237,10 @@ export const COMMENT_JOB_NAME = "process-comment";
 export const POSTBACK_JOB_NAME = "process-postback";
 export const FOLLOWUP_JOB_NAME = "process-followup";
 export const MESSAGE_JOB_NAME = "process-message";
+// A worker from before this job ignores its name (dispatchJob): the DM's
+// time is then not recorded, as before. DMs without text never go into the
+// message job, which an older worker would answer for "any word" campaigns.
+export const DM_SENDER_JOB_NAME = "process-dm-sender";
 export const OFFER_JOB_NAME = "process-offer";
 // A worker from before the catch-up ignores this name (dispatchJob), and the
 // catch-up stays owed in the database until a newer worker runs it.

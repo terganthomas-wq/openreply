@@ -71,6 +71,7 @@ import {
   getRedisConnection,
   CATCH_UP_JOB_NAME,
   COMMENT_JOB_NAME,
+  DM_SENDER_JOB_NAME,
   LOST_TAP_SEARCH_JOB_NAME,
   MESSAGE_JOB_NAME,
   POSTBACK_JOB_NAME,
@@ -79,6 +80,7 @@ import {
   type DmQueueJob,
   type ProcessCatchUpJob,
   type ProcessCommentJob,
+  type ProcessDmSenderJob,
   type ProcessLostTapSearchJob,
   type ProcessMessageJob,
   type ProcessOfferJob,
@@ -2754,9 +2756,10 @@ async function holdFollowUpForPause(
   }
 }
 
-// When the DM behind a message job arrived (epoch ms): a copy queued for the
-// account's pause carries it, the webhook's own job was queued on arrival.
-function messageTime(job: Job<ProcessMessageJob>): number {
+// When the DM behind a message job (or a DM sender job) arrived (epoch ms):
+// a copy queued for the account's pause carries it, the webhook's own job
+// was queued on arrival.
+function messageTime(job: Job<ProcessMessageJob> | Job<ProcessDmSenderJob>): number {
   return job.data.receivedAt ?? job.timestamp ?? Date.now();
 }
 
@@ -3266,13 +3269,14 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
 }
 
 /**
- * Record the sender of an inbound DM as a contact, stamped with the time of
- * the DM. A campaign that may answer it already names the account; without
- * one the account is looked up. Best effort, like every contact write on a
- * send path: a failure is logged and the DM is still handled.
+ * Record the sender of an inbound DM, with or without text, as a contact,
+ * stamped with the time of the DM. A campaign that may answer it already
+ * names the account; without one the account is looked up. Best effort,
+ * like every contact write on a send path: a failure is logged and the DM is
+ * still handled.
  */
 async function recordMessageSender(
-  job: Job<ProcessMessageJob>,
+  job: Job<ProcessMessageJob> | Job<ProcessDmSenderJob>,
   campaign: { instagramAccountId: string; workspaceId: string } | undefined
 ): Promise<ContactSummary | null> {
   const { instagramAccountId, accountConnectionId, senderId } = job.data;
@@ -3306,6 +3310,18 @@ async function recordMessageSender(
   }
 }
 
+/**
+ * A DM without text from a person (a photo, a voice note, a sticker, the
+ * heart, a shared post): nothing answers it, but it opens Instagram's
+ * 24-hour messaging window, so its sender is recorded with its time exactly
+ * as for a DM with text. That is what a read fallback, a follow-up or an
+ * offer reads the window from. No campaign is read, no keyword matched, and
+ * Meta is not called.
+ */
+async function processDmSender(job: Job<ProcessDmSenderJob>): Promise<void> {
+  await recordMessageSender(job, undefined);
+}
+
 async function dispatchJob(job: Job<DmQueueJob>): Promise<void> {
   if (job.name === POSTBACK_JOB_NAME) {
     return processPostback(job as Job<ProcessPostbackJob>);
@@ -3315,6 +3331,9 @@ async function dispatchJob(job: Job<DmQueueJob>): Promise<void> {
   }
   if (job.name === MESSAGE_JOB_NAME) {
     return processMessage(job as Job<ProcessMessageJob>);
+  }
+  if (job.name === DM_SENDER_JOB_NAME) {
+    return processDmSender(job as Job<ProcessDmSenderJob>);
   }
   if (job.name === OFFER_JOB_NAME) {
     return processOffer(job as Job<ProcessOfferJob>);

@@ -9,6 +9,7 @@ import {
   verifyWebhookSignature,
   parseCommentEvents,
   parseMessageEvents,
+  parseMessageSenderEvents,
   parseReadEvents,
 } from "../lib/meta/webhook";
 import { createHmac } from "crypto";
@@ -463,6 +464,93 @@ describe("parseMessageEvents", () => {
         ],
       })
     ).toHaveLength(0);
+  });
+});
+
+describe("parseMessageSenderEvents", () => {
+  function messagingPayload(messaging: unknown[]) {
+    return {
+      object: "instagram",
+      entry: [{ id: "ig_456", time: 1234567890, messaging }],
+    } as Parameters<typeof parseMessageSenderEvents>[0];
+  }
+  const fromPerson = (message: Record<string, unknown>) => ({
+    sender: { id: "user_999" },
+    recipient: { id: "ig_456" },
+    message,
+  });
+
+  it.each(["image", "audio", "video", "like_heart", "ig_reel", "share", "story_mention"])(
+    "reports a DM that is only a %s, which parseMessageEvents leaves out",
+    (type) => {
+      const payload = messagingPayload([
+        fromPerson({ mid: "mid_abc", attachments: [{ type }] }),
+      ]);
+
+      expect(parseMessageSenderEvents(payload)).toEqual([
+        { instagramAccountId: "ig_456", messageId: "mid_abc", senderId: "user_999" },
+      ]);
+      expect(parseMessageEvents(payload)).toEqual([]);
+    }
+  );
+
+  it("reports a message the API does not support, with or without text", () => {
+    expect(
+      parseMessageSenderEvents(
+        messagingPayload([
+          fromPerson({ mid: "mid_a", is_unsupported: true }),
+          fromPerson({ mid: "mid_b", text: "link", is_unsupported: true }),
+        ])
+      ).map((event) => event.messageId)
+    ).toEqual(["mid_a", "mid_b"]);
+  });
+
+  it("leaves a DM with text to parseMessageEvents", () => {
+    const payload = messagingPayload([
+      fromPerson({ mid: "mid_abc", text: "ja", attachments: [{ type: "image" }] }),
+    ]);
+
+    expect(parseMessageSenderEvents(payload)).toEqual([]);
+    expect(parseMessageEvents(payload)).toHaveLength(1);
+  });
+
+  it("ignores echoes, unsent messages, the account's own DMs and other events", () => {
+    expect(
+      parseMessageSenderEvents(
+        messagingPayload([
+          {
+            sender: { id: "ig_456" },
+            recipient: { id: "user_999" },
+            message: { mid: "mid_echo", attachments: [{ type: "image" }], is_echo: true },
+          },
+          fromPerson({ mid: "mid_deleted", is_deleted: true }),
+          {
+            sender: { id: "ig_456" },
+            recipient: { id: "ig_456" },
+            message: { mid: "mid_self", attachments: [{ type: "image" }] },
+          },
+          fromPerson({ attachments: [{ type: "image" }] }),
+          {
+            sender: { id: "user_999" },
+            recipient: { id: "ig_456" },
+            reaction: { mid: "mid_abc", action: "react", emoji: "❤️" },
+          },
+          { sender: { id: "user_999" }, recipient: { id: "ig_456" }, read: { watermark: 1 } },
+        ])
+      )
+    ).toEqual([]);
+    expect(
+      parseMessageSenderEvents({
+        object: "page",
+        entry: [
+          {
+            id: "ig_456",
+            time: 1,
+            messaging: [fromPerson({ mid: "mid_abc", attachments: [{ type: "image" }] })],
+          },
+        ],
+      } as Parameters<typeof parseMessageSenderEvents>[0])
+    ).toEqual([]);
   });
 });
 

@@ -105,6 +105,13 @@ export interface WebhookMessageEvent {
   senderId: string;
 }
 
+/** An inbound DM that has no text for a campaign to match (parseMessageSenderEvents). */
+export interface WebhookMessageSenderEvent {
+  instagramAccountId: string;
+  messageId: string;
+  senderId: string;
+}
+
 export interface WebhookPostbackEvent {
   instagramAccountId: string;
   userId: string;
@@ -213,7 +220,9 @@ export function parsePostbackEvents(
  * Echoes (messages the account itself sent, including our own autoreplies),
  * deletions, and attachment-only messages with no text are dropped here so
  * the worker never sees them — an echo would otherwise let an autoreply
- * containing its own keyword trigger itself.
+ * containing its own keyword trigger itself. A DM a person sent without
+ * text still opens the messaging window: parseMessageSenderEvents reports
+ * those.
  */
 export function parseMessageEvents(
   payload: WebhookPayload
@@ -245,6 +254,44 @@ export function parseMessageEvents(
         messageText: text,
         senderId,
       });
+    }
+  }
+
+  return events;
+}
+
+/**
+ * Parse the inbound DMs a person sent that parseMessageEvents leaves out
+ * because they carry no text a campaign could match: a photo, a video, a
+ * voice note, a sticker, the heart, a shared post or reel, a story mention,
+ * or content the API does not support. No campaign answers them, but like
+ * every DM they open Instagram's 24-hour messaging window, so the worker
+ * records their sender's time (a job of its own, without keyword matching).
+ * Echoes, deletions (an unsent message) and anything the account sent
+ * itself are dropped, as there.
+ */
+export function parseMessageSenderEvents(
+  payload: WebhookPayload
+): WebhookMessageSenderEvent[] {
+  const events: WebhookMessageSenderEvent[] = [];
+
+  if (payload.object !== "instagram") return events;
+
+  for (const entry of payload.entry ?? []) {
+    for (const messaging of entry.messaging ?? []) {
+      const message = messaging.message;
+      if (!message || message.is_echo || message.is_deleted) continue;
+
+      const messageId = message.mid;
+      const senderId = messaging.sender?.id;
+      const accountId = entry.id ?? messaging.recipient?.id;
+
+      if (!messageId || !senderId || !accountId) continue;
+      if (senderId === accountId) continue;
+      // A DM with text is a message job of its own (parseMessageEvents).
+      if (message.text?.trim() && !message.is_unsupported) continue;
+
+      events.push({ instagramAccountId: accountId, messageId, senderId });
     }
   }
 

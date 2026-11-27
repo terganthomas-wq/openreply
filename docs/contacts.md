@@ -5,7 +5,8 @@ Instagram-scoped id (IGSID), their handle when a comment carried it, and the
 tags they got. The same person on two connected accounts is two contacts,
 because Instagram gives them a different id on each. A contact is recorded
 when a campaign's keyword matches their comment, on every button tap and on
-every DM they send.
+every DM they send, also one without text (a photo, a voice note, a sticker,
+the heart), which no campaign answers but which opens the messaging window.
 
 Contacts belong to the account, not to a campaign: pausing or deleting a
 campaign keeps them and their tags. Disconnecting an Instagram account in

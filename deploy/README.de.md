@@ -73,7 +73,10 @@ neu verbinden.
 - Liest jemand die erste DM nur, ohne auf den Button zu tippen, schickt das
   Tool 5 Minuten später den Link nur, wenn Instagrams 24-Stunden-Fenster
   offen ist: Die Person hat in den 24 Stunden davor selbst geschrieben oder
-  einen Button getippt (mit 5 Minuten Sicherheitsabstand). Bei einer Kampagne
+  einen Button getippt (mit 5 Minuten Sicherheitsabstand). Als Schreiben
+  zählt jede DM, auch eine ohne Text: ein Foto, eine Sprachnachricht, ein
+  Sticker oder das Herz. Eine bloße Reaktion auf eine Nachricht zählt nicht,
+  die bekommt das Tool nicht. Bei einer Kampagne
   mit Follow-Gate prüft es dann wie bisher, ob die Person folgt. Sonst fragt
   das Tool Instagram gar nicht erst, auch nicht nach Name oder Folgen: Lesen
   öffnet das Fenster nicht, und Meta lehnt solche Nachrichten ab. Im
