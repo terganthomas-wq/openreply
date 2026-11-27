@@ -96,8 +96,9 @@ export const createAutomationSchema = z
     followPromptButtonLabel: utf16Max(BUTTON_LABEL_MAX).optional().nullable(),
     followUpEnabled: z.boolean().optional().default(false),
     followUpMessage: z.string().max(1000).optional().nullable(),
-    // Minutes to wait before the follow-up. Capped at 24h so it stays inside
-    // Instagram's messaging window.
+    // Minutes to wait before the follow-up, at most 24h. It goes out only
+    // while Instagram's messaging window is still open then (the worker
+    // checks), so beyond about 23 hours it rarely does; the editor warns.
     followUpDelayMinutes: z.number().int().min(0).max(1440).optional().default(0),
     publicReplyEnabled: z.boolean().optional().default(false),
     publicReplyMessage: z.string().max(1000).optional().nullable(),

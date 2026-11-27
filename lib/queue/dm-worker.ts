@@ -1912,6 +1912,30 @@ async function findConversationCampaign<
 }
 
 /**
+ * The contact a read fallback or a follow-up reads Instagram's 24-hour
+ * messaging window from: `lastInteractionAt`, the person's last button tap or
+ * DM. One lookup by its unique key, bound to the campaign's workspace as the
+ * name lookup is (lib/instagram/recipient-name.ts). Never created: null when
+ * there is none (a deleted contact stays deleted), and a person who only
+ * commented has one without an interaction, which is no window either.
+ */
+async function findConversationContact(
+  automation: { workspaceId: string; instagramAccountId: string },
+  userId: string
+) {
+  return prisma.contact.findUnique({
+    where: {
+      instagramAccountId_igsid: {
+        instagramAccountId: automation.instagramAccountId,
+        igsid: userId,
+      },
+      workspaceId: automation.workspaceId,
+    },
+    select: { id: true, lastInteractionAt: true },
+  });
+}
+
+/**
  * Deliver the reveal message after a user taps an opening DM's button.
  * The postback payload is `reveal:<automationId>`; the sender is the user's
  * IGSID (same id as their comment author id), which we DM directly.
@@ -2021,6 +2045,23 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
       select: { id: true },
     });
     if (answeredByDm) return;
+
+    // Reading a DM opens no messaging window (Meta does not count a read),
+    // and Meta refuses a message outside it. So the fallback asks Instagram
+    // nothing (no name, no follow check, no send), reserves and records
+    // nothing, unless the person tapped or wrote in the last 24 hours by
+    // their contact, within withinWindow's margin. Decided when the job runs,
+    // so someone who typed a reply after reading still gets the link, and
+    // before the account's pause: without a window there is nothing to wait
+    // for.
+    const windowContact = await findConversationContact(automation, userId);
+    if (!withinWindow(windowContact?.lastInteractionAt)) {
+      console.log(
+        "[DM Worker] Read fallback skipped: no open messaging window",
+        job.id
+      );
+      return;
+    }
   }
 
   // A2: a tap that a messaging silence swallowed, which the search after it
@@ -2524,13 +2565,13 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
       }
     }
 
-    // The read fallback is speculative: it only runs when the user read the
-    // opening DM and never tapped the button, which means they never messaged
-    // us, which means the 24-hour window is closed and Meta rejects the send
-    // ("outside of allowed window"). That is the expected outcome here, not a
-    // failure the user can act on — so don't log it as FAILED and don't retry
-    // it against a window that cannot reopen on its own. It still delivers in
-    // the case that does work: the user replied by typing instead of tapping.
+    // The read fallback is speculative: the user read the opening DM and never
+    // tapped its button. It only gets here while their contact shows a tap or
+    // DM in the last 24 hours (the window check above), but Meta keeps its own
+    // clock and may still answer "outside of allowed window". That is an
+    // expected outcome here, not a failure the user can act on — so don't log
+    // it as FAILED and don't retry it against a window that cannot reopen on
+    // its own.
     if (fallback && !isDeliveryUnconfirmed(error)) {
       console.log(
         "[DM Worker] Read fallback not delivered (messaging window closed):",
@@ -2583,8 +2624,10 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
 
 /**
  * Send the scheduled appreciation follow-up. Runs after its delay elapses.
- * Best-effort: if the message can't be delivered (e.g. the 24-hour messaging
- * window closed because the delay was long), it is logged, not retried forever.
+ * It goes out only while Instagram's 24-hour messaging window is open: its
+ * delay may be up to 24 hours after the link, and Meta refuses a message
+ * outside the window. Best effort otherwise: a message that still can't be
+ * delivered is logged, not retried forever.
  */
 async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
   const { instagramAccountId, userId, automationId, commenterName } = job.data;
@@ -2606,6 +2649,21 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
     return;
   }
 
+  // The window counts from the person's last tap or DM (their contact),
+  // within withinWindow's margin. Closed, or no contact: Instagram is not
+  // asked at all, and Diagnostics says why. Read once, before the account's
+  // pause, whose wait counts the same window.
+  const contact = await findConversationContact(automation, userId);
+  if (!contact || !withinWindow(contact.lastInteractionAt)) {
+    await logWorkerEvent({
+      workspaceId: automation.workspaceId,
+      level: "INFO",
+      message: "Follow-up not sent: messaging window closed",
+      payload: { automationId: automation.id, userId },
+    });
+    return;
+  }
+
   let accessToken: InstagramContext;
   try {
     accessToken = await createInstagramContext(
@@ -2620,7 +2678,7 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
   // paused): the follow-up waits for the end of the pause instead.
   const pausedUntil = await checkAccountPause(instagramAccountId);
   if (pausedUntil !== null) {
-    return holdFollowUpForPause(job, automation, pausedUntil);
+    return holdFollowUpForPause(job, automation, contact, pausedUntil);
   }
 
   try {
@@ -2643,7 +2701,7 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
         account: automation.instagramAccount.username,
         error,
       });
-      return holdFollowUpForPause(job, automation, pause.resumeAt);
+      return holdFollowUpForPause(job, automation, contact, pause.resumeAt);
     }
     console.log(
       "[DM Worker] Failed to send follow-up message:",
@@ -2655,35 +2713,26 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
 /**
  * The follow-up meets its account's pause, before anything was sent: it goes
  * out after the pause, as followup_<campaign>_<person>_pause_<n>, while
- * Instagram's window from the person's last tap or DM (their contact) is
- * still open then. Best effort, like the follow-up itself: what keeps it
- * from waiting is logged, and this job never fails. The follow-up has no
- * claim, so a BullMQ retry next to a copy that was queued after all could
- * send it twice.
+ * Instagram's window from the person's last tap or DM (`contact`, as
+ * processFollowUp read it) is still open then. Best effort, like the
+ * follow-up itself: what keeps it from waiting is logged, and this job never
+ * fails. The follow-up has no claim, so a BullMQ retry next to a copy that
+ * was queued after all could send it twice.
  */
 async function holdFollowUpForPause(
   job: Job<ProcessFollowUpJob>,
-  automation: { id: string; workspaceId: string; instagramAccountId: string },
+  automation: { id: string },
+  contact: { lastInteractionAt: Date | null },
   resumeAt: number
 ): Promise<void> {
   try {
-    const contact = await prisma.contact.findUnique({
-      where: {
-        instagramAccountId_igsid: {
-          instagramAccountId: automation.instagramAccountId,
-          igsid: job.data.userId,
-        },
-        workspaceId: automation.workspaceId,
-      },
-      select: { lastInteractionAt: true },
-    });
     const outcome = await holdConversation({
       name: FOLLOWUP_JOB_NAME,
       data: job.data,
       baseJobId: `followup_${automation.id}_${job.data.userId}`,
       instagramAccountId: job.data.instagramAccountId,
       resumeAt,
-      windowFrom: latestTime(contact?.lastInteractionAt),
+      windowFrom: latestTime(contact.lastInteractionAt),
     });
     if (outcome === "window-closed") {
       console.log(

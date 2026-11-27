@@ -62,6 +62,13 @@ const MESSAGE_DEFAULTS_URL = "/api/workspace/message-defaults";
 // BUTTON_TEXT_MAX of a message that goes out with a button.
 const DM_TEXT_MAX = 1000;
 
+// The follow-up goes out only while Instagram's 24-hour window from the
+// person's last tap or DM is open; the worker checks it right before sending.
+// Its delay counts from the link, which mostly came right after such a tap or
+// DM, so beyond 23 hours the window has usually closed. The field still
+// takes up to 1440 minutes, so that campaigns saved with more still save.
+const FOLLOW_UP_WINDOW_WARNING_MINUTES = 23 * 60;
+
 // The editor's own starting point, for a workspace without default texts:
 // nothing switched on but the question-mark filter, and the English button
 // labels the senders fall back to.
@@ -1532,8 +1539,13 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                   {followUpDelayMinutes > 0
                     ? t("Sent {minutes} min after they tap through.", { minutes: followUpDelayMinutes })
                     : t("Sent right after they tap through.")}
-                  {" {username}"} {t("personalizes it. Max 24 hours, to stay inside Instagram's messaging window.")}
+                  {" {username}"} {t("personalizes.")}
                 </p>
+                {followUpDelayMinutes > FOLLOW_UP_WINDOW_WARNING_MINUTES && (
+                  <p className="text-xs text-warning">
+                    {t("It only goes out if the person wrote to you or tapped a button in the 24 hours before. With more than 23 hours that is usually no longer the case.")}
+                  </p>
+                )}
               </div>
             )}
           </div>

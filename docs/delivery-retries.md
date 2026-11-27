@@ -51,7 +51,14 @@ skipped once the campaign answered the person: a tap that delivered the link,
 or a DM keyword that the campaign's DM trigger answered because the person
 typed the keyword instead of tapping. Both checks run when the job is queued
 and again when it runs, so a campaign with an opening DM and the DM trigger
-sends its link once.
+sends its link once. After them the job reads the person's contact: reading
+opens no messaging window, so unless the person tapped or wrote in the last
+23 hours and 55 minutes (Instagram's 24 hours less a five-minute margin), the
+fallback asks Instagram nothing, not even the name or the follow, reserves
+nothing and leaves no row; the worker log says "Read fallback skipped: no open
+messaging window". This is decided when the job runs, before the account's
+pause, so a reply typed in the five minutes after reading still brings the
+link.
 
 No campaign is paused by this policy. New comments continue through the normal
 flow. No schema migration is required.

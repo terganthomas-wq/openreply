@@ -108,7 +108,12 @@ it. With an offer 22 hours later it comes first as long as it waits at most
 DM, and the other half hour is for a link that took a while. Only a longer
 follow-up can reach the offer, and only then does the editor warn. A link that
 an Instagram request limit held back for longer
-(`docs/delivery-retries.md`) can still bring a shorter follow-up near it.
+(`docs/delivery-retries.md`) can still bring a shorter follow-up near it. The
+follow-up itself checks the window right before it goes out, as every offer
+message does (with a five-minute margin): when the person has not tapped or
+written in the 24 hours before, Instagram is not asked and Diagnostics says
+"Follow-up not sent: messaging window closed", which is why the editor warns
+about delays above 23 hours.
 
 ## The card image
 

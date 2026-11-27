@@ -775,7 +775,7 @@
   "not available": "não disponível",
   "over {count} days": "em {count} dias",
   "paused, skipped": "pausada, ignorada",
-  "personalizes it. Max 24 hours, to stay inside Instagram's messaging window.": "personaliza a mensagem. Máximo de 24 horas, para ficar dentro da janela de mensagens do Instagram.",
+  "It only goes out if the person wrote to you or tapped a button in the 24 hours before. With more than 23 hours that is usually no longer the case.": "Só é enviada se a pessoa tiver escrito para você ou tocado em um botão nas 24 horas anteriores. Com mais de 23 horas, isso geralmente já não acontece.",
   "personalizes.": "personaliza.",
   "quick favor before i send your link. i don't make any money from this, it's free. if you want to support me, just don't unfollow after, and star the repo on github if it helps you. tap the button once you're following and i'll send it over": "um favorzinho antes de eu te mandar o link. não ganho nada com isso, é de graça. se quiser me apoiar, é só não deixar de seguir depois e dar uma estrela no repositório no github se ele te ajudar. toque no botão quando estiver seguindo que eu te mando",
   "redirects to": "redireciona para",

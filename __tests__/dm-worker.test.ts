@@ -6,6 +6,7 @@ const {
   mockSendPrivateReplyWithLinkButton,
   mockSendPrivateReplyWithButton,
   mockGetUserFollowStatus,
+  mockGetUserUsername,
   mockSendDirectMessageWithButton,
   mockSendDirectMessage,
   mockSendDirectMessageWithLinkButton,
@@ -69,6 +70,8 @@ const {
   mockSendPrivateReplyWithLinkButton: vi.fn(),
   mockSendPrivateReplyWithButton: vi.fn(),
   mockGetUserFollowStatus: vi.fn(),
+  // The live name lookup (getRecipientUsername), used when no name is stored.
+  mockGetUserUsername: vi.fn(),
   mockSendDirectMessageWithButton: vi.fn(),
   mockSendDirectMessage: vi.fn(),
   mockSendDirectMessageWithLinkButton: vi.fn(),
@@ -92,6 +95,7 @@ vi.mock("@/lib/meta/client", () => ({
   sendPrivateReplyWithLinkButton: mockSendPrivateReplyWithLinkButton,
   sendPrivateReplyWithButton: mockSendPrivateReplyWithButton,
   getUserFollowStatus: mockGetUserFollowStatus,
+  getUserUsername: mockGetUserUsername,
   sendDirectMessageWithButton: mockSendDirectMessageWithButton,
   sendDirectMessage: mockSendDirectMessage,
   sendDirectMessageWithLinkButton: mockSendDirectMessageWithLinkButton,
@@ -298,6 +302,19 @@ function createMockPostbackJob(
   };
 }
 
+// A read fallback and a follow-up ask Instagram anything only while the
+// person's contact shows a tap or DM in the last 24 hours (Instagram's
+// messaging window). Here the person tapped or wrote an hour ago. Without
+// this the contact lookup finds nothing, as for someone who only read.
+function openMessagingWindow(
+  lastInteractionAt = new Date(Date.now() - 60 * 60_000)
+) {
+  mockPrisma.contact.findUnique.mockResolvedValue({
+    id: "contact_1",
+    lastInteractionAt,
+  });
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   // An empty Redis: no account is paused for a Meta request limit.
@@ -396,6 +413,7 @@ beforeEach(() => {
     message_id: "msg_006",
   });
   mockGetUserFollowStatus.mockResolvedValue(true);
+  mockGetUserUsername.mockReset().mockResolvedValue(null);
 });
 
 
@@ -830,6 +848,8 @@ describe("DM Worker — Full Pipeline", () => {
       ...mockAutomation,
       trackedLinks: [],
     });
+    // The person wrote an hour ago: Instagram's window is open.
+    openMessagingWindow();
 
     const processor = getProcessor();
     await processor(
@@ -983,6 +1003,8 @@ describe("DM Worker — Full Pipeline", () => {
       trackedLinks: [],
     });
     mockGetUserFollowStatus.mockResolvedValue(false); // still not following
+    // The window is open, so the follow gate is what decides.
+    openMessagingWindow();
 
     const processor = getProcessor();
     await processor(
@@ -995,6 +1017,7 @@ describe("DM Worker — Full Pipeline", () => {
     );
 
     // Non-follower on a read fallback: no link, and no re-prompt spam either.
+    expect(mockGetUserFollowStatus).toHaveBeenCalledTimes(1);
     expect(mockSendDirectMessage).not.toHaveBeenCalled();
     expect(mockSendDirectMessageWithButton).not.toHaveBeenCalled();
     expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
@@ -1007,9 +1030,10 @@ describe("DM Worker — Full Pipeline", () => {
       requireFollow: true,
       trackedLinks: [],
     });
-    // Instagram answers "User consent is required" until the person taps a
-    // button, which is exactly the case of someone who only read the DM.
+    // Instagram answers "User consent is required" when it cannot tell, as
+    // before the person ever tapped a button: unknown is no follow here.
     mockGetUserFollowStatus.mockResolvedValue(null);
+    openMessagingWindow();
 
     const processor = getProcessor();
     await processor(
@@ -1021,6 +1045,7 @@ describe("DM Worker — Full Pipeline", () => {
       })
     );
 
+    expect(mockGetUserFollowStatus).toHaveBeenCalledTimes(1);
     expect(mockSendDirectMessage).not.toHaveBeenCalled();
     expect(mockSendDirectMessageWithButton).not.toHaveBeenCalled();
   });
@@ -1033,6 +1058,8 @@ describe("DM Worker — Full Pipeline", () => {
       trackedLinks: [],
     });
     mockGetUserFollowStatus.mockResolvedValue(true);
+    // The person tapped or wrote an hour ago: Instagram's window is open.
+    openMessagingWindow();
 
     const processor = getProcessor();
     await processor(
@@ -1058,13 +1085,17 @@ describe("DM Worker — Full Pipeline", () => {
       ...mockAutomation,
       trackedLinks: [],
     });
-    mockSendDirectMessage.mockRejectedValue(
-      new MetaApiError(10, undefined, undefined, "This message is sent outside of allowed window.")
-    );
+    // The person only read the opening DM: their contact has no tap or DM,
+    // so Instagram's window is closed.
+    mockPrisma.contact.findUnique.mockResolvedValue({
+      id: "contact_1",
+      lastInteractionAt: null,
+    });
 
     const processor = getProcessor();
     // The window cannot reopen on its own, so this must not throw (no retries)
-    // and must not leave a FAILED row the user can do nothing about.
+    // and must not leave a FAILED row the user can do nothing about. Meta,
+    // which would refuse the send, is not asked at all.
     await expect(
       processor(
         createMockPostbackJob({
@@ -1076,6 +1107,36 @@ describe("DM Worker — Full Pipeline", () => {
       )
     ).resolves.toBeUndefined();
 
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
+    expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
+  });
+
+  it("should not log a failure when Meta still refuses a read fallback as outside the window", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([]);
+    mockPrisma.automation.findFirst.mockResolvedValue({
+      ...mockAutomation,
+      trackedLinks: [],
+    });
+    // Open by the contact, but Meta keeps its own clock.
+    openMessagingWindow();
+    mockSendDirectMessage.mockRejectedValue(
+      new MetaApiError(10, undefined, undefined, "This message is sent outside of allowed window.")
+    );
+
+    const processor = getProcessor();
+    await expect(
+      processor(
+        createMockPostbackJob({
+          instagramAccountId: "ig_456",
+          userId: "commenter_999",
+          payload: "reveal:auto_789",
+          fallback: true,
+        })
+      )
+    ).resolves.toBeUndefined();
+
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
     expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
     expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalled();
   });
@@ -1980,6 +2041,7 @@ describe("DM Worker — work after a delivered button tap", () => {
 
   it("still schedules the follow-up after a read fallback delivered the link", async () => {
     mockPrisma.automation.findFirst.mockResolvedValue(withFollowUp);
+    openMessagingWindow();
 
     await getProcessor()(
       createMockPostbackJob({
@@ -2972,6 +3034,8 @@ describe("DM Worker — contacts", () => {
       requireFollow: true,
     });
     mockGetUserFollowStatus.mockResolvedValue(true);
+    // A read fallback sends only inside a window the person opened earlier.
+    openMessagingWindow();
 
     await getProcessor()({
       ...createMockPostbackJob({
@@ -3201,6 +3265,7 @@ describe("DM Worker — delivery tag", () => {
     { label: "a read fallback", fallback: true },
   ])("tags the contact after $label delivered the link", async ({ fallback }) => {
     mockPrisma.automation.findFirst.mockResolvedValue(tagged);
+    openMessagingWindow();
 
     await getProcessor()(
       createMockPostbackJob({
@@ -3815,6 +3880,7 @@ describe("DM Worker — offers after a delivered link", () => {
 
   it("skips the offer and says why after a read fallback delivered the link", async () => {
     mockPrisma.automation.findFirst.mockResolvedValue(withOffers);
+    openMessagingWindow();
 
     await getProcessor()(
       createMockPostbackJob({
@@ -5222,6 +5288,7 @@ describe("DM Worker — Meta request limits on taps, DM replies and follow-ups",
       it("waits a minute behind the taps and DM replies held for the same pause", async () => {
         await pauseFor(10);
         // The person typed a reply instead of tapping: the window is open.
+        openMessagingWindow(new Date(NOW - 2 * MINUTE));
         mockPrisma.contact.upsert.mockResolvedValue({
           id: "contact_1",
           username: "commenter_user",
@@ -5240,14 +5307,26 @@ describe("DM Worker — Meta request limits on taps, DM replies and follow-ups",
         expect(mockPrisma.dmLog.updateMany).not.toHaveBeenCalled();
       });
 
-      it("is dropped during the pause when the person opened no window", async () => {
+      it.each([
+        { label: "no contact", contact: null },
+        {
+          label: "a last tap or DM 25 hours ago",
+          contact: { id: "contact_1", lastInteractionAt: new Date(NOW - 25 * HOUR) },
+        },
+      ])("is dropped during the pause when the person opened no window ($label)", async ({ contact }) => {
         await pauseFor(10);
+        mockPrisma.contact.findUnique.mockResolvedValue(contact);
 
         await expect(getProcessor()(fallback())).resolves.toBeUndefined();
 
         expect(pauseCopies()).toHaveLength(0);
         expect(anyLinkSends()).toBe(0);
         expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
+        // Decided before the pause, which is not even looked at: no token is
+        // decrypted, and no contact is recorded for a wait.
+        expect(redis.commands).not.toContain(`GET ${PAUSE_KEY}`);
+        expect(mockDecryptToken).not.toHaveBeenCalled();
+        expect(mockPrisma.contact.upsert).not.toHaveBeenCalled();
       });
 
       it("sends nothing while a tap's link waits for the pause", async () => {
@@ -5348,6 +5427,7 @@ describe("DM Worker — Meta request limits on taps, DM replies and follow-ups",
     beforeEach(() => {
       mockPrisma.automation.findFirst.mockResolvedValue(withFollowUp);
       mockPrisma.contact.findUnique.mockResolvedValue({
+        id: "contact_1",
         lastInteractionAt: new Date(NOW - 31 * MINUTE),
       });
     });
@@ -5358,9 +5438,12 @@ describe("DM Worker — Meta request limits on taps, DM replies and follow-ups",
       await expect(getProcessor()(followUp())).resolves.toBeUndefined();
 
       expect(mockSendDirectMessage).not.toHaveBeenCalled();
+      // One lookup, before the pause: the window check and the wait read the
+      // same contact.
+      expect(mockPrisma.contact.findUnique).toHaveBeenCalledTimes(1);
       expect(mockPrisma.contact.findUnique).toHaveBeenCalledWith({
         where: { ...CONTACT_KEY, workspaceId: "workspace_123" },
-        select: { lastInteractionAt: true },
+        select: { id: true, lastInteractionAt: true },
       });
       expect(pauseCopies()).toEqual([
         [
@@ -5407,6 +5490,9 @@ describe("DM Worker — Meta request limits on taps, DM replies and follow-ups",
       await getProcessor()(followUp());
 
       expect(pauseCopies()).toHaveLength(0);
+      // Decided before the pause, which is not even looked at.
+      expect(mockDecryptToken).not.toHaveBeenCalled();
+      expect(redis.commands).not.toContain(`GET ${PAUSE_KEY}`);
     });
 
     it("is dropped after the twelfth wait", async () => {
@@ -5726,6 +5812,243 @@ describe("DM Worker — Meta request limits on taps, DM replies and follow-ups",
           },
         })
       );
+    });
+  });
+});
+
+// B8: reading a DM opens no messaging window, and Meta refuses a message
+// outside it. A read fallback and a follow-up therefore ask Instagram nothing
+// unless the person's contact shows a tap or DM within the last 24 hours, less
+// withinWindow's five-minute margin. Decided when the job runs, before the
+// account's pause.
+describe("DM Worker — read fallback and follow-up only inside the messaging window", () => {
+  const MINUTE = 60_000;
+  const HOUR = 60 * MINUTE;
+  const NOW = new Date("2026-11-27T12:00:00.000Z").getTime();
+  const PAUSE_KEY = "meta:pause:ig_456";
+  // The one contact lookup of both, by its unique key in the campaign's
+  // workspace.
+  const WINDOW_LOOKUP = {
+    where: { ...CONTACT_KEY, workspaceId: "workspace_123" },
+    select: { id: true, lastInteractionAt: true },
+  };
+  const closedWindows = [
+    { label: "no contact", contact: null },
+    {
+      label: "a contact that only commented",
+      contact: { id: "contact_1", lastInteractionAt: null },
+    },
+    {
+      label: "a last tap or DM 25 hours ago",
+      contact: { id: "contact_1", lastInteractionAt: new Date(NOW - 25 * HOUR) },
+    },
+    // Inside 24 hours, but not by the five minutes Meta's clock may differ.
+    {
+      label: "a last tap or DM 23 hours 56 minutes ago",
+      contact: {
+        id: "contact_1",
+        lastInteractionAt: new Date(NOW - 23 * HOUR - 56 * MINUTE),
+      },
+    },
+  ];
+  const openWindows = [
+    { label: "a DM an hour ago", lastInteractionAt: new Date(NOW - HOUR) },
+    {
+      label: "a tap 23 hours 54 minutes ago",
+      lastInteractionAt: new Date(NOW - 23 * HOUR - 54 * MINUTE),
+    },
+  ];
+  let redis: FakeRedis;
+  let log: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    redis = new FakeRedis();
+    vi.mocked(getRedisConnection).mockReturnValue(redis as never);
+    log = vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    log.mockRestore();
+  });
+
+  function pauseFor(minutes: number) {
+    return redis.set(PAUSE_KEY, String(NOW + minutes * MINUTE), "PX", minutes * MINUTE);
+  }
+
+  describe("a read fallback", () => {
+    const fallback = () => ({
+      ...createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        payload: "reveal:auto_789",
+        fallback: true,
+      }),
+      timestamp: NOW - 5 * MINUTE,
+    });
+
+    beforeEach(() => {
+      // Follow-gated, as the German default: an open window asks Instagram
+      // whether the person follows.
+      mockPrisma.automation.findFirst.mockResolvedValue({
+        ...mockAutomation,
+        requireFollow: true,
+        trackedLinks: [],
+      });
+      // No name stored anywhere: an open window reads it from Instagram.
+      mockPrisma.dmLog.findFirst.mockResolvedValue(null);
+      mockGetUserUsername.mockResolvedValue("live_handle");
+    });
+
+    it.each(closedWindows)(
+      "asks Instagram nothing and records nothing with $label",
+      async ({ contact }) => {
+        mockPrisma.contact.findUnique.mockResolvedValue(contact);
+
+        await expect(getProcessor()(fallback())).resolves.toBeUndefined();
+
+        expect(mockPrisma.contact.findUnique).toHaveBeenCalledTimes(1);
+        expect(mockPrisma.contact.findUnique).toHaveBeenCalledWith(WINDOW_LOOKUP);
+        expect(log).toHaveBeenCalledWith(
+          "[DM Worker] Read fallback skipped: no open messaging window",
+          "postback_job_001"
+        );
+        // No Meta call: no token, no name, no follow check, no send.
+        expect(mockDecryptToken).not.toHaveBeenCalled();
+        expect(mockGetUserUsername).not.toHaveBeenCalled();
+        expect(mockGetUserFollowStatus).not.toHaveBeenCalled();
+        expect(mockSendDirectMessage).not.toHaveBeenCalled();
+        expect(mockSendDirectMessageWithButton).not.toHaveBeenCalled();
+        expect(mockSendDirectMessageWithLinkButton).not.toHaveBeenCalled();
+        // Nothing reserved, claimed or recorded.
+        expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
+        expect(mockPrisma.postbackDelivery.create).not.toHaveBeenCalled();
+        expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
+        expect(mockPrisma.contact.upsert).not.toHaveBeenCalled();
+        expect(mockPrisma.operationalEvent.create).not.toHaveBeenCalled();
+      }
+    );
+
+    it.each(openWindows)(
+      "checks the follow and sends the link after $label",
+      async ({ lastInteractionAt }) => {
+        openMessagingWindow(lastInteractionAt);
+
+        await getProcessor()(fallback());
+
+        expect(mockPrisma.contact.findUnique).toHaveBeenCalledWith(WINDOW_LOOKUP);
+        expect(mockGetUserFollowStatus).toHaveBeenCalledTimes(1);
+        expect(mockReserveWorkspaceDMSend).toHaveBeenCalledTimes(1);
+        expect(mockSendDirectMessage).toHaveBeenCalledWith(
+          META_AUTH,
+          "ig_456",
+          "commenter_999",
+          "Hey live_handle! Here is the link: https://example.com"
+        );
+        expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
+          expect.objectContaining({
+            create: expect.objectContaining({ status: "SENT" }),
+          })
+        );
+      }
+    );
+
+    it("does not wait for the account's pause when the window is closed", async () => {
+      await pauseFor(10);
+      mockPrisma.contact.findUnique.mockResolvedValue({
+        id: "contact_1",
+        lastInteractionAt: new Date(NOW - 25 * HOUR),
+      });
+
+      await expect(getProcessor()(fallback())).resolves.toBeUndefined();
+
+      // No copy for after the pause, and the pause was not even read.
+      expect(mockQueueAdd).not.toHaveBeenCalled();
+      expect(redis.commands).not.toContain(`GET ${PAUSE_KEY}`);
+      expect(mockPrisma.contact.upsert).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("a follow-up", () => {
+    const followUp = () => ({
+      name: "process-followup",
+      data: {
+        instagramAccountId: "ig_456",
+        accountConnectionId: "ig_account_row_1",
+        userId: "commenter_999",
+        automationId: "auto_789",
+        commenterName: "commenter_user",
+      },
+      id: "followup_auto_789_commenter_999",
+      attemptsMade: 0,
+      timestamp: NOW - 23 * HOUR,
+    });
+    const windowClosedEvent = {
+      data: {
+        workspaceId: "workspace_123",
+        source: "WORKER",
+        level: "INFO",
+        message: "Follow-up not sent: messaging window closed",
+        payload: { automationId: "auto_789", userId: "commenter_999" },
+      },
+    };
+
+    beforeEach(() => {
+      mockPrisma.automation.findFirst.mockResolvedValue({
+        ...mockAutomation,
+        followUpEnabled: true,
+        followUpMessage: "Danke, {username}!",
+        followUpDelayMinutes: 1380,
+      });
+    });
+
+    it.each(closedWindows)(
+      "is not sent with $label, and Diagnostics says why",
+      async ({ contact }) => {
+        mockPrisma.contact.findUnique.mockResolvedValue(contact);
+
+        await expect(getProcessor()(followUp())).resolves.toBeUndefined();
+
+        expect(mockPrisma.contact.findUnique).toHaveBeenCalledTimes(1);
+        expect(mockPrisma.contact.findUnique).toHaveBeenCalledWith(WINDOW_LOOKUP);
+        // No Meta call, and nothing waits.
+        expect(mockDecryptToken).not.toHaveBeenCalled();
+        expect(mockSendDirectMessage).not.toHaveBeenCalled();
+        expect(mockQueueAdd).not.toHaveBeenCalled();
+        expect(mockPrisma.operationalEvent.create).toHaveBeenCalledTimes(1);
+        expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(windowClosedEvent);
+      }
+    );
+
+    it.each(openWindows)("goes out after $label", async ({ lastInteractionAt }) => {
+      openMessagingWindow(lastInteractionAt);
+
+      await getProcessor()(followUp());
+
+      expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+      expect(mockSendDirectMessage).toHaveBeenCalledWith(
+        META_AUTH,
+        "ig_456",
+        "commenter_999",
+        "Danke, commenter_user!"
+      );
+      expect(mockPrisma.operationalEvent.create).not.toHaveBeenCalled();
+    });
+
+    it("does not wait for the account's pause when the window is closed", async () => {
+      await pauseFor(10);
+      mockPrisma.contact.findUnique.mockResolvedValue({
+        id: "contact_1",
+        lastInteractionAt: new Date(NOW - 25 * HOUR),
+      });
+
+      await expect(getProcessor()(followUp())).resolves.toBeUndefined();
+
+      expect(mockQueueAdd).not.toHaveBeenCalled();
+      expect(redis.commands).not.toContain(`GET ${PAUSE_KEY}`);
+      expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(windowClosedEvent);
     });
   });
 });

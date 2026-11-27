@@ -70,6 +70,22 @@ neu verbinden.
   (`bash deploy/oracle/upload-env.sh <server-ip> <ordner>/worker.env`).
 - Die Warte-Nachricht beim Follow-Gate steht in `FOLLOW_RECHECK_ACK_MESSAGE`
   (worker.env, über `deploy/make-env.mjs`).
+- Liest jemand die erste DM nur, ohne auf den Button zu tippen, schickt das
+  Tool 5 Minuten später den Link nur, wenn Instagrams 24-Stunden-Fenster
+  offen ist: Die Person hat in den 24 Stunden davor selbst geschrieben oder
+  einen Button getippt (mit 5 Minuten Sicherheitsabstand). Bei einer Kampagne
+  mit Follow-Gate prüft es dann wie bisher, ob die Person folgt. Sonst fragt
+  das Tool Instagram gar nicht erst, auch nicht nach Name oder Folgen: Lesen
+  öffnet das Fenster nicht, und Meta lehnt solche Nachrichten ab. Im
+  Worker-Log (`pm2 logs`) steht dann „Read fallback skipped: no open
+  messaging window“, im DM-Protokoll nichts. Lesebestätigungen werden weiter
+  gespeichert und zählen weiter für „Nachrichten kommen nicht an“.
+- Die Folgenachricht einer Kampagne prüft dasselbe Fenster direkt vor dem
+  Senden. Ist es zu, geht nichts raus, und in der *Diagnose* steht
+  „Follow-up not sent: messaging window closed“. Die Wartezeit darf weiter
+  bis 1440 Minuten betragen. Ab mehr als 23 Stunden (1380 Minuten) warnt der
+  Editor: Das Fenster zählt ab dem letzten Tippen oder der letzten DM der
+  Person, und das war meist der Tipp oder die DM direkt vor dem Link.
 
 ### Meta-Limits: Wenn Instagram „zu viele Anfragen“ meldet
 

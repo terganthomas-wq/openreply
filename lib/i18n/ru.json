@@ -775,7 +775,7 @@
   "not available": "недоступно",
   "over {count} days": "за {count} дн.",
   "paused, skipped": "на паузе, пропускается",
-  "personalizes it. Max 24 hours, to stay inside Instagram's messaging window.": "подставляет имя. Не больше 24 часов, чтобы уложиться в окно переписки Instagram.",
+  "It only goes out if the person wrote to you or tapped a button in the 24 hours before. With more than 23 hours that is usually no longer the case.": "Отправляется, только если человек написал вам или нажал кнопку в течение 24 часов до этого. При задержке больше 23 часов так обычно уже не бывает.",
   "personalizes.": "подставляет имя.",
   "quick favor before i send your link. i don't make any money from this, it's free. if you want to support me, just don't unfollow after, and star the repo on github if it helps you. tap the button once you're following and i'll send it over": "маленькая просьба, прежде чем я пришлю ссылку: подпишись, пожалуйста, — это бесплатно, а мне будет приятно. как подпишешься, нажми кнопку, и я сразу отправлю",
   "redirects to": "ведёт на",

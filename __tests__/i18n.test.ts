@@ -381,4 +381,22 @@ describe("interface translations", () => {
       "Die Folgenachricht kommt 1300 Minuten nach dem Link. Dann kann das Angebot schon laufen, und sie landet womöglich zwischen den Angebotsnachrichten. Mit höchstens 1260 Minuten kommt sie vor dem Angebot."
     );
   });
+
+  // B8: the follow-up goes out only inside Instagram's 24-hour window, which
+  // the worker checks right before sending. Above 23 hours the editor warns,
+  // and no text says any more that up to 24 hours work.
+  it("warns about follow-up delays above 23 hours in every language", () => {
+    const warning =
+      "It only goes out if the person wrote to you or tapped a button in the 24 hours before. With more than 23 hours that is usually no longer the case.";
+    for (const catalog of [zhTW, ptBR, ru, de]) {
+      expect(catalog[warning], warning).toBeTruthy();
+      expect(catalog["personalizes."]).toBeTruthy();
+      expect(catalog, "old hint").not.toHaveProperty([
+        "personalizes it. Max 24 hours, to stay inside Instagram's messaging window.",
+      ]);
+    }
+    expect(createI18n("de").t(warning)).toBe(
+      "Geht nur raus, wenn die Person dir in den 24 Stunden davor geschrieben oder getippt hat. Bei mehr als 23 Stunden ist das meistens nicht mehr so."
+    );
+  });
 });
