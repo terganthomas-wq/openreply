@@ -79,7 +79,8 @@ every open of "All time". Now (`app/api/instagram/overview/route.ts`,
   likes and comments for every post and insights only for the newest 12; no
   insights call goes beyond them. The page says so above the totals, and the
   totals of views, reach, saves and shares sum only those posts
-  (`insightPosts` in the answer).
+  (`insightPosts` in the answer). Any other `count` reads as 12, so it costs
+  no media read and no cache key of its own.
 - Each post's insights are kept in Redis for 6 hours
   (`insights:v1:<account row>:<media id>`), the whole answer for 10 minutes
   (`overview:v1:<account row>:<range>`). Opening the page again within 10

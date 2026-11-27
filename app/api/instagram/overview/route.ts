@@ -46,6 +46,11 @@ const INSIGHTS_CONCURRENCY = 3;
 // The range when none (or no valid one) is asked for.
 const DEFAULT_COUNT = 12;
 
+// The ranges the page offers besides "all" (app/(dashboard)/overview/page.tsx).
+// Any other count reads as the default: each one would cost a Meta media read
+// and a 10-minute cache key of its own in the Redis the queue shares.
+const COUNTS: readonly number[] = [12, 25, 50, 100];
+
 /** Map over items with a bounded number of in-flight async operations. */
 async function mapWithConcurrency<T, R>(
   items: T[],
@@ -162,14 +167,14 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  // `count` is either "all" or a positive integer (last N posts).
+  // `count` is either "all" or one of COUNTS (last N posts).
   const countParam = request.nextUrl.searchParams.get("count");
   const isAll = countParam === "all";
   const parsedCount = countParam ? Number.parseInt(countParam, 10) : NaN;
   const requestedCount: "all" | number = isAll
     ? "all"
-    : Number.isFinite(parsedCount)
-      ? Math.max(parsedCount, 1)
+    : COUNTS.includes(parsedCount)
+      ? parsedCount
       : DEFAULT_COUNT;
 
   const target = isAll

@@ -256,6 +256,19 @@ describe("the 10-minute answer", () => {
     expect(mocks.getUserInfo).not.toHaveBeenCalled();
   });
 
+  it("reads a range the page does not offer as the default, without a media read or a key of its own", async () => {
+    await overview("?count=12");
+    for (const count of ["13", "499", "1", "0", "-5", "abc"]) {
+      const data = await overview(`?count=${count}`);
+      expect(data.requestedCount, count).toBe(12);
+      expect(data.fromCache, count).toBe(true);
+    }
+    expect(mocks.getAllUserMedia).toHaveBeenCalledTimes(1);
+    expect([...redis.strings.keys()].filter((key) => key.startsWith("overview:"))).toEqual([
+      "overview:v1:account_1:12",
+    ]);
+  });
+
   it("keeps each range apart", async () => {
     await overview("?count=12");
     const fifty = await overview("?count=50");
